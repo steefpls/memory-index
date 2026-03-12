@@ -1,0 +1,36 @@
+# Virtual environment
+.venv/
+
+# ChromaDB data (rebuilt by indexing)
+data/chroma/
+
+# Entity and graph data (runtime state)
+data/memory_entities.json
+data/memory_graph.json
+data/vaults.json
+data/*_calibration.json
+
+# ONNX model (downloaded/exported by setup.bat)
+data/coderank_onnx/
+
+# Logs
+data/server.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
