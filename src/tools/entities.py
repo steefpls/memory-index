@@ -68,6 +68,8 @@ def tool_get_entity(name_or_id: str, vault: str = "") -> str:
         return f"Entity not found: '{name_or_id}'"
 
     obs_list = get_observations(entity.id)
+    superseded_list = get_observations(entity.id, include_superseded=True)
+    superseded_only = [o for o in superseded_list if o.is_superseded]
     relations = get_relations_for_entity(entity.id)
 
     lines = [
@@ -86,6 +88,13 @@ def tool_get_entity(name_or_id: str, vault: str = "") -> str:
             conf = f" (confidence: {obs.confidence})" if obs.confidence < 1.0 else ""
             lines.append(f"  - {obs.content}{src}{conf}")
             lines.append(f"    ID: {obs.id}")
+        lines.append("")
+
+    if superseded_only:
+        lines.append(f"Superseded observations ({len(superseded_only)}):")
+        for obs in superseded_only:
+            lines.append(f"  - [old] {obs.content}")
+            lines.append(f"    ID: {obs.id} -> replaced by {obs.superseded_by}")
         lines.append("")
 
     if relations:
@@ -190,7 +199,8 @@ def tool_list_entities(vault: str = "", entity_type: str = "",
 
 def tool_add_observation(name_or_id: str, content: str,
                          vault: str = "", source: str = "",
-                         confidence: float = 1.0) -> str:
+                         confidence: float = 1.0,
+                         supersedes: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
     Args:
@@ -199,6 +209,8 @@ def tool_add_observation(name_or_id: str, content: str,
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution.
         confidence: Confidence level (0.0 to 1.0, default 1.0).
+        supersedes: Optional observation ID that this replaces. The old
+                    observation is kept for history but excluded from search.
 
     Returns:
         Confirmation or error.
@@ -207,13 +219,17 @@ def tool_add_observation(name_or_id: str, content: str,
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    obs = add_observation(entity.id, content, source=source, confidence=confidence)
+    obs = add_observation(entity.id, content, source=source, confidence=confidence,
+                          supersedes=supersedes)
     if obs is None:
         return "Error: failed to add observation."
 
-    return (f"Observation added to '{entity.name}':\n"
-            f"  {content}\n"
-            f"  ID: {obs.id}")
+    msg = (f"Observation added to '{entity.name}':\n"
+           f"  {content}\n"
+           f"  ID: {obs.id}")
+    if supersedes:
+        msg += f"\n  Supersedes: {supersedes}"
+    return msg
 
 
 def tool_delete_observation(observation_id: str) -> str:

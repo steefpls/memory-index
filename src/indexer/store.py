@@ -11,9 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config import DATA_DIR, ENTITIES_FILE, VAULTS, get_vault
+from src.indexer.calibration import calibrate_collection
 from src.indexer.embedder import get_embedding_function, get_collection, get_chroma_client
 from src.models.entity import Entity
 from src.models.observation import Observation
+
+_RECALIBRATE_EVERY = 10  # auto-recalibrate after every N observations per vault
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +226,18 @@ def resolve_entity(name_or_id: str, vault: str | None = None) -> Entity | None:
 # --- Observation CRUD ---
 
 def add_observation(entity_id: str, content: str, source: str = "",
-                    confidence: float = 1.0) -> Observation | None:
-    """Add an observation to an entity and embed it in ChromaDB."""
+                    confidence: float = 1.0,
+                    supersedes: str = "") -> Observation | None:
+    """Add an observation to an entity and embed it in ChromaDB.
+
+    Args:
+        entity_id: Entity to attach to.
+        content: Observation text.
+        source: Optional source attribution.
+        confidence: Confidence level (0.0 to 1.0).
+        supersedes: Optional observation ID that this new observation replaces.
+                    The old observation is marked superseded and removed from search.
+    """
     _load_store()
     ent = _entities.get(entity_id)
     if ent is None or ent.deleted:
@@ -238,6 +251,31 @@ def add_observation(entity_id: str, content: str, source: str = "",
         confidence=confidence,
     )
     _observations[obs.id] = obs
+
+    # Mark the old observation as superseded and tag it in ChromaDB
+    if supersedes:
+        old_obs = _observations.get(supersedes)
+        if old_obs and not old_obs.deleted and old_obs.entity_id == entity_id:
+            old_obs.superseded_by = obs.id
+            # Update ChromaDB metadata to tag it as superseded (keep it searchable)
+            try:
+                collection = _get_collection_for_vault(ent.vault)
+                collection.update(
+                    ids=[supersedes],
+                    metadatas=[{
+                        "entity_id": entity_id,
+                        "entity_name": ent.name,
+                        "entity_type": ent.entity_type,
+                        "content": old_obs.content,
+                        "source": old_obs.source,
+                        "confidence": old_obs.confidence,
+                        "vault": ent.vault,
+                        "created_at": old_obs.created_at,
+                        "superseded_by": obs.id,
+                    }],
+                )
+            except Exception as e:
+                logger.warning("Failed to tag superseded observation in ChromaDB: %s", e)
 
     # Embed in ChromaDB
     embed_text = _make_embedding_text(ent, content)
@@ -257,6 +295,7 @@ def add_observation(entity_id: str, content: str, source: str = "",
                 "source": source,
                 "confidence": confidence,
                 "vault": ent.vault,
+                "created_at": obs.created_at,
             }],
         )
     except Exception as e:
@@ -265,15 +304,37 @@ def add_observation(entity_id: str, content: str, source: str = "",
     # Update entity timestamp
     ent.updated_at = _now_iso()
     _save_store()
+
+    # Auto-recalibrate every N observations
+    vault_obs_count = get_observation_count(ent.vault)
+    if vault_obs_count > 0 and vault_obs_count % _RECALIBRATE_EVERY == 0:
+        try:
+            collection = _get_collection_for_vault(ent.vault)
+            calibrate_collection(collection, ent.vault)
+            from src.tools.search import invalidate_calibration_cache
+            invalidate_calibration_cache(ent.vault)
+            logger.info("Auto-recalibrated vault '%s' at %d observations",
+                        ent.vault, vault_obs_count)
+        except Exception as e:
+            logger.warning("Auto-recalibration failed for vault '%s': %s",
+                           ent.vault, e)
+
     return obs
 
 
-def get_observations(entity_id: str) -> list[Observation]:
-    """Get all active observations for an entity."""
+def get_observations(entity_id: str, include_superseded: bool = False) -> list[Observation]:
+    """Get observations for an entity.
+
+    Args:
+        entity_id: Entity ID.
+        include_superseded: If False (default), excludes superseded observations.
+                            If True, returns all including superseded (for history).
+    """
     _load_store()
     return [
         o for o in _observations.values()
         if o.entity_id == entity_id and not o.deleted
+        and (include_superseded or not o.is_superseded)
     ]
 
 
@@ -324,6 +385,7 @@ def _reembed_entity_observations(entity: Entity) -> None:
                 "source": obs.source,
                 "confidence": obs.confidence,
                 "vault": entity.vault,
+                "created_at": obs.created_at,
             })
 
         embeddings = ef(texts)
@@ -349,15 +411,17 @@ def get_entity_count(vault: str | None = None) -> int:
 
 
 def get_observation_count(vault: str | None = None) -> int:
-    """Count active observations."""
+    """Count active (non-deleted, non-superseded) observations."""
     _load_store()
     if vault is None:
-        return sum(1 for o in _observations.values() if not o.deleted)
+        return sum(1 for o in _observations.values()
+                   if not o.deleted and not o.is_superseded)
     vault_entity_ids = {
         e.id for e in _entities.values()
         if not e.deleted and e.vault == vault
     }
     return sum(
         1 for o in _observations.values()
-        if not o.deleted and o.entity_id in vault_entity_ids
+        if not o.deleted and not o.is_superseded
+        and o.entity_id in vault_entity_ids
     )

@@ -207,6 +207,130 @@ class TestEntityStore(unittest.TestCase):
         add_observation(entity.id, "Fact 2")
         self.assertEqual(get_observation_count(vault="test"), 2)
 
+    # --- Superseding tests ---
+
+    def test_supersede_observation(self):
+        """Superseding marks old observation and links to new one."""
+        from src.indexer.store import create_entity, add_observation, get_observations
+
+        entity = create_entity("Perception", "project", "test")
+        old = add_observation(entity.id, "Uses .NET Framework")
+        new = add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        # Default: only current observations
+        current = get_observations(entity.id)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0].content, "Migrated to .NET 8")
+
+        # Include superseded: both show up
+        all_obs = get_observations(entity.id, include_superseded=True)
+        self.assertEqual(len(all_obs), 2)
+
+    def test_superseded_observation_has_link(self):
+        """Superseded observation stores the ID of its replacement."""
+        from src.indexer.store import create_entity, add_observation, _observations
+
+        entity = create_entity("Perception", "project", "test")
+        old = add_observation(entity.id, "Uses .NET Framework")
+        new = add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        old_obs = _observations[old.id]
+        self.assertEqual(old_obs.superseded_by, new.id)
+        self.assertTrue(old_obs.is_superseded)
+
+    def test_supersede_updates_chromadb_metadata(self):
+        """Superseding should update ChromaDB metadata, not delete the entry."""
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Perception", "project", "test")
+        old = add_observation(entity.id, "Uses .NET Framework")
+        new = add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        # ChromaDB update should have been called (not delete)
+        self.mock_collection.update.assert_called()
+        update_call = self.mock_collection.update.call_args
+        meta = update_call[1]["metadatas"][0] if "metadatas" in update_call[1] else update_call[0][1][0]
+        self.assertEqual(meta.get("superseded_by"), new.id)
+
+    def test_superseded_excluded_from_count(self):
+        """Observation count should not include superseded observations."""
+        from src.indexer.store import create_entity, add_observation, get_observation_count
+
+        entity = create_entity("Perception", "project", "test")
+        old = add_observation(entity.id, "Uses .NET Framework")
+        add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        self.assertEqual(get_observation_count(vault="test"), 1)
+
+    def test_supersede_wrong_entity_ignored(self):
+        """Superseding an observation from a different entity should be ignored."""
+        from src.indexer.store import create_entity, add_observation, get_observations
+
+        entity_a = create_entity("A", "project", "test")
+        entity_b = create_entity("B", "project", "test")
+        obs_a = add_observation(entity_a.id, "Fact for A")
+        add_observation(entity_b.id, "Fact for B", supersedes=obs_a.id)
+
+        # obs_a should NOT be superseded since it belongs to a different entity
+        current_a = get_observations(entity_a.id)
+        self.assertEqual(len(current_a), 1)
+        self.assertFalse(current_a[0].is_superseded)
+
+    def test_supersede_chain(self):
+        """Multiple supersedes in a chain should only leave the latest current."""
+        from src.indexer.store import create_entity, add_observation, get_observations
+
+        entity = create_entity("Framework", "technology", "test")
+        v1 = add_observation(entity.id, ".NET Framework")
+        v2 = add_observation(entity.id, ".NET 8", supersedes=v1.id)
+        v3 = add_observation(entity.id, ".NET 12", supersedes=v2.id)
+
+        current = get_observations(entity.id)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0].content, ".NET 12")
+
+        all_obs = get_observations(entity.id, include_superseded=True)
+        self.assertEqual(len(all_obs), 3)
+
+    # --- Temporal metadata tests ---
+
+    def test_observation_has_created_at_in_chromadb(self):
+        """ChromaDB metadata should include created_at timestamp."""
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        obs = add_observation(entity.id, "A fact")
+
+        add_call = self.mock_collection.add.call_args
+        meta = add_call[1]["metadatas"][0] if "metadatas" in add_call[1] else add_call[0][3][0]
+        self.assertIn("created_at", meta)
+        self.assertEqual(meta["created_at"], obs.created_at)
+
+    def test_observation_serialization_with_superseded(self):
+        """Observation to_dict/from_dict should roundtrip superseded_by."""
+        from src.models.observation import Observation
+
+        obs = Observation(id="abc", entity_id="xyz", content="test",
+                          superseded_by="def")
+        d = obs.to_dict()
+        self.assertEqual(d["superseded_by"], "def")
+
+        restored = Observation.from_dict(d)
+        self.assertEqual(restored.superseded_by, "def")
+        self.assertTrue(restored.is_superseded)
+
+    def test_observation_serialization_without_superseded(self):
+        """Observation without superseded_by should omit it from dict."""
+        from src.models.observation import Observation
+
+        obs = Observation(id="abc", entity_id="xyz", content="test")
+        d = obs.to_dict()
+        self.assertNotIn("superseded_by", d)
+
+        restored = Observation.from_dict(d)
+        self.assertEqual(restored.superseded_by, "")
+        self.assertFalse(restored.is_superseded)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,13 +1,14 @@
 """Per-vault distance calibration for search confidence thresholds.
 
-After adding enough observations, runs generic knowledge + nonsense queries
-against the collection to derive adaptive L2 distance thresholds.
+Samples real observations from the vault as "should match" probes, and uses
+gibberish as "should not match" probes. Derives adaptive L2 distance thresholds
+from the gap between the two distributions.
 """
 
 import json
 import logging
+import random
 from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 
@@ -16,30 +17,24 @@ from src.indexer.embedder import get_embedding_function
 
 logger = logging.getLogger(__name__)
 
-# Memory-domain calibration queries (knowledge/facts instead of code)
-_KNOWLEDGE_QUERIES = [
+# Fallback probes if the vault has too few observations to sample from
+_FALLBACK_KNOWLEDGE_QUERIES = [
     "person responsible for project", "technology stack used",
     "decision made about architecture", "error encountered during deployment",
     "solution for performance issue", "configuration setting change",
-    "dependency between components", "meeting notes from review",
-    "API design decision rationale", "database migration strategy",
-    "security vulnerability fix", "testing approach for integration",
-    "deployment pipeline setup", "monitoring and alerting rules",
-    "user feedback on feature", "team member expertise area",
-    "project deadline milestone", "infrastructure cost optimization",
-    "code review feedback pattern", "documentation update needed",
-    "bug report root cause", "feature request priority",
-    "environment setup instructions", "third party library evaluation",
-    "performance benchmark results", "data model schema change",
-    "authentication flow design", "error handling strategy",
-    "caching layer implementation", "logging and observability",
+    "dependency between components", "API design decision rationale",
+    "database migration strategy", "testing approach for integration",
 ]
 
 _NONSENSE_QUERIES = [
-    "chocolate cake recipe frosting", "weather forecast tomorrow rain",
-    "guitar chord progression blues", "gardening tips growing tomatoes",
-    "movie review rating stars",
+    "xkq7 zpmf bratl vvnx plrm",
+    "aaaaa bbbbb ccccc ddddd eeeee",
+    "12345 67890 !@#$% ^&*() +=<>",
+    "the the the the the the the",
+    "asdfghjkl qwertyuiop zxcvbnm",
 ]
+
+_MIN_SAMPLES = 10  # minimum observations before sampling is useful
 
 # Fallback thresholds if no calibration file exists
 _DEFAULT_THRESHOLDS = {
@@ -49,22 +44,57 @@ _DEFAULT_THRESHOLDS = {
 }
 
 
+def _sample_knowledge_queries(collection, n: int = 30) -> list[str]:
+    """Sample real observation texts from the vault as calibration probes.
+
+    Uses the actual stored documents so calibration reflects what's in the vault,
+    not a hardcoded assumption about content domain.
+    """
+    total = collection.count()
+    if total < _MIN_SAMPLES:
+        return _FALLBACK_KNOWLEDGE_QUERIES
+
+    # Peek returns up to `limit` documents from the collection
+    sample_size = min(n, total)
+    results = collection.peek(limit=sample_size)
+
+    docs = results.get("documents") or []
+    if len(docs) < _MIN_SAMPLES:
+        return _FALLBACK_KNOWLEDGE_QUERIES
+
+    # Shuffle so we don't always get the same subset if vault grows
+    random.shuffle(docs)
+    return docs[:n]
+
+
 def calibrate_collection(collection, vault_name: str) -> dict:
-    """Run calibration queries and save per-vault thresholds."""
+    """Run calibration queries and save per-vault thresholds.
+
+    Samples real observations as "should match" probes and queries them
+    against the collection (they'll match themselves or similar entries).
+    Gibberish probes establish the noise floor.
+    """
     ef = get_embedding_function(role="index")
 
-    all_queries = _KNOWLEDGE_QUERIES + _NONSENSE_QUERIES
+    knowledge_queries = _sample_knowledge_queries(collection)
+    all_queries = knowledge_queries + _NONSENSE_QUERIES
     all_embeddings = ef.embed_queries(all_queries)
 
-    knowledge_embeddings = all_embeddings[:len(_KNOWLEDGE_QUERIES)]
-    nonsense_embeddings = all_embeddings[len(_KNOWLEDGE_QUERIES):]
+    knowledge_embeddings = all_embeddings[:len(knowledge_queries)]
+    nonsense_embeddings = all_embeddings[len(knowledge_queries):]
 
+    # n_results=2 for knowledge probes: the closest match will be the
+    # observation itself (distance ~0), so we want the second-nearest
+    # to measure how close *other* content is.
     knowledge_result = collection.query(
-        query_embeddings=knowledge_embeddings, n_results=1, include=["distances"],
+        query_embeddings=knowledge_embeddings, n_results=2, include=["distances"],
     )
-    knowledge_distances = [
-        dists[0] for dists in knowledge_result["distances"] if dists
-    ]
+    knowledge_distances = []
+    for dists in knowledge_result["distances"]:
+        if len(dists) >= 2:
+            knowledge_distances.append(dists[1])  # second-nearest
+        elif dists:
+            knowledge_distances.append(dists[0])
 
     nonsense_result = collection.query(
         query_embeddings=nonsense_embeddings, n_results=1, include=["distances"],
@@ -83,6 +113,8 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     calibration = {
         "vault_name": vault_name,
         "total_observations": collection.count(),
+        "knowledge_probe_count": len(knowledge_queries),
+        "knowledge_probe_source": "sampled" if collection.count() >= _MIN_SAMPLES else "fallback",
         "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         "knowledge_distances": {
             "min": float(knowledge_arr.min()),
@@ -109,9 +141,10 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     cal_path.parent.mkdir(parents=True, exist_ok=True)
     cal_path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
 
-    logger.info("Calibration saved for %s: HIGH<%s MEDIUM<%s LOW<%s",
+    logger.info("Calibration saved for %s: HIGH<%s MEDIUM<%s LOW<%s (source=%s, probes=%d)",
                 vault_name, calibration["thresholds"]["HIGH"],
-                calibration["thresholds"]["MEDIUM"], calibration["thresholds"]["LOW"])
+                calibration["thresholds"]["MEDIUM"], calibration["thresholds"]["LOW"],
+                calibration["knowledge_probe_source"], len(knowledge_queries))
 
     return calibration
 

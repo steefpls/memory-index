@@ -35,6 +35,8 @@ def invalidate_calibration_cache(vault: str | None = None) -> None:
 
 def search_memory(query: str, vault: str = "", n_results: int = 10,
                    entity_type: str = "", include_neighbors: bool = True,
+                   since: str = "", before: str = "",
+                   include_superseded: bool = False,
                    output_format: str = "text") -> str:
     """Hybrid vector + graph-boosted semantic memory search.
 
@@ -44,6 +46,10 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
         n_results: Number of results (default 10, max 30).
         entity_type: Optional entity type filter.
         include_neighbors: Include graph-connected entities (default True).
+        since: Only include observations created after this ISO date/datetime.
+        before: Only include observations created before this ISO date/datetime.
+        include_superseded: If True, include observations that have been replaced
+                            by newer ones. Default False (only current facts).
         output_format: "text" (default) or "json".
 
     Returns:
@@ -88,9 +94,19 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
             continue
 
         # Build where clause
-        where = None
+        where_conditions = []
         if entity_type:
-            where = {"entity_type": entity_type}
+            where_conditions.append({"entity_type": entity_type})
+        if since:
+            where_conditions.append({"created_at": {"$gte": since}})
+        if before:
+            where_conditions.append({"created_at": {"$lt": before}})
+
+        where = None
+        if len(where_conditions) == 1:
+            where = where_conditions[0]
+        elif len(where_conditions) > 1:
+            where = {"$and": where_conditions}
 
         fetch_count = n_results * 3  # over-fetch for dedup
         try:
@@ -113,6 +129,10 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
 
         for i in range(len(ids)):
             meta = metadatas[i]
+            # Skip superseded observations unless explicitly requested
+            if not include_superseded and meta.get("superseded_by"):
+                continue
+            is_superseded = bool(meta.get("superseded_by"))
             all_items.append({
                 "observation_id": ids[i],
                 "entity_id": meta.get("entity_id", ""),
@@ -124,6 +144,7 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
                 "vault": meta.get("vault", vault_name),
                 "distance": distances[i],
                 "graph_boosted": False,
+                "superseded": is_superseded,
             })
 
     if not all_items:
@@ -324,7 +345,8 @@ def _format_text(results: list[dict], entity_obs: dict[str, list[dict]],
             lines.append(f"  Observations ({len(obs_list)}):")
             for obs in obs_list[:5]:  # cap at 5 per entity
                 src = f" [source: {obs.get('source', '')}]" if obs.get("source") else ""
-                lines.append(f"    - {obs['content']}{src}")
+                old = " [superseded]" if obs.get("superseded") else ""
+                lines.append(f"    - {obs['content']}{src}{old}")
         lines.append("")
 
     return "\n".join(lines)

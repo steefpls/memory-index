@@ -113,7 +113,8 @@ def list_entities(vault: str = "", entity_type: str = "",
 @mcp.tool()
 def add_observation(name_or_id: str, content: str,
                     vault: str = "", source: str = "",
-                    confidence: float = 1.0) -> str:
+                    confidence: float = 1.0,
+                    supersedes: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
     Args:
@@ -122,9 +123,12 @@ def add_observation(name_or_id: str, content: str,
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution.
         confidence: Confidence level (0.0 to 1.0, default 1.0).
+        supersedes: Optional observation ID that this replaces. The old
+                    observation is kept for history but excluded from search.
     """
     from src.tools.entities import tool_add_observation
-    return tool_add_observation(name_or_id, content, vault, source, confidence)
+    return tool_add_observation(name_or_id, content, vault, source, confidence,
+                                supersedes)
 
 
 @mcp.tool()
@@ -176,6 +180,8 @@ def delete_relation(relation_id: str) -> str:
 @mcp.tool()
 def search_memory(query: str, vault: str = "", n_results: int = 10,
                    entity_type: str = "", include_neighbors: bool = True,
+                   since: str = "", before: str = "",
+                   include_superseded: bool = False,
                    output_format: str = "text") -> str:
     """Semantic memory search with graph boosting across knowledge entities.
 
@@ -188,10 +194,16 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
         n_results: Number of results (default 10, max 30).
         entity_type: Optional entity type filter.
         include_neighbors: Include graph-connected entities (default True).
+        since: Only include observations created after this ISO date/datetime
+               (e.g., "2026-03-01", "2026-03-13T10:00:00").
+        before: Only include observations created before this ISO date/datetime.
+        include_superseded: Include observations that have been replaced by
+                            newer ones (default False). Useful for history queries.
         output_format: "text" (default) or "json".
     """
     from src.tools.search import search_memory as do_search
-    return do_search(query, vault, n_results, entity_type, include_neighbors, output_format)
+    return do_search(query, vault, n_results, entity_type, include_neighbors,
+                     since, before, include_superseded, output_format)
 
 
 @mcp.tool()

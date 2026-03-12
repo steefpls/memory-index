@@ -14,6 +14,7 @@ class Observation:
     confidence: float = 1.0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     deleted: bool = False
+    superseded_by: str = ""  # ID of the observation that replaced this one
 
     @property
     def embedding_text(self) -> str:
@@ -24,8 +25,12 @@ class Observation:
     def embedding_text(self, value: str):
         self._embedding_text = value
 
+    @property
+    def is_superseded(self) -> bool:
+        return bool(self.superseded_by)
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "entity_id": self.entity_id,
             "content": self.content,
@@ -34,6 +39,9 @@ class Observation:
             "created_at": self.created_at,
             "deleted": self.deleted,
         }
+        if self.superseded_by:
+            d["superseded_by"] = self.superseded_by
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Observation":
@@ -45,4 +53,5 @@ class Observation:
             confidence=d.get("confidence", 1.0),
             created_at=d.get("created_at", ""),
             deleted=d.get("deleted", False),
+            superseded_by=d.get("superseded_by", ""),
         )
