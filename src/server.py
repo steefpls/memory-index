@@ -269,6 +269,17 @@ def create_vault(name: str) -> str:
     return tool_create_vault(name)
 
 
+@mcp.tool()
+def delete_vault(name: str) -> str:
+    """Delete a vault and all its entities, observations, relations, and vectors.
+
+    Args:
+        name: Vault name to delete.
+    """
+    from src.tools.status import tool_delete_vault
+    return tool_delete_vault(name)
+
+
 # --- Startup ---
 
 def _startup_check():

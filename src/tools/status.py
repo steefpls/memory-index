@@ -2,7 +2,7 @@
 
 import logging
 
-from src.config import VAULTS, list_vaults as config_list_vaults, create_vault as config_create_vault
+from src.config import VAULTS, list_vaults as config_list_vaults, create_vault as config_create_vault, delete_vault as config_delete_vault
 from src.indexer.store import get_entity_count, get_observation_count
 from src.indexer.embedder import get_active_backend
 from src.graph.manager import get_relation_count
@@ -99,6 +99,46 @@ def tool_create_vault(name: str) -> str:
 
     vault = config_create_vault(name)
     return f"Vault created: {vault.name} (collection: {vault.collection_name})"
+
+
+def tool_delete_vault(name: str) -> str:
+    """Delete a vault and all its entities, observations, and relations.
+
+    Args:
+        name: Vault name to delete.
+
+    Returns:
+        Confirmation or error.
+    """
+    if not name or not name.strip():
+        return "Error: vault name is required."
+
+    name = name.strip()
+    if name not in VAULTS:
+        return f"Vault '{name}' not found."
+
+    from src.indexer.store import list_entities, delete_entity
+    from src.graph.manager import remove_entity_relations
+    from src.indexer.embedder import get_chroma_client
+
+    # Delete all entities in this vault (cascades to observations + relations)
+    entities, _ = list_entities(vault=name, limit=10000)
+    for ent in entities:
+        remove_entity_relations(ent.id)
+        delete_entity(ent.id)
+
+    # Drop the ChromaDB collection
+    vault_cfg = VAULTS[name]
+    try:
+        client = get_chroma_client()
+        client.delete_collection(vault_cfg.collection_name)
+    except Exception as e:
+        logger.warning("Failed to delete ChromaDB collection: %s", e)
+
+    # Remove vault config
+    config_delete_vault(name)
+
+    return f"Vault '{name}' deleted ({len(entities)} entities removed)."
 
 
 def tool_get_graph_summary() -> str:
