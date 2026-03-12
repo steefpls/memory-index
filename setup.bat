@@ -6,7 +6,7 @@ pushd "%~dp0" >nul
 set "EXIT_CODE=0"
 
 echo ============================================
-echo   Memory Index - Setup
+echo   Memory Index - Setup (CPU-only)
 echo ============================================
 echo.
 
@@ -47,46 +47,8 @@ if errorlevel 1 (
     echo [WARN] Could not upgrade pip - continuing anyway.
 )
 
-REM --- GPU-specific onnxruntime (install FIRST, before other deps) ---
-echo [INFO] Detecting GPU vendor...
-set "ORT_PACKAGE="
-for /f "delims=" %%i in ('"%VENV_PYTHON%" scripts\detect_gpu.py --install-hint') do set "ORT_PACKAGE=%%i"
-if not defined ORT_PACKAGE set "ORT_PACKAGE=onnxruntime"
-if defined ORT_PACKAGE_OVERRIDE (
-    echo [INFO] Using ORT_PACKAGE_OVERRIDE=%ORT_PACKAGE_OVERRIDE%
-    set "ORT_PACKAGE=%ORT_PACKAGE_OVERRIDE%"
-)
-
-set "ORT_INSTALL_OK=0"
-echo [INFO] Installing %ORT_PACKAGE%...
-"%VENV_PYTHON%" -m pip uninstall onnxruntime onnxruntime-gpu onnxruntime-directml -y >nul 2>&1
-"%VENV_PYTHON%" -m pip install -q %ORT_PACKAGE%
-if not errorlevel 1 set "ORT_INSTALL_OK=1"
-
-if "%ORT_INSTALL_OK%"=="0" if /I "%ORT_PACKAGE%"=="onnxruntime-gpu" (
-    echo [WARN] CUDA package install failed - trying DirectML fallback...
-    "%VENV_PYTHON%" -m pip uninstall onnxruntime onnxruntime-gpu onnxruntime-directml -y >nul 2>&1
-    "%VENV_PYTHON%" -m pip install -q onnxruntime-directml
-    if not errorlevel 1 (
-        set "ORT_PACKAGE=onnxruntime-directml"
-        set "ORT_INSTALL_OK=1"
-    )
-)
-
-if "%ORT_INSTALL_OK%"=="0" (
-    echo [WARN] GPU package install failed - falling back to CPU onnxruntime...
-    "%VENV_PYTHON%" -m pip uninstall onnxruntime onnxruntime-gpu onnxruntime-directml -y >nul 2>&1
-    "%VENV_PYTHON%" -m pip install -q onnxruntime
-    if errorlevel 1 (
-        echo [ERROR] Failed to install onnxruntime.
-        set "EXIT_CODE=1"
-        goto :cleanup_with_pause
-    )
-    set "ORT_PACKAGE=onnxruntime"
-)
-
 echo [INFO] Installing core packages...
-"%VENV_PYTHON%" -m pip install -q "mcp[cli]" chromadb networkx
+"%VENV_PYTHON%" -m pip install -q "mcp[cli]" chromadb networkx onnxruntime
 if errorlevel 1 (
     echo [ERROR] Failed to install core packages.
     set "EXIT_CODE=1"
@@ -109,49 +71,12 @@ if errorlevel 1 (
     goto :cleanup_with_pause
 )
 
-REM Final safety check: ensure CPU-only onnxruntime didn't sneak back in
-set "ORT_CONFLICT=0"
-"%VENV_PYTHON%" -m pip show onnxruntime >nul 2>&1 && "%VENV_PYTHON%" -m pip show onnxruntime-directml >nul 2>&1 && set "ORT_CONFLICT=1"
-"%VENV_PYTHON%" -m pip show onnxruntime >nul 2>&1 && "%VENV_PYTHON%" -m pip show onnxruntime-gpu >nul 2>&1 && set "ORT_CONFLICT=1"
-if "%ORT_CONFLICT%"=="1" (
-    echo [WARN] CPU onnxruntime detected alongside GPU variant - fixing...
-    "%VENV_PYTHON%" -m pip uninstall onnxruntime -y >nul 2>&1
-    if exist ".venv\Lib\site-packages\onnxruntime" (
-        rmdir /s /q ".venv\Lib\site-packages\onnxruntime" >nul 2>&1
-    )
-    "%VENV_PYTHON%" -m pip install --force-reinstall -q %ORT_PACKAGE% >nul 2>&1
-    echo [OK] onnxruntime package restored ^(%ORT_PACKAGE%^)
-)
-
-REM --- Install CUDA pip libraries if NVIDIA GPU detected but CUDA doesn't load ---
-if /I "%ORT_PACKAGE%"=="onnxruntime-gpu" (
-    echo [INFO] Checking if CUDA libraries are available...
-    "%VENV_PYTHON%" scripts\detect_gpu.py --check-cuda
-    if errorlevel 1 (
-        echo [INFO] CUDA libraries missing - installing CUDA pip packages...
-        "%VENV_PYTHON%" -m pip install -q nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
-        if errorlevel 1 (
-            echo [WARN] Failed to install some CUDA packages - GPU acceleration may not work.
-        ) else (
-            echo [OK] CUDA pip packages installed
-            "%VENV_PYTHON%" scripts\detect_gpu.py --check-cuda
-            if errorlevel 1 (
-                echo [WARN] CUDA still not loading after installing pip packages.
-            ) else (
-                echo [OK] CUDA verified - GPU acceleration is working
-            )
-        )
-    ) else (
-        echo [OK] CUDA libraries already available
-    )
-)
-
 echo [OK] Dependencies installed
 
 REM --- Download model and export to ONNX ---
 echo.
 echo [INFO] Downloading CodeRankEmbed model and exporting to ONNX...
-echo        (first run downloads ~274MB model, then exports for acceleration)
+echo        (first run downloads ~274MB model, then exports for CPU inference)
 echo.
 
 set PYTHONIOENCODING=utf-8
@@ -159,11 +84,6 @@ set PYTHONIOENCODING=utf-8
 if errorlevel 1 (
     echo [ERROR] ONNX export failed. The server will still work using PyTorch CPU ^(slower^).
 )
-
-REM --- Detect GPU backend ---
-echo.
-echo [INFO] Detecting GPU acceleration...
-"%VENV_PYTHON%" scripts\detect_gpu.py
 
 REM --- Register MCP server with available AI CLIs ---
 echo.

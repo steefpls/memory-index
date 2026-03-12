@@ -7,6 +7,12 @@ import logging
 import os
 import sys
 import threading
+from pathlib import Path
+
+# Ensure project root is on sys.path when run as `python src/server.py`
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -24,9 +30,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
-
-# Disable stdout (stdio transport only)
-sys.stdout = open(os.devnull, "w")
 
 # --- FastMCP server ---
 mcp = FastMCP("memory-index")
@@ -284,8 +287,6 @@ def _startup_check():
     threading.Thread(target=_bg_init, daemon=True, name="memory-index-startup").start()
 
 
-_startup_check()
-
-
 if __name__ == "__main__":
+    _startup_check()
     mcp.run(transport="stdio")

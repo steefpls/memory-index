@@ -10,14 +10,9 @@ dependencies = [
     "transformers",
     "einops",
     "onnxscript",
+    "onnxruntime",
     "networkx",
 ]
-
-# NOTE: onnxruntime is NOT listed in dependencies. The correct GPU-specific variant
-# (onnxruntime-gpu for NVIDIA, onnxruntime-directml for AMD/Intel, or plain
-# onnxruntime for CPU) is installed by setup.bat via scripts/detect_gpu.py.
-# These packages share the same Python namespace and CONFLICT if co-installed.
-# Never add any onnxruntime variant here — setup.bat handles it.
 
 [project.optional-dependencies]
 dev = ["pytest"]
