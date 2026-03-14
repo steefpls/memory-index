@@ -48,7 +48,7 @@ if errorlevel 1 (
 )
 
 echo [INFO] Installing core packages...
-"%VENV_PYTHON%" -m pip install -q "mcp[cli]" chromadb networkx onnxruntime
+"%VENV_PYTHON%" -m pip install -q "mcp[cli]" chromadb networkx scikit-learn onnxruntime
 if errorlevel 1 (
     echo [ERROR] Failed to install core packages.
     set "EXIT_CODE=1"

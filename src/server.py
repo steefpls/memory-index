@@ -1,10 +1,10 @@
 """Memory Index MCP server — persistent entity/observation/relation memory.
 
-Provides 20 MCP tools for knowledge management via FastMCP:
+Provides 21 MCP tools for knowledge management via FastMCP:
 - 5 entity tools, 2 observation tools, 2 relation tools
-- 2 search tools (semantic + graph-boosted with RRF fusion)
+- 2 search tools (semantic + spreading activation with RRF fusion)
 - 3 temporal tools (timeline, point-in-time, temporal neighbors)
-- 1 graph analysis tool (PageRank, Louvain communities, knowledge gaps)
+- 2 graph analysis tools (PageRank/Louvain/gaps + Librarian clustering)
 - 5 status/vault tools
 """
 
@@ -335,6 +335,28 @@ def analyze_graph(vault: str = "", top_n: int = 20,
     """
     from src.tools.graph_analysis import tool_analyze_graph
     return tool_analyze_graph(vault, top_n, output_format)
+
+
+@mcp.tool()
+def run_librarian(vault: str = "", eps: float = 0.5,
+                  min_samples: int = 2,
+                  output_format: str = "text") -> str:
+    """Run the Librarian: discover knowledge clusters and structural gaps.
+
+    Analyzes all observation embeddings using DBSCAN clustering to find
+    concept groups, then checks the knowledge graph for structural gaps —
+    clusters of semantically similar entities that lack graph relations.
+    Produces an actionable report suggesting missing connections.
+
+    Args:
+        vault: Vault to analyze (required).
+        eps: DBSCAN epsilon — max cosine distance within a cluster.
+             Lower = tighter clusters (default 0.5).
+        min_samples: Min observations to form a cluster (default 2).
+        output_format: "text" (default) or "json".
+    """
+    from src.tools.librarian import tool_run_librarian
+    return tool_run_librarian(vault, eps, min_samples, output_format)
 
 
 # ========== Status Tools ==========

@@ -12,6 +12,7 @@ dependencies = [
     "onnxscript",
     "onnxruntime",
     "networkx",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
