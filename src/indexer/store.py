@@ -6,6 +6,7 @@ text into ChromaDB for semantic retrieval.
 
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from src.models.entity import Entity
 from src.models.observation import Observation
 
 _RECALIBRATE_EVERY = 10  # auto-recalibrate after every N observations per vault
+_LIBRARIAN_EVERY = 10    # auto-run librarian after every N observations per vault
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +320,23 @@ def add_observation(entity_id: str, content: str, source: str = "",
         except Exception as e:
             logger.warning("Auto-recalibration failed for vault '%s': %s",
                            ent.vault, e)
+
+    # Auto-run librarian every N observations (background thread)
+    if vault_obs_count > 0 and vault_obs_count % _LIBRARIAN_EVERY == 0:
+        def _bg_librarian(vault_name: str):
+            try:
+                from src.tools.librarian import tool_run_librarian
+                report = tool_run_librarian(vault_name)
+                logger.info("Auto-librarian for vault '%s' at %d observations:\n%s",
+                            vault_name, vault_obs_count, report)
+            except Exception as e:
+                logger.warning("Auto-librarian failed for vault '%s': %s",
+                               vault_name, e)
+
+        threading.Thread(
+            target=_bg_librarian, args=(ent.vault,),
+            daemon=True, name="memory-index-auto-librarian",
+        ).start()
 
     return obs
 
