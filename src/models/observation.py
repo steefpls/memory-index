@@ -11,7 +11,6 @@ class Observation:
     entity_id: str
     content: str
     source: str = ""
-    confidence: float = 1.0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     deleted: bool = False
     superseded_by: str = ""  # ID of the observation that replaced this one
@@ -35,7 +34,6 @@ class Observation:
             "entity_id": self.entity_id,
             "content": self.content,
             "source": self.source,
-            "confidence": self.confidence,
             "created_at": self.created_at,
             "deleted": self.deleted,
         }
@@ -50,7 +48,6 @@ class Observation:
             entity_id=d["entity_id"],
             content=d["content"],
             source=d.get("source", ""),
-            confidence=d.get("confidence", 1.0),
             created_at=d.get("created_at", ""),
             deleted=d.get("deleted", False),
             superseded_by=d.get("superseded_by", ""),

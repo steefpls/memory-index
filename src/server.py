@@ -118,7 +118,6 @@ def list_entities(vault: str = "", entity_type: str = "",
 @mcp.tool()
 def add_observation(name_or_id: str, content: str,
                     vault: str = "", source: str = "",
-                    confidence: float = 1.0,
                     supersedes: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
@@ -127,13 +126,11 @@ def add_observation(name_or_id: str, content: str,
         content: The observation text.
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution.
-        confidence: Confidence level (0.0 to 1.0, default 1.0).
         supersedes: Optional observation ID that this replaces. The old
                     observation is kept for history but excluded from search.
     """
     from src.tools.entities import tool_add_observation
-    return tool_add_observation(name_or_id, content, vault, source, confidence,
-                                supersedes)
+    return tool_add_observation(name_or_id, content, vault, source, supersedes)
 
 
 @mcp.tool()

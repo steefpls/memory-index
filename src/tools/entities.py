@@ -85,8 +85,7 @@ def tool_get_entity(name_or_id: str, vault: str = "") -> str:
         lines.append(f"Observations ({len(obs_list)}):")
         for obs in obs_list:
             src = f" [source: {obs.source}]" if obs.source else ""
-            conf = f" (confidence: {obs.confidence})" if obs.confidence < 1.0 else ""
-            lines.append(f"  - {obs.content}{src}{conf}")
+            lines.append(f"  - {obs.content}{src}")
             lines.append(f"    ID: {obs.id}")
         lines.append("")
 
@@ -199,7 +198,6 @@ def tool_list_entities(vault: str = "", entity_type: str = "",
 
 def tool_add_observation(name_or_id: str, content: str,
                          vault: str = "", source: str = "",
-                         confidence: float = 1.0,
                          supersedes: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
@@ -208,7 +206,6 @@ def tool_add_observation(name_or_id: str, content: str,
         content: The observation text.
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution.
-        confidence: Confidence level (0.0 to 1.0, default 1.0).
         supersedes: Optional observation ID that this replaces. The old
                     observation is kept for history but excluded from search.
 
@@ -219,7 +216,7 @@ def tool_add_observation(name_or_id: str, content: str,
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    obs = add_observation(entity.id, content, source=source, confidence=confidence,
+    obs = add_observation(entity.id, content, source=source,
                           supersedes=supersedes)
     if obs is None:
         return "Error: failed to add observation."

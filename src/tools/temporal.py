@@ -220,7 +220,6 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
                     "id": o.id,
                     "content": o.content,
                     "source": o.source,
-                    "confidence": o.confidence,
                     "created_at": o.created_at,
                 }
                 for o in obs_at_time

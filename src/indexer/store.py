@@ -228,7 +228,6 @@ def resolve_entity(name_or_id: str, vault: str | None = None) -> Entity | None:
 # --- Observation CRUD ---
 
 def add_observation(entity_id: str, content: str, source: str = "",
-                    confidence: float = 1.0,
                     supersedes: str = "") -> Observation | None:
     """Add an observation to an entity and embed it in ChromaDB.
 
@@ -236,7 +235,6 @@ def add_observation(entity_id: str, content: str, source: str = "",
         entity_id: Entity to attach to.
         content: Observation text.
         source: Optional source attribution.
-        confidence: Confidence level (0.0 to 1.0).
         supersedes: Optional observation ID that this new observation replaces.
                     The old observation is marked superseded and removed from search.
     """
@@ -250,7 +248,6 @@ def add_observation(entity_id: str, content: str, source: str = "",
         entity_id=entity_id,
         content=content,
         source=source,
-        confidence=confidence,
     )
     _observations[obs.id] = obs
 
@@ -270,7 +267,6 @@ def add_observation(entity_id: str, content: str, source: str = "",
                         "entity_type": ent.entity_type,
                         "content": old_obs.content,
                         "source": old_obs.source,
-                        "confidence": old_obs.confidence,
                         "vault": ent.vault,
                         "created_at": old_obs.created_at,
                         "superseded_by": obs.id,
@@ -295,7 +291,6 @@ def add_observation(entity_id: str, content: str, source: str = "",
                 "entity_type": ent.entity_type,
                 "content": content,
                 "source": source,
-                "confidence": confidence,
                 "vault": ent.vault,
                 "created_at": obs.created_at,
             }],
@@ -402,7 +397,6 @@ def _reembed_entity_observations(entity: Entity) -> None:
                 "entity_type": entity.entity_type,
                 "content": obs.content,
                 "source": obs.source,
-                "confidence": obs.confidence,
                 "vault": entity.vault,
                 "created_at": obs.created_at,
             })
