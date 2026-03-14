@@ -227,8 +227,13 @@ def tool_run_librarian(vault: str = "", eps: float = 0.5,
     if vault not in VAULTS:
         return f"Error: Unknown vault '{vault}'. Use list_vaults() to see available vaults."
 
+    import time
+    t0 = time.perf_counter()
+
     # Fetch embeddings
+    logger.info("[librarian] fetching embeddings for vault '%s'", vault)
     obs_ids, entity_ids, embeddings = _fetch_embeddings(vault)
+    logger.info("[librarian] fetched %d embeddings in %.2fs", len(obs_ids), time.perf_counter() - t0)
     if len(obs_ids) == 0:
         return f"No observations in vault '{vault}'. Nothing to analyze."
 
@@ -236,18 +241,26 @@ def tool_run_librarian(vault: str = "", eps: float = 0.5,
         return f"Only {len(obs_ids)} observations in vault '{vault}'. Need at least {min_samples} for clustering."
 
     # Run DBSCAN
+    t1 = time.perf_counter()
+    logger.info("[librarian] running DBSCAN (eps=%.2f, min_samples=%d, n=%d)", eps, min_samples, len(obs_ids))
     labels = _run_dbscan(embeddings, eps=eps, min_samples=min_samples)
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int((labels == -1).sum())
+    logger.info("[librarian] DBSCAN done in %.2fs: %d clusters, %d noise", time.perf_counter() - t1, n_clusters, n_noise)
 
     # Build cluster metadata
+    t2 = time.perf_counter()
     clusters = _build_clusters(labels, obs_ids, entity_ids, embeddings)
+    logger.info("[librarian] built clusters in %.2fs", time.perf_counter() - t2)
 
     # Detect structural gaps
+    t3 = time.perf_counter()
     graph = get_graph()
     gaps = _detect_gaps(clusters, graph)
+    logger.info("[librarian] gap detection in %.2fs, found %d gaps", time.perf_counter() - t3, len(gaps))
 
     # Build report
+    logger.info("[librarian] total elapsed: %.2fs", time.perf_counter() - t0)
     report = {
         "vault": vault,
         "total_observations": len(obs_ids),

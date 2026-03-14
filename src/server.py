@@ -411,6 +411,15 @@ def _startup_check():
     from src.config import VAULTS
     logger.info("memory-index starting: %d vaults configured", len(VAULTS))
 
+    # Pre-import heavy C extension libraries (numpy, sklearn, onnxruntime)
+    # BEFORE launching the background init thread. On Windows, concurrent
+    # first-imports of C extensions can deadlock on the DLL loader lock.
+    import numpy  # noqa: F401
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        pass
+
     # Start search backend init eagerly
     def _bg_init():
         try:
