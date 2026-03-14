@@ -1,6 +1,11 @@
 """Memory Index MCP server — persistent entity/observation/relation memory.
 
-Provides 15 MCP tools for knowledge management via FastMCP.
+Provides 20 MCP tools for knowledge management via FastMCP:
+- 5 entity tools, 2 observation tools, 2 relation tools
+- 2 search tools (semantic + graph-boosted with RRF fusion)
+- 3 temporal tools (timeline, point-in-time, temporal neighbors)
+- 1 graph analysis tool (PageRank, Louvain communities, knowledge gaps)
+- 5 status/vault tools
 """
 
 import logging
@@ -179,31 +184,34 @@ def delete_relation(relation_id: str) -> str:
 
 @mcp.tool()
 def search_memory(query: str, vault: str = "", n_results: int = 10,
-                   entity_type: str = "", include_neighbors: bool = True,
+                   entity_type: str = "",
                    since: str = "", before: str = "",
                    include_superseded: bool = False,
+                   strategy: str = "associative",
                    output_format: str = "text") -> str:
-    """Semantic memory search with graph boosting across knowledge entities.
+    """Semantic memory search with spreading activation and RRF fusion.
 
     Finds entities and observations matching your query using vector similarity,
-    then expands results via graph relations for connected context.
+    then explores the knowledge graph outward from hits via spreading activation,
+    and merges both rankings with Reciprocal Rank Fusion.
 
     Args:
         query: Natural language query describing what you're looking for.
         vault: Vault to search (empty = search all vaults).
         n_results: Number of results (default 10, max 30).
         entity_type: Optional entity type filter.
-        include_neighbors: Include graph-connected entities (default True).
         since: Only include observations created after this ISO date/datetime
                (e.g., "2026-03-01", "2026-03-13T10:00:00").
         before: Only include observations created before this ISO date/datetime.
         include_superseded: Include observations that have been replaced by
                             newer ones (default False). Useful for history queries.
+        strategy: "associative" (default — spreading activation + RRF fusion)
+                  or "semantic" (vector-only, no graph expansion).
         output_format: "text" (default) or "json".
     """
     from src.tools.search import search_memory as do_search
-    return do_search(query, vault, n_results, entity_type, include_neighbors,
-                     since, before, include_superseded, output_format)
+    return do_search(query, vault, n_results, entity_type,
+                     since, before, include_superseded, strategy, output_format)
 
 
 @mcp.tool()
@@ -245,6 +253,88 @@ def get_neighbors(entity_name_or_id: str, vault: str = "",
                      f"(depth: {nb['depth']}, weight: {nb['weight']}){ctx}")
 
     return "\n".join(lines)
+
+
+# ========== Temporal Tools ==========
+
+@mcp.tool()
+def query_timeline(vault: str = "", start: str = "", end: str = "",
+                   entity_type: str = "", limit: int = 50,
+                   output_format: str = "text") -> str:
+    """Query observations across a time range, ordered chronologically.
+
+    Returns a timeline of facts/events within the specified window,
+    grouped by date.
+
+    Args:
+        vault: Vault to query (empty = all vaults).
+        start: Start date/datetime (ISO format, inclusive). Empty = no lower bound.
+        end: End date/datetime (ISO format, exclusive). Empty = no upper bound.
+        entity_type: Optional filter by entity type.
+        limit: Max results (default 50, max 200).
+        output_format: "text" (default) or "json".
+    """
+    from src.tools.temporal import tool_query_timeline
+    return tool_query_timeline(vault, start, end, entity_type, limit, output_format)
+
+
+@mcp.tool()
+def point_in_time(entity_name_or_id: str, as_of: str,
+                  vault: str = "", output_format: str = "text") -> str:
+    """Get what was known about an entity at a specific point in time.
+
+    Reconstructs entity state by including only observations that existed
+    at the given timestamp, correctly handling superseding chains — if an
+    observation was superseded before as_of, only the replacement is shown.
+
+    Args:
+        entity_name_or_id: Entity name or ID.
+        as_of: ISO date/datetime — the point in time to query.
+        vault: Vault name (helps disambiguate).
+        output_format: "text" (default) or "json".
+    """
+    from src.tools.temporal import tool_point_in_time
+    return tool_point_in_time(entity_name_or_id, as_of, vault, output_format)
+
+
+@mcp.tool()
+def get_temporal_neighbors(entity_name_or_id: str, vault: str = "",
+                           direction: str = "both", limit: int = 10,
+                           output_format: str = "text") -> str:
+    """Get entities temporally adjacent to a given entity.
+
+    Finds graph neighbors and sorts them by observation timestamps,
+    showing what was learned before or after the target entity.
+
+    Args:
+        entity_name_or_id: Entity name or ID.
+        vault: Vault name (helps disambiguate).
+        direction: "before", "after", or "both" (default).
+        limit: Max results (default 10, max 50).
+        output_format: "text" (default) or "json".
+    """
+    from src.tools.temporal import tool_get_temporal_neighbors
+    return tool_get_temporal_neighbors(entity_name_or_id, vault, direction, limit, output_format)
+
+
+# ========== Graph Analysis Tools ==========
+
+@mcp.tool()
+def analyze_graph(vault: str = "", top_n: int = 20,
+                  output_format: str = "text") -> str:
+    """Analyze the knowledge graph: PageRank centrality, community detection,
+    and knowledge gap identification.
+
+    Returns the most important entities (by PageRank), detected communities
+    (Louvain), and under-documented entities that may need more observations.
+
+    Args:
+        vault: Optional vault filter for knowledge gaps (empty = all).
+        top_n: Number of top PageRank results (default 20).
+        output_format: "text" (default) or "json".
+    """
+    from src.tools.graph_analysis import tool_analyze_graph
+    return tool_analyze_graph(vault, top_n, output_format)
 
 
 # ========== Status Tools ==========

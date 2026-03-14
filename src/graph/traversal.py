@@ -76,35 +76,155 @@ def get_neighbors(entity_id: str, max_depth: int = 1,
     return neighbors
 
 
-def get_graph_boost_entity_ids(entity_ids: set[str], max_depth: int = 1) -> dict[str, float]:
-    """Get entity IDs that should receive a graph boost in search results.
+def spread_activation(seed_ids: set[str], decay: float = 0.7,
+                      max_hops: int = 3, top_k: int = 10) -> dict[str, float]:
+    """Spreading activation from seed entities through the graph.
 
-    For each input entity, finds 1-hop neighbors and assigns a boost score
-    based on relation weight and depth.
+    Energy starts at 1.0 on each seed, then propagates to neighbors with
+    decay per hop. Energy accumulates across paths. Lateral inhibition
+    keeps only top-K per hop to prevent explosion.
 
     Args:
-        entity_ids: Set of entity IDs from vector search results.
-        max_depth: Traversal depth (default 1).
+        seed_ids: Starting entity IDs (typically from vector search).
+        decay: Energy decay per hop (0.0 to 1.0, default 0.7).
+        max_hops: Max traversal depth (default 3).
+        top_k: Keep only top-K activated nodes per hop (default 10).
 
     Returns:
-        Dict mapping entity_id -> boost_score (0.0 to 1.0).
+        Dict mapping entity_id -> activation energy (higher = more relevant).
     """
     graph = get_graph()
-    boosted: dict[str, float] = {}
+    activation: dict[str, float] = {sid: 1.0 for sid in seed_ids
+                                     if graph.has_node(sid)}
 
-    for eid in entity_ids:
-        neighbors = get_neighbors(eid, max_depth=max_depth)
-        for nb in neighbors:
-            nb_id = nb["entity_id"]
-            if nb_id in entity_ids:
-                continue  # already in results, don't boost
-            weight = nb.get("weight", 1.0)
-            depth = nb.get("depth", 1)
-            # Boost decays with depth: 0.3 at depth 1, 0.15 at depth 2
-            boost = 0.3 * weight / depth
-            boosted[nb_id] = max(boosted.get(nb_id, 0.0), boost)
+    if not activation:
+        return {}
 
-    return boosted
+    # Track all accumulated energy
+    total_energy: dict[str, float] = dict(activation)
+    visited_seeds = set(seed_ids)
+
+    frontier = dict(activation)
+    for hop in range(max_hops):
+        next_frontier: dict[str, float] = {}
+
+        for node_id, energy in frontier.items():
+            # Outgoing edges
+            for _, target, data in graph.out_edges(node_id, data=True):
+                weight = data.get("weight", 1.0)
+                propagated = energy * decay * weight
+                next_frontier[target] = next_frontier.get(target, 0.0) + propagated
+
+            # Incoming edges
+            for source, _, data in graph.in_edges(node_id, data=True):
+                weight = data.get("weight", 1.0)
+                propagated = energy * decay * weight
+                next_frontier[source] = next_frontier.get(source, 0.0) + propagated
+
+        if not next_frontier:
+            break
+
+        # Lateral inhibition: keep only top-K
+        sorted_next = sorted(next_frontier.items(), key=lambda x: -x[1])[:top_k]
+        frontier = dict(sorted_next)
+
+        # Accumulate energy
+        for node_id, energy in frontier.items():
+            total_energy[node_id] = total_energy.get(node_id, 0.0) + energy
+
+    # Remove seeds from results (caller already has them)
+    for sid in seed_ids:
+        total_energy.pop(sid, None)
+
+    return total_energy
+
+
+def compute_pagerank(top_n: int = 20, alpha: float = 0.85) -> list[dict]:
+    """Compute PageRank over the knowledge graph.
+
+    Args:
+        top_n: Number of top-ranked entities to return (default 20).
+        alpha: Damping factor (default 0.85).
+
+    Returns:
+        List of dicts with entity_id and pagerank score, sorted descending.
+    """
+    graph = get_graph()
+    if graph.number_of_nodes() == 0:
+        return []
+
+    try:
+        pr = nx.pagerank(graph, alpha=alpha)
+    except nx.PowerIterationFailedConvergence:
+        logger.warning("PageRank failed to converge, using default alpha=0.85")
+        pr = nx.pagerank(graph, alpha=0.85, max_iter=200)
+
+    sorted_pr = sorted(pr.items(), key=lambda x: -x[1])[:top_n]
+    return [{"entity_id": eid, "pagerank": round(score, 6)}
+            for eid, score in sorted_pr]
+
+
+def detect_communities() -> list[list[str]]:
+    """Detect communities in the knowledge graph using Louvain method.
+
+    Returns:
+        List of communities, each a list of entity IDs. Sorted by size descending.
+    """
+    graph = get_graph()
+    if graph.number_of_nodes() == 0:
+        return []
+
+    undirected = graph.to_undirected()
+    try:
+        communities = nx.community.louvain_communities(undirected)
+    except Exception as e:
+        logger.warning("Louvain community detection failed: %s", e)
+        return []
+
+    # Sort by size descending, convert sets to lists
+    sorted_communities = sorted(communities, key=len, reverse=True)
+    return [list(c) for c in sorted_communities]
+
+
+def find_knowledge_gaps(min_observations: int = 2) -> list[dict]:
+    """Find entities that are important (high PageRank) but under-documented.
+
+    An entity with high graph centrality but few observations is a knowledge
+    gap — it's referenced a lot but we don't know much about it.
+
+    Args:
+        min_observations: Entities with fewer observations than this are
+                          considered under-documented (default 2).
+
+    Returns:
+        List of dicts with entity_id, pagerank, observation_count.
+    """
+    from src.indexer.store import get_observations, get_entity
+
+    graph = get_graph()
+    if graph.number_of_nodes() == 0:
+        return []
+
+    pr = nx.pagerank(graph, alpha=0.85)
+
+    gaps = []
+    for eid, score in pr.items():
+        ent = get_entity(eid)
+        if ent is None:
+            continue
+        obs_count = len(get_observations(eid))
+        if obs_count < min_observations:
+            gaps.append({
+                "entity_id": eid,
+                "entity_name": ent.name,
+                "entity_type": ent.entity_type,
+                "vault": ent.vault,
+                "pagerank": round(score, 6),
+                "observation_count": obs_count,
+            })
+
+    gaps.sort(key=lambda x: -x["pagerank"])
+    return gaps
 
 
 def get_graph_summary() -> dict:

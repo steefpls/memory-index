@@ -189,16 +189,18 @@ class TestGraphTraversal(unittest.TestCase):
         self.assertIn("uses", summary["relation_types"])
         self.assertIn("depends_on", summary["relation_types"])
 
-    def test_graph_boost(self):
-        from src.graph.traversal import get_graph_boost_entity_ids
+    def test_spreading_activation(self):
+        from src.graph.traversal import spread_activation
 
-        # e1 is in results, should boost e2 and e4 (1-hop neighbors)
-        boosted = get_graph_boost_entity_ids({"e1"})
-        self.assertIn("e2", boosted)
-        self.assertIn("e4", boosted)
-        self.assertNotIn("e1", boosted)  # already in results
-        # e3 is 2 hops away, should NOT be boosted at depth=1
-        self.assertNotIn("e3", boosted)
+        # e1 is seed, should activate e2 and e4 (1-hop neighbors)
+        activated = spread_activation({"e1"}, decay=0.7, max_hops=2, top_k=10)
+        self.assertIn("e2", activated)
+        self.assertIn("e4", activated)
+        self.assertNotIn("e1", activated)  # seeds excluded from results
+        # e3 is 2 hops away, should be activated at max_hops=2
+        self.assertIn("e3", activated)
+        # e2 (1 hop) should have more energy than e3 (2 hops)
+        self.assertGreater(activated["e2"], activated["e3"])
 
 
 if __name__ == "__main__":

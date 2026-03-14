@@ -1,4 +1,4 @@
-"""Hybrid vector + graph-boosted memory search."""
+"""Hybrid vector + spreading-activation memory search with RRF fusion."""
 
 import json
 import logging
@@ -10,7 +10,7 @@ from src.config import VAULTS, get_vault
 from src.indexer.embedder import get_collection, get_embedding_function, get_active_backend
 from src.indexer.calibration import get_thresholds
 from src.indexer.store import get_entity, get_observations, resolve_entity
-from src.graph.traversal import get_neighbors, get_graph_boost_entity_ids
+from src.graph.traversal import spread_activation
 
 logger = logging.getLogger(__name__)
 
@@ -34,22 +34,28 @@ def invalidate_calibration_cache(vault: str | None = None) -> None:
 
 
 def search_memory(query: str, vault: str = "", n_results: int = 10,
-                   entity_type: str = "", include_neighbors: bool = True,
+                   entity_type: str = "",
                    since: str = "", before: str = "",
                    include_superseded: bool = False,
+                   strategy: str = "associative",
                    output_format: str = "text") -> str:
-    """Hybrid vector + graph-boosted semantic memory search.
+    """Hybrid vector + graph memory search with spreading activation and RRF fusion.
+
+    Default strategy uses spreading activation to explore the knowledge graph
+    outward from vector search hits, then merges both rankings via Reciprocal
+    Rank Fusion. Use "semantic" for vector-only search without graph expansion.
 
     Args:
         query: Natural language query describing what you're looking for.
         vault: Vault to search (empty = search all vaults).
         n_results: Number of results (default 10, max 30).
         entity_type: Optional entity type filter.
-        include_neighbors: Include graph-connected entities (default True).
         since: Only include observations created after this ISO date/datetime.
         before: Only include observations created before this ISO date/datetime.
         include_superseded: If True, include observations that have been replaced
                             by newer ones. Default False (only current facts).
+        strategy: "associative" (default — spreading activation + RRF fusion)
+                  or "semantic" (vector-only, no graph expansion).
         output_format: "text" (default) or "json".
 
     Returns:
@@ -60,6 +66,9 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
         return "Error: output_format must be 'text' or 'json'."
 
     n_results = min(max(n_results, 1), 30)
+    strategy = (strategy or "associative").lower()
+    if strategy not in {"associative", "semantic"}:
+        strategy = "associative"
 
     # Determine which vaults to search
     if vault:
@@ -167,26 +176,29 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
             entity_observations[eid] = []
         entity_observations[eid].append(item)
 
-    # Graph boost: expand via neighbors
-    if include_neighbors and entity_best:
+    # Graph expansion via spreading activation + RRF fusion
+    if strategy == "associative" and entity_best:
         result_entity_ids = set(entity_best.keys())
-        boosted = get_graph_boost_entity_ids(result_entity_ids)
 
-        for boosted_eid, boost_score in boosted.items():
-            if boosted_eid in entity_best:
+        activated = spread_activation(
+            seed_ids=result_entity_ids,
+            decay=0.7, max_hops=3, top_k=10,
+        )
+
+        # Collect graph-discovered entities
+        graph_items: list[dict] = []
+        for activated_eid, energy in activated.items():
+            if activated_eid in entity_best:
                 continue
-            ent = get_entity(boosted_eid)
+            ent = get_entity(activated_eid)
             if ent is None:
                 continue
-            obs_list = get_observations(boosted_eid)
+            obs_list = get_observations(activated_eid)
             if not obs_list:
                 continue
-            # Use the best observation's content as representative
             best_obs = obs_list[0]
-            # Synthesize a result with boosted distance
             worst_distance = max(item["distance"] for item in all_items)
-            synthetic_distance = worst_distance * (1.0 + (1.0 - boost_score))
-            entity_best[boosted_eid] = {
+            graph_items.append({
                 "observation_id": best_obs.id,
                 "entity_id": ent.id,
                 "entity_name": ent.name,
@@ -195,10 +207,11 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
                 "source": best_obs.source,
                 "confidence": best_obs.confidence,
                 "vault": ent.vault,
-                "distance": synthetic_distance,
+                "distance": worst_distance,
                 "graph_boosted": True,
-            }
-            entity_observations[boosted_eid] = [
+                "_energy": energy,
+            })
+            entity_observations[activated_eid] = [
                 {
                     "observation_id": o.id,
                     "content": o.content,
@@ -207,12 +220,34 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
                 for o in obs_list
             ]
 
-    # Sort by normalized score
-    sorted_entities = sorted(
-        entity_best.values(),
-        key=lambda x: _normalized_score(x["distance"], x["vault"]),
-        reverse=True,
-    )
+        if graph_items:
+            # RRF fusion: merge vector-ranked and graph-ranked results
+            vector_ranked = sorted(entity_best.values(), key=lambda x: x["distance"])
+            graph_ranked = sorted(graph_items, key=lambda x: x["_energy"], reverse=True)
+
+            rrf_scores = _rrf_merge(vector_ranked, graph_ranked)
+
+            for item in graph_items:
+                entity_best[item["entity_id"]] = item
+
+            sorted_entities = sorted(
+                entity_best.values(),
+                key=lambda x: rrf_scores.get(x["entity_id"], 0.0),
+                reverse=True,
+            )
+        else:
+            sorted_entities = sorted(
+                entity_best.values(),
+                key=lambda x: _normalized_score(x["distance"], x["vault"]),
+                reverse=True,
+            )
+    else:
+        # Semantic-only: sort by normalized score
+        sorted_entities = sorted(
+            entity_best.values(),
+            key=lambda x: _normalized_score(x["distance"], x["vault"]),
+            reverse=True,
+        )
 
     # Trim to n_results
     sorted_entities = sorted_entities[:n_results]
@@ -280,6 +315,34 @@ def _ensure_search_backend_init_started() -> threading.Event:
         )
         _search_init_thread.start()
         return _search_init_event
+
+
+def _rrf_merge(vector_ranked: list[dict], graph_ranked: list[dict],
+               k: int = 60) -> dict[str, float]:
+    """Reciprocal Rank Fusion — merge vector and graph result rankings.
+
+    Combines rankings from two sources using RRF scoring:
+      score(entity) = sum(1 / (k + rank_i)) across all lists.
+
+    Args:
+        vector_ranked: Entities ranked by vector distance (best first).
+        graph_ranked: Entities ranked by activation energy (best first).
+        k: Smoothing constant (default 60, standard RRF value).
+
+    Returns:
+        Dict mapping entity_id -> RRF score (higher is better).
+    """
+    scores: dict[str, float] = {}
+
+    for rank, item in enumerate(vector_ranked, 1):
+        eid = item["entity_id"]
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+
+    for rank, item in enumerate(graph_ranked, 1):
+        eid = item["entity_id"]
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+
+    return scores
 
 
 def _get_thresholds_cached(vault: str) -> dict:
