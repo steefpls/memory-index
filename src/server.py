@@ -1,10 +1,10 @@
 """Memory Index MCP server — persistent entity/observation/relation memory.
 
-Provides 21 MCP tools for knowledge management via FastMCP:
+Provides 22 MCP tools for knowledge management via FastMCP:
 - 5 entity tools, 2 observation tools, 2 relation tools
 - 2 search tools (semantic + spreading activation with RRF fusion)
 - 3 temporal tools (timeline, point-in-time, temporal neighbors)
-- 2 graph analysis tools (PageRank/Louvain/gaps + Librarian clustering)
+- 3 graph analysis tools (PageRank/Louvain/gaps + Librarian clustering + visualization)
 - 5 status/vault tools
 """
 
@@ -354,6 +354,21 @@ def run_librarian(vault: str = "", eps: float = 0.5,
     """
     from src.tools.librarian import tool_run_librarian
     return tool_run_librarian(vault, eps, min_samples, output_format)
+
+
+@mcp.tool()
+def visualize_graph(vault: str = "") -> str:
+    """Generate an interactive knowledge graph visualization and open in browser.
+
+    Builds a self-contained HTML file with Cytoscape.js showing all entities
+    as color-coded nodes and relations as directed edges. Click a node to see
+    its observations and relations in a side panel.
+
+    Args:
+        vault: Optional vault filter (empty = all vaults).
+    """
+    from src.tools.visualize import tool_visualize_graph
+    return tool_visualize_graph(vault)
 
 
 # ========== Status Tools ==========
