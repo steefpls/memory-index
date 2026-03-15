@@ -545,29 +545,43 @@ function selectNode(node) {
   const d = node.data();
 
   // Highlight neighborhood
-  cy.elements().removeClass('highlighted faded');
+  cy.elements().removeClass('highlighted faded trail-node trail-edge');
   const neighborhood = node.closedNeighborhood();
   neighborhood.addClass('highlighted');
   cy.elements().not(neighborhood).addClass('faded');
-  // Keep trail nodes visible
-  trail.forEach(t => {
-    cy.getElementById(t.id).removeClass('faded');
+
+  // Re-apply trail styling to trail nodes/edges
+  trail.forEach((t, i) => {
+    const trailNode = cy.getElementById(t.id);
+    trailNode.removeClass('faded').addClass('trail-node');
+    if (i > 0) {
+      const prevId = trail[i - 1].id;
+      cy.getElementById(prevId).edgesWith(trailNode).removeClass('faded').addClass('trail-edge');
+    }
   });
 
   // Add to trail
   if (trail.length === 0 || trail[trail.length - 1].id !== d.id) {
-    // Find relation label between last trail node and this one
+    // Check if this node is a neighbor of the last trail node
     let relLabel = '';
+    let isConnected = false;
     if (trail.length > 0) {
       const lastId = trail[trail.length - 1].id;
       const edges = cy.getElementById(lastId).edgesWith(node);
       if (edges.length > 0) {
         relLabel = edges[0].data('label') || '';
+        isConnected = true;
       }
     }
+
+    // If not connected to last trail node, reset trail
+    if (trail.length > 0 && !isConnected) {
+      cy.elements().removeClass('trail-node trail-edge');
+      trail.length = 0;
+    }
+
     trail.push({ id: d.id, label: d.label, relationLabel: relLabel });
     node.addClass('trail-node');
-    // Highlight trail edges
     if (trail.length > 1) {
       const prevId = trail[trail.length - 2].id;
       cy.getElementById(prevId).edgesWith(node).addClass('trail-edge');
