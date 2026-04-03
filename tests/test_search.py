@@ -31,13 +31,13 @@ class TestSearchScoring(unittest.TestCase):
         # Perfect match
         self.assertEqual(_normalized_score(0, "test"), 100.0)
 
-        # HIGH boundary -> 60%
+        # HIGH boundary -> 85%
         score_at_high = _normalized_score(650, "test")
-        self.assertAlmostEqual(score_at_high, 60.0, places=0)
+        self.assertAlmostEqual(score_at_high, 85.0, places=0)
 
-        # MEDIUM boundary -> 35%
+        # MEDIUM boundary -> 55%
         score_at_med = _normalized_score(775, "test")
-        self.assertAlmostEqual(score_at_med, 35.0, places=0)
+        self.assertAlmostEqual(score_at_med, 55.0, places=0)
 
         # LOW boundary -> 15%
         score_at_low = _normalized_score(875, "test")
