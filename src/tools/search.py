@@ -209,13 +209,15 @@ def search_memory(query: str, vault: str = "", n_results: int = 10,
                 "graph_boosted": True,
                 "_energy": energy,
             })
+            # Graph-boosted entities didn't match the query — keep only one
+            # representative observation. The full obs list is reachable via
+            # get_entity() if the caller decides this hit is worth drilling into.
             entity_observations[activated_eid] = [
                 {
-                    "observation_id": o.id,
-                    "content": o.content,
-                    "source": o.source,
+                    "observation_id": best_obs.id,
+                    "content": best_obs.content,
+                    "source": best_obs.source,
                 }
-                for o in obs_list
             ]
 
         if graph_items:
@@ -402,18 +404,38 @@ def _format_text(results: list[dict], entity_obs: dict[str, list[dict]],
         vault = item["vault"]
         confidence = _confidence_label(item["distance"], vault)
         score = _normalized_score(item["distance"], vault)
-        boosted = " [graph-boosted]" if item.get("graph_boosted") else ""
+        is_boosted = bool(item.get("graph_boosted"))
+        boosted = " [graph-boosted]" if is_boosted else ""
 
         lines.append(f"--- Result {i + 1} (relevance: {score}%, confidence: {confidence}{boosted}) ---")
         lines.append(f"  Entity: {item['entity_name']} ({item['entity_type']})")
         lines.append(f"  Vault: {vault}")
         lines.append(f"  Entity ID: {item['entity_id']}")
 
-        # Show matched observations
+        # Show top observations by relevance.
+        # Direct semantic hits keep their distance per observation, so we sort
+        # by distance ascending (best first). Graph-boosted hits have only one
+        # representative observation injected upstream — sort is a no-op there.
         obs_list = entity_obs.get(item["entity_id"], [])
         if obs_list:
-            lines.append(f"  Observations ({len(obs_list)}):")
-            for obs in obs_list[:5]:  # cap at 5 per entity
+            obs_sorted = sorted(obs_list, key=lambda o: o.get("distance", float("inf")))
+            cap = 1 if is_boosted else 3
+            shown = obs_sorted[:cap]
+
+            # Total observations on the entity (for the "showing N of M" hint).
+            # max(...) handles cases where the entity isn't in the store
+            # (e.g. unit-test fixtures) — fall back to len(obs_list).
+            total_obs = max(len(get_observations(item["entity_id"])), len(obs_list))
+
+            if total_obs > len(shown):
+                lines.append(
+                    f"  Observations (showing {len(shown)} of {total_obs} — "
+                    f"call get_entity('{item['entity_id']}') for full):"
+                )
+            else:
+                lines.append(f"  Observations ({total_obs}):")
+
+            for obs in shown:
                 src = f" [source: {obs.get('source', '')}]" if obs.get("source") else ""
                 old = " [superseded]" if obs.get("superseded") else ""
                 lines.append(f"    - {obs['content']}{src}{old}")
@@ -427,7 +449,14 @@ def _format_json(results: list[dict], entity_obs: dict[str, list[dict]],
     payload = {"query": query, "results": []}
     for i, item in enumerate(results):
         vault = item["vault"]
+        is_boosted = bool(item.get("graph_boosted"))
         obs_list = entity_obs.get(item["entity_id"], [])
+
+        obs_sorted = sorted(obs_list, key=lambda o: o.get("distance", float("inf")))
+        cap = 1 if is_boosted else 3
+        shown = obs_sorted[:cap]
+        total_obs = max(len(get_observations(item["entity_id"])), len(obs_list))
+
         payload["results"].append({
             "result_num": i + 1,
             "entity_id": item["entity_id"],
@@ -437,11 +466,13 @@ def _format_json(results: list[dict], entity_obs: dict[str, list[dict]],
             "distance": round(float(item["distance"]), 4),
             "relevance_pct": _normalized_score(item["distance"], vault),
             "confidence": _confidence_label(item["distance"], vault),
-            "graph_boosted": item.get("graph_boosted", False),
+            "graph_boosted": is_boosted,
+            "observations_shown": len(shown),
+            "observations_total": total_obs,
             "observations": [
                 {"id": o.get("observation_id", ""), "content": o["content"],
                  "source": o.get("source", "")}
-                for o in obs_list[:5]
+                for o in shown
             ],
         })
     return json.dumps(payload, indent=2)

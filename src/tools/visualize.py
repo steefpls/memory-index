@@ -486,6 +486,14 @@ cy.on('mouseout', 'node', function(evt) {
   node.connectedEdges().removeClass('hover');
 });
 
+// --- Direct edge hover: show relation label on the edge itself ---
+cy.on('mouseover', 'edge', function(evt) {
+  evt.target.addClass('hover');
+});
+cy.on('mouseout', 'edge', function(evt) {
+  evt.target.removeClass('hover');
+});
+
 // --- Single click: select + show panel + add to trail ---
 cy.on('tap', 'node', function(evt) {
   const node = evt.target;
