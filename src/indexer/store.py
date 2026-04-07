@@ -164,7 +164,11 @@ def update_entity(entity_id: str, name: str | None = None,
 
 
 def delete_entity(entity_id: str) -> bool:
-    """Soft delete an entity and its observations."""
+    """Soft delete an entity and its observations.
+
+    Also hard-removes any relations involving this entity from the graph,
+    so the graph never accumulates dangling references to deleted entities.
+    """
     _load_store()
     ent = _entities.get(entity_id)
     if ent is None or ent.deleted:
@@ -187,6 +191,16 @@ def delete_entity(entity_id: str) -> bool:
             collection.delete(ids=obs_ids_to_remove)
         except Exception as e:
             logger.warning("Failed to remove observations from ChromaDB: %s", e)
+
+    # Always clean up relations so the graph can't accumulate dangling edges.
+    # Imported here (not at module top) to avoid a circular import with graph.manager.
+    try:
+        from src.graph.manager import remove_entity_relations
+        removed = remove_entity_relations(entity_id)
+        if removed:
+            logger.info("Removed %d relations for deleted entity %s", removed, entity_id)
+    except Exception as e:
+        logger.warning("Failed to remove relations for entity %s: %s", entity_id, e)
 
     _save_store()
     logger.info("Soft deleted entity: %s (%s)", ent.name, entity_id)

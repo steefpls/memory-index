@@ -151,8 +151,8 @@ def tool_delete_entity(name_or_id: str, vault: str = "") -> str:
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    # Remove relations too
-    rel_count = remove_entity_relations(entity.id)
+    # Count relations before delete (delete_entity now cleans them up itself)
+    rel_count = len(get_relations_for_entity(entity.id))
     success = delete_entity(entity.id)
     if not success:
         return "Error: delete failed."

@@ -2,7 +2,10 @@
 
 import logging
 
-from src.config import VAULTS, list_vaults as config_list_vaults, create_vault as config_create_vault, delete_vault as config_delete_vault
+from src.config import (
+    get_vault, list_vaults as config_list_vaults,
+    create_vault as config_create_vault, delete_vault as config_delete_vault,
+)
 from src.indexer.store import get_entity_count, get_observation_count
 from src.indexer.embedder import get_active_backend
 from src.graph.manager import get_relation_count
@@ -94,7 +97,7 @@ def tool_create_vault(name: str) -> str:
         return "Error: vault name is required."
 
     name = name.strip()
-    if name in VAULTS:
+    if get_vault(name) is not None:
         return f"Vault '{name}' already exists."
 
     vault = config_create_vault(name)
@@ -114,31 +117,61 @@ def tool_delete_vault(name: str) -> str:
         return "Error: vault name is required."
 
     name = name.strip()
-    if name not in VAULTS:
+    vault_cfg = get_vault(name)
+    if vault_cfg is None:
         return f"Vault '{name}' not found."
 
-    from src.indexer.store import list_entities, delete_entity
-    from src.graph.manager import remove_entity_relations
+    from src.indexer import store as store_mod
+    from src.graph import manager as graph_mod
     from src.indexer.embedder import get_chroma_client
+    from src.config import DATA_DIR
 
-    # Delete all entities in this vault (cascades to observations + relations)
-    entities, _ = list_entities(vault=name, limit=10000)
-    for ent in entities:
-        remove_entity_relations(ent.id)
-        delete_entity(ent.id)
+    # Hard-remove entities, observations, and relations for this vault.
+    # We can drop them outright (rather than soft-delete) because the entire
+    # vault is going away — there's no audit trail to preserve.
+    store_mod._load_store()
+    graph_mod._get_graph()
 
-    # Drop the ChromaDB collection
-    vault_cfg = VAULTS[name]
+    vault_entity_ids = {
+        e.id for e in store_mod._entities.values() if e.vault == name
+    }
+    entity_count = len(vault_entity_ids)
+
+    # Remove relations involving any of these entities
+    for eid in vault_entity_ids:
+        graph_mod.remove_entity_relations(eid)
+
+    # Hard-pop observations and entities from the in-memory stores
+    obs_ids_to_drop = [
+        oid for oid, o in store_mod._observations.items()
+        if o.entity_id in vault_entity_ids
+    ]
+    for oid in obs_ids_to_drop:
+        store_mod._observations.pop(oid, None)
+    for eid in vault_entity_ids:
+        store_mod._entities.pop(eid, None)
+
+    store_mod._save_store()
+
+    # Drop the ChromaDB collection (cleans all vectors at once)
     try:
         client = get_chroma_client()
         client.delete_collection(vault_cfg.collection_name)
     except Exception as e:
         logger.warning("Failed to delete ChromaDB collection: %s", e)
 
+    # Remove the per-vault calibration sidecar, if present
+    cal_path = DATA_DIR / f"{name}_calibration.json"
+    if cal_path.exists():
+        try:
+            cal_path.unlink()
+        except OSError as e:
+            logger.warning("Failed to remove calibration file %s: %s", cal_path, e)
+
     # Remove vault config
     config_delete_vault(name)
 
-    return f"Vault '{name}' deleted ({len(entities)} entities removed)."
+    return f"Vault '{name}' deleted ({entity_count} entities removed)."
 
 
 def tool_get_graph_summary() -> str:

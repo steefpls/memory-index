@@ -416,6 +416,59 @@ def delete_vault(name: str) -> str:
     return tool_delete_vault(name)
 
 
+# ========== Import / Export ==========
+
+@mcp.tool()
+def export_vault(vault: str, output_path: str = "") -> str:
+    """Export a vault to a portable zip archive.
+
+    The archive contains JSON files with entities, observations, and
+    relations. Vector embeddings are not included — they are regenerated
+    on import, which keeps the archive small and portable across embedding
+    model changes.
+
+    Args:
+        vault: Vault name to export.
+        output_path: Optional output path. May be a directory (filename
+                     auto-generated as <vault>_<timestamp>.zip), an explicit
+                     .zip path, or empty (defaults to data/exports/).
+    """
+    from src.tools.portability import tool_export_vault
+    return tool_export_vault(vault, output_path)
+
+
+@mcp.tool()
+def vacuum_store(dry_run: bool = False) -> str:
+    """Hard-remove stale rows that accumulated despite soft-delete semantics.
+
+    Removes entities whose vault no longer exists, soft-deleted entities,
+    observations whose entity is gone, and relations with dangling endpoints.
+    Affected Chroma vectors are removed best-effort.
+
+    Args:
+        dry_run: If True, report what would be removed without modifying state.
+    """
+    from src.tools.maintenance import tool_vacuum_store
+    return tool_vacuum_store(dry_run)
+
+
+@mcp.tool()
+def import_vault(input_path: str, vault: str = "") -> str:
+    """Import a vault export zip into a target vault. Always additive.
+
+    Existing entities are matched by name and reused. Observations are
+    deduped by exact content per entity. Relations are deduped by
+    (from, to, relation_type). Nothing in the target vault is removed.
+
+    Args:
+        input_path: Path to a zip archive produced by export_vault.
+        vault: Target vault name. Defaults to the source vault recorded in
+               the archive's manifest. Auto-created if it doesn't exist.
+    """
+    from src.tools.portability import tool_import_vault
+    return tool_import_vault(input_path, vault)
+
+
 # --- Startup ---
 
 def _startup_check():

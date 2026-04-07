@@ -16,6 +16,12 @@ data/coderank_onnx/
 # Logs
 data/server.log
 
+# Vault export archives (user-generated)
+data/exports/
+
+# Cygwin/Git Bash crash dumps
+*.stackdump
+
 # Python
 __pycache__/
 *.pyc

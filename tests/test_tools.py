@@ -214,6 +214,74 @@ class TestStatusTools(unittest.TestCase):
         self.assertIn("Knowledge Graph Summary", result)
         self.assertIn("Nodes: 0", result)
 
+    def test_delete_vault_removes_calibration_file(self):
+        from src.tools.status import tool_create_vault, tool_delete_vault
+
+        # Need to mock the chroma client used by tool_delete_vault
+        with patch("src.indexer.embedder.get_chroma_client") as mock_client:
+            mock_client.return_value = MagicMock()
+
+            tool_create_vault("doomed")
+
+            # Simulate a calibration sidecar being written
+            cal_path = Path(self.tmpdir) / "doomed_calibration.json"
+            cal_path.write_text("{}", encoding="utf-8")
+            self.assertTrue(cal_path.exists())
+
+            tool_delete_vault("doomed")
+            self.assertFalse(cal_path.exists())
+
+    def test_delete_vault_no_calibration_file(self):
+        """delete_vault should succeed even if no calibration sidecar exists."""
+        from src.tools.status import tool_create_vault, tool_delete_vault
+
+        with patch("src.indexer.embedder.get_chroma_client") as mock_client:
+            mock_client.return_value = MagicMock()
+
+            tool_create_vault("doomed")
+            result = tool_delete_vault("doomed")
+            self.assertIn("deleted", result)
+
+    def test_delete_vault_leaves_no_orphans(self):
+        """delete_vault should hard-remove its entities, observations, and
+        relations — not leave them as orphans for vacuum to collect later."""
+        from src.tools.status import tool_create_vault, tool_delete_vault
+        from src.tools.entities import tool_create_entity
+        from src.tools.relations import tool_create_relation
+        import src.indexer.store as store_mod
+        import src.graph.manager as gm
+
+        with patch("src.indexer.embedder.get_chroma_client") as mock_client, \
+             patch("src.indexer.store.get_collection", return_value=MagicMock()), \
+             patch("src.indexer.store.get_embedding_function",
+                   return_value=MagicMock(return_value=[[0.1] * 768])):
+            mock_client.return_value = MagicMock()
+
+            tool_create_vault("doomed")
+            tool_create_entity("A", "concept", "doomed",
+                               observations="fact 1|fact 2")
+            tool_create_entity("B", "concept", "doomed",
+                               observations="fact 3")
+            tool_create_relation("A", "B", "related_to", "doomed")
+
+            # Sanity: data exists
+            self.assertEqual(
+                sum(1 for e in store_mod._entities.values() if e.vault == "doomed"),
+                2,
+            )
+            self.assertGreater(len(store_mod._observations), 0)
+            self.assertGreater(len(gm.get_all_relations()), 0)
+
+            tool_delete_vault("doomed")
+
+            # No orphans left in any store
+            self.assertEqual(
+                sum(1 for e in store_mod._entities.values() if e.vault == "doomed"),
+                0,
+            )
+            self.assertEqual(len(store_mod._observations), 0)
+            self.assertEqual(len(gm.get_all_relations()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
