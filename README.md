@@ -62,6 +62,69 @@ Search supports `since` and `before` filters using ISO date/datetime:
 search_memory("framework migration", since="2026-03-01", before="2026-03-14")
 ```
 
+## Agent Usage
+
+Rules for LLM agents (Claude Code, Codex CLI, etc.) writing to and reading from memory-index. Paste a condensed version of this section into your agent's system prompt / `CLAUDE.md` so the discipline is enforced at the agent layer — memory-index itself does not police it.
+
+### Read before answering
+
+Call `search_memory` before responding to questions that could plausibly involve stored context — people, projects, decisions, preferences, prior work. Never claim "I don't know" about the user's world without searching first. Re-search mid-conversation when new topics surface or before making recommendations that depend on prior decisions.
+
+### Search before writing
+
+Before `create_entity`, `add_observation`, or `create_relation`, call `search_memory` first. Then choose, in order of preference:
+
+1. `add_observation` on an existing entity (most common — entity exists, fact is new)
+2. `create_relation` between existing entities (the fact is implicit in the edge)
+3. `create_entity` only if nothing relevant exists
+
+Never duplicate facts. If fact X already lives on entity Y, link via relation — don't restate.
+
+### Atomicity — one observation = one atomic fact
+
+Observations are embedded individually. A packed observation ("Likes X, works at Y, based in Z") produces one embedding that represents none of those facts well, and semantic search degrades at the fact level.
+
+- One fact per `add_observation` call. Five facts → five calls.
+- No JSON arrays, comma-packed lists, or "consolidated" mega-observations.
+- Self-contained facts may rely on parent entity context — on entity `Alice`, the observation "Based in Singapore" is fine.
+- Cleanup happens via per-observation supersession (`supersedes=<old_id>`), never via bundling.
+
+### Attribution — facts about X live on X
+
+Ask: what is the *subject* of this fact? That's where the observation lives.
+
+- "Project P forks library L" → on entity `P`.
+- "Alice built P in one afternoon" → on entity `Alice` (the fact is about Alice's velocity).
+- "Company C laid off the QA team" → on entity `C`.
+- "Alice's salary at C is $X" → on entity `Alice`.
+
+Use relations liberally to connect across entities (`Alice -[works_at]-> C`, `Alice -[created]-> P`) rather than duplicating facts on both sides.
+
+### Source + date discipline
+
+- Populate the `source` field on every observation — chat date, file name, conversation context, web research summary. Sources make observations traceable and trustworthy later.
+- Convert relative dates to absolute in observation content. "Yesterday" → actual ISO date. "Last Thursday" → actual ISO date.
+
+### When NOT to write
+
+Skip writing observations that are:
+
+- Ephemeral conversation state ("currently debugging X", "in the middle of Y")
+- Derivable from code, git, or files (paths, function names, recent commits)
+- Already captured in `CLAUDE.md` or equivalent instruction files
+- Conversation transcripts or "we discussed X today" notes — record the *outcome*, not the discussion
+- Stale project snapshots ("Project P has N modules as of March") — these rot fast; `git log` is authoritative
+
+### Entity type conventions
+
+Suggested types (free-form strings — no enum enforced):
+
+`person`, `project`, `concept`, `decision`, `error`, `solution`, `technology`, `pattern`, `preference`, `organization`, `event`, `reference`
+
+### Default vault
+
+Unless the agent is explicitly told otherwise, all operations should target a single named vault (e.g. `work`). Multi-vault setups are for domain isolation (personal vs work vs a specific client), not for sharding a single domain.
+
 ## Search
 
 1. Embed query with CodeRankEmbed (CPU, ONNX)
