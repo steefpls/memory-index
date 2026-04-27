@@ -36,6 +36,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# --- Silence cosmetic streamable-HTTP disconnect tracebacks ---
+# The MCP SDK's streamable_http transport logs an ERROR with a full
+# anyio.ClosedResourceError traceback every time an HTTP-mode client
+# closes its session — which is once per tool call. The exception is
+# benign (the writer side of the channel is gone because the request
+# completed); silencing it here keeps real errors visible.
+class _SuppressClosedResource(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info and record.exc_info[0] is not None:
+            try:
+                from anyio import ClosedResourceError
+            except ImportError:
+                return True
+            if issubclass(record.exc_info[0], ClosedResourceError):
+                return False
+        return True
+
+
+logging.getLogger("mcp.server.streamable_http").addFilter(_SuppressClosedResource())
+
+
 # --- FastMCP server ---
 mcp = FastMCP("memory-index")
 
