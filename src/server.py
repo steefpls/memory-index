@@ -496,6 +496,41 @@ def _startup_check():
     threading.Thread(target=_bg_init, daemon=True, name="memory-index-startup").start()
 
 
+def _configure_http_transport(port: int, api_key: str) -> None:
+    """Mutate FastMCP settings to serve streamable-HTTP on 0.0.0.0:<port>/mcp/<key>.
+
+    Mirrors telegram-mcp's claude_trigger.handler.configure_http_transport.
+    Bind 0.0.0.0 (not ::) — Windows IPV6_V6ONLY=1 blocks IPv4 clients.
+    json_response + stateless_http are required for Claude Code's MCP client
+    (it does GET /mcp/<key> after init without echoing Mcp-Session-Id, which
+    a stateful FastMCP rejects).
+    """
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = f"/mcp/{api_key}"
+    mcp.settings.json_response = True
+    mcp.settings.stateless_http = True
+    print(
+        f"[memory-index] HTTP daemon listening on http://0.0.0.0:{port}/mcp/<api_key>",
+        file=sys.stderr,
+    )
+
+
 if __name__ == "__main__":
     _startup_check()
-    mcp.run(transport="stdio")
+    port_env = os.environ.get("MCP_PORT", "").strip()
+    if port_env:
+        api_key = os.environ.get("MCP_API_KEY", "").strip()
+        if not api_key:
+            logger.error("MCP_PORT set but MCP_API_KEY missing — refusing to expose HTTP without auth path.")
+            sys.exit(1)
+        try:
+            port = int(port_env)
+        except ValueError:
+            logger.error("MCP_PORT must be an integer, got %r", port_env)
+            sys.exit(1)
+        import asyncio
+        _configure_http_transport(port, api_key)
+        asyncio.run(mcp.run_streamable_http_async())
+    else:
+        mcp.run(transport="stdio")
