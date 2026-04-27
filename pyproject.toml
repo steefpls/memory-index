@@ -17,6 +17,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+backup = [
+    "google-api-python-client",
+    "google-auth",
+    "google-auth-oauthlib",
+]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
