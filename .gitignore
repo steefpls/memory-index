@@ -15,6 +15,8 @@ data/coderank_onnx/
 
 # Logs
 data/server.log
+daemon.log
+daemon.log.*
 
 # Vault export archives (user-generated)
 data/exports/
