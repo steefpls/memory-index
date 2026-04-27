@@ -112,6 +112,28 @@ def upload_to_drive(service, folder_id: str, local_path: Path) -> str:
     return f["id"]
 
 
+def upload_oauth_snapshot(service, folder_id: str) -> str:
+    """Upload a date-stamped copy of the OAuth token to the same Drive folder.
+
+    Loss of this token only costs a 5-min re-auth on the server, but having a
+    snapshot means a corrupted token file can be restored without re-running
+    the OAuth flow.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    if not OAUTH_TOKEN_PATH.exists():
+        log.warning("OAuth token missing at %s, skipping snapshot", OAUTH_TOKEN_PATH)
+        return ""
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    drive_name = f"oauth_{OAUTH_TOKEN_PATH.stem}_{today}.json"
+    meta = {"name": drive_name, "parents": [folder_id]}
+    media = MediaFileUpload(str(OAUTH_TOKEN_PATH), mimetype="application/json", resumable=False)
+    f = service.files().create(body=meta, media_body=media, fields="id, name").execute()
+    log.info("Uploaded %s (id=%s, %d bytes)", f["name"], f["id"], OAUTH_TOKEN_PATH.stat().st_size)
+    return f["id"]
+
+
 def prune_drive_backups(service, folder_id: str) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=DRIVE_RETENTION_DAYS)
     cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -148,6 +170,7 @@ def main() -> int:
         service = get_drive_service()
         folder_id = ensure_drive_folder(service)
         upload_to_drive(service, folder_id, local_path)
+        upload_oauth_snapshot(service, folder_id)
         prune_drive_backups(service, folder_id)
         prune_local_exports()
         log.info("Daily backup complete.")
