@@ -13,6 +13,7 @@ dependencies = [
     "onnxruntime",
     "networkx",
     "scikit-learn",
+    "uvicorn==0.34.0",
 ]
 
 [project.optional-dependencies]
