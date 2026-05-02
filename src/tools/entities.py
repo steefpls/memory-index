@@ -53,12 +53,24 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
             f"  Observations: {obs_count}")
 
 
-def tool_get_entity(name_or_id: str, vault: str = "") -> str:
-    """Get entity details including observations and relations.
+def tool_get_entity(name_or_id: str, vault: str = "",
+                    offset: int = 0, limit: int = 30,
+                    full: bool = False,
+                    include_superseded: bool = False) -> str:
+    """Get entity details with observations and relations.
+
+    By default returns header + counts + all relations + the `limit` most
+    recent active observations. Set full=True to dump everything in one call.
+    Superseded observations are hidden by default; pass include_superseded=True
+    to also list them (for full history use the temporal tools).
 
     Args:
         name_or_id: Entity name or ID.
         vault: Vault name (helps disambiguate names across vaults).
+        offset: Skip this many active observations (newest-first ordering).
+        limit: Max active observations to show (default 30, ignored if full=True).
+        full: If True, return every active observation, ignoring offset/limit.
+        include_superseded: If True, also list superseded observations.
 
     Returns:
         Entity details with observations and relations.
@@ -67,10 +79,25 @@ def tool_get_entity(name_or_id: str, vault: str = "") -> str:
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    obs_list = get_observations(entity.id)
-    superseded_list = get_observations(entity.id, include_superseded=True)
-    superseded_only = [o for o in superseded_list if o.is_superseded]
+    obs_active = get_observations(entity.id)
+    obs_active.sort(key=lambda o: o.created_at, reverse=True)
+    obs_total = len(obs_active)
+
+    superseded_only: list = []
+    if include_superseded:
+        all_obs = get_observations(entity.id, include_superseded=True)
+        superseded_only = [o for o in all_obs if o.is_superseded]
+        superseded_only.sort(key=lambda o: o.created_at, reverse=True)
+
     relations = get_relations_for_entity(entity.id)
+
+    if full:
+        offset_used = 0
+        shown_obs = obs_active
+    else:
+        offset_used = max(0, offset)
+        limit_used = max(1, limit)
+        shown_obs = obs_active[offset_used:offset_used + limit_used]
 
     lines = [
         f"Entity: {entity.name} ({entity.entity_type})",
@@ -78,33 +105,48 @@ def tool_get_entity(name_or_id: str, vault: str = "") -> str:
         f"  Vault: {entity.vault}",
         f"  Created: {entity.created_at}",
         f"  Updated: {entity.updated_at}",
+        f"  Observations: {obs_total} active"
+        + (f" + {len(superseded_only)} superseded" if superseded_only else ""),
+        f"  Relations: {len(relations)}",
         "",
     ]
 
-    if obs_list:
-        lines.append(f"Observations ({len(obs_list)}):")
-        for obs in obs_list:
+    if shown_obs:
+        if full or obs_total <= len(shown_obs):
+            lines.append(f"Observations ({obs_total}, newest first):")
+        else:
+            end = offset_used + len(shown_obs)
+            lines.append(
+                f"Observations (showing {offset_used + 1}-{end} of {obs_total}, "
+                f"newest first; use offset={end} for next page or full=True to "
+                f"dump all):"
+            )
+        for obs in shown_obs:
             src = f" [source: {obs.source}]" if obs.source else ""
-            lines.append(f"  - {obs.content}{src}")
-            lines.append(f"    ID: {obs.id}")
+            lines.append(f"  - {obs.content}{src} (id: {obs.id})")
+        lines.append("")
+    elif obs_total > 0 and offset_used >= obs_total:
+        lines.append(
+            f"Observations: offset={offset_used} is past the end "
+            f"({obs_total} total)."
+        )
         lines.append("")
 
     if superseded_only:
         lines.append(f"Superseded observations ({len(superseded_only)}):")
         for obs in superseded_only:
-            lines.append(f"  - [old] {obs.content}")
-            lines.append(f"    ID: {obs.id} -> replaced by {obs.superseded_by}")
+            lines.append(
+                f"  - [old] {obs.content} (id: {obs.id} -> {obs.superseded_by})"
+            )
         lines.append("")
 
     if relations:
         lines.append(f"Relations ({len(relations)}):")
         for rel in relations:
-            if rel.from_entity == entity.id:
-                lines.append(f"  -> {rel.to_entity} [{rel.relation_type}]")
-            else:
-                lines.append(f"  <- {rel.from_entity} [{rel.relation_type}]")
-            if rel.context:
-                lines.append(f"     Context: {rel.context}")
+            arrow = "->" if rel.from_entity == entity.id else "<-"
+            other = rel.to_entity if rel.from_entity == entity.id else rel.from_entity
+            ctx = f" - {rel.context}" if rel.context else ""
+            lines.append(f"  {arrow} {other} [{rel.relation_type}]{ctx}")
 
     return "\n".join(lines)
 

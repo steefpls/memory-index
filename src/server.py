@@ -82,15 +82,28 @@ def create_entity(name: str, entity_type: str, vault: str,
 
 
 @mcp.tool()
-def get_entity(name_or_id: str, vault: str = "") -> str:
-    """Get entity details including observations and relations.
+def get_entity(name_or_id: str, vault: str = "",
+               offset: int = 0, limit: int = 30,
+               full: bool = False,
+               include_superseded: bool = False) -> str:
+    """Get entity details with observations and relations.
+
+    Returns header + counts + all relations + the `limit` most recent
+    active observations (newest first). Use offset/limit to paginate, or
+    full=True to dump everything in one call. Superseded observations are
+    hidden unless include_superseded=True (use temporal tools for history).
 
     Args:
         name_or_id: Entity name or ID.
         vault: Vault name (helps disambiguate names across vaults).
+        offset: Skip this many active observations (newest-first).
+        limit: Max active observations to show (default 30, ignored if full).
+        full: If True, return every active observation in one call.
+        include_superseded: If True, also list superseded observations.
     """
     from src.tools.entities import tool_get_entity
-    return tool_get_entity(name_or_id, vault)
+    return tool_get_entity(name_or_id, vault, offset=offset, limit=limit,
+                           full=full, include_superseded=include_superseded)
 
 
 @mcp.tool()
@@ -244,7 +257,7 @@ def get_neighbors(entity_name_or_id: str, vault: str = "",
         max_depth: How many hops to traverse (default 1, max 3).
         relation_type: Optional filter by relation type.
     """
-    from src.indexer.store import resolve_entity
+    from src.indexer.store import resolve_entity, get_observations
     from src.graph.traversal import get_neighbors as graph_neighbors
     from src.indexer.store import get_entity as store_get_entity
 
@@ -266,10 +279,12 @@ def get_neighbors(entity_name_or_id: str, vault: str = "",
         nb_ent = store_get_entity(nb["entity_id"])
         nb_name = nb_ent.name if nb_ent else nb["entity_id"]
         nb_type = f" ({nb_ent.entity_type})" if nb_ent else ""
+        obs_count = len(get_observations(nb["entity_id"])) if nb_ent else 0
+        size_hint = f", {obs_count} obs" if nb_ent else ""
         direction = "->" if nb["direction"] == "outgoing" else "<-"
         ctx = f" — {nb['context']}" if nb.get("context") else ""
         lines.append(f"  {direction} {nb_name}{nb_type} [{nb['relation_type']}] "
-                     f"(depth: {nb['depth']}, weight: {nb['weight']}){ctx}")
+                     f"(depth: {nb['depth']}, weight: {nb['weight']}{size_hint}){ctx}")
 
     return "\n".join(lines)
 
