@@ -102,7 +102,23 @@ class TestEntityTools(unittest.TestCase):
         tool_create_entity("Python", "technology", "test")
         result = tool_add_observation("Python", "Used in ML", vault="test")
         self.assertIn("Observation added", result)
-        self.assertIn("Used in ML", result)
+        self.assertIn("Python", result)
+        self.assertIn("id=", result)
+        # Response should NOT echo the observation content back to the caller —
+        # the caller just sent it. Saves tokens on every write.
+        self.assertNotIn("Used in ML", result)
+
+    def test_add_observation_tool_supersedes(self):
+        from src.tools.entities import tool_create_entity, tool_add_observation
+        tool_create_entity("Python", "technology", "test")
+        first = tool_add_observation("Python", "Old fact", vault="test")
+        old_id = first.split("id=", 1)[1].split(",", 1)[0].strip()
+        result = tool_add_observation(
+            "Python", "New fact", vault="test", supersedes=old_id,
+        )
+        self.assertIn("Observation added", result)
+        self.assertIn(f"supersedes={old_id}", result)
+        self.assertNotIn("New fact", result)
 
     def test_delete_entity_tool(self):
         from src.tools.entities import tool_create_entity, tool_delete_entity

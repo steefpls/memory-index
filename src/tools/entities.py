@@ -263,11 +263,9 @@ def tool_add_observation(name_or_id: str, content: str,
     if obs is None:
         return "Error: failed to add observation."
 
-    msg = (f"Observation added to '{entity.name}':\n"
-           f"  {content}\n"
-           f"  ID: {obs.id}")
+    msg = f"Observation added to '{entity.name}': id={obs.id}"
     if supersedes:
-        msg += f"\n  Supersedes: {supersedes}"
+        msg += f", supersedes={supersedes}"
     return msg
 
 
