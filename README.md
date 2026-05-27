@@ -64,7 +64,50 @@ search_memory("framework migration", since="2026-03-01", before="2026-03-14")
 
 ## Agent Usage
 
-Rules for LLM agents (Claude Code, Codex CLI, etc.) writing to and reading from memory-index. Paste a condensed version of this section into your agent's system prompt / `CLAUDE.md` so the discipline is enforced at the agent layer — memory-index itself does not police it.
+Rules for LLM agents (Claude Code, Codex CLI, etc.) writing to and reading from memory-index. Memory-index does not police these rules — they must be enforced at the agent layer via your `CLAUDE.md` or system prompt.
+
+### CLAUDE.md Snippet
+
+Copy this block verbatim into your `CLAUDE.md` (or `agents.md` / system prompt). Adjust the vault name to match your setup.
+
+````markdown
+## MANDATORY: Memory via memory-index MCP
+
+**Use `memory-index` MCP tools as the primary memory system. Default vault: `work`.**
+
+### READ — search before answering (non-negotiable)
+Before answering the user's first message in any conversation, call `search_memory` (vault: `work`). Derive the query from what the user is asking about — people, projects, decisions, codebases, anything plausibly stored.
+- Always search before claiming you don't know something.
+- Re-search when new topics surface mid-conversation, or before making architectural/process suggestions.
+- If `search_memory` isn't loaded yet, fetch it with `ToolSearch` first, then search.
+
+### WRITE — search before writing (non-negotiable)
+Before `create_entity`, `add_observation`, or `create_relation`, call `search_memory` first. Then choose in order:
+1. `add_observation` on an existing entity (most common)
+2. `create_relation` between existing entities (fact is implicit in the edge)
+3. `create_entity` only if nothing relevant exists
+
+### Atomicity — one observation = one atomic fact
+Each observation is embedded individually. Split multi-fact statements into separate `add_observation` calls — one fact per call, always. No JSON arrays, comma-packed lists, or summary bundles. Cleanup is via per-observation supersession (`supersedes=<old_id>`), not by overwriting.
+
+### Attribution — facts about X live on X
+Ask: what is the *subject* of this fact? That entity is where the observation lives. Use relations to connect across entities rather than duplicating facts on both sides.
+
+### Source + date discipline
+Always populate the `source` field — chat date, filename, PR number, meeting context. Convert relative dates ("yesterday", "last Thursday") to absolute ISO dates in observation content.
+
+### Entity types
+`person`, `project`, `concept`, `decision`, `error`, `solution`, `technology`, `pattern`, `preference`, `organization`, `event`, `reference`
+
+### What NOT to save
+- Ephemeral state ("currently debugging X")
+- Facts derivable from code, git, or files
+- Anything already in CLAUDE.md
+- Conversation transcripts — record the *outcome*, not the discussion
+
+### Before recommending from memory
+A memory naming a file, function, or flag is a claim it existed when written. Verify before acting: check the file exists, grep for the symbol. If a recalled memory conflicts with what you observe now, trust what you observe and update the stale memory.
+````
 
 ### Read before answering
 
