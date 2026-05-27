@@ -542,13 +542,13 @@ def _configure_http_transport(port: int, api_key: str) -> None:
     (it does GET /mcp/<key> after init without echoing Mcp-Session-Id, which
     a stateful FastMCP rejects).
     """
-    mcp.settings.host = "0.0.0.0"
+    mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
     mcp.settings.port = port
     mcp.settings.streamable_http_path = f"/mcp/{api_key}"
     mcp.settings.json_response = True
     mcp.settings.stateless_http = True
     print(
-        f"[memory-index] HTTP daemon listening on http://0.0.0.0:{port}/mcp/<api_key>",
+        f"[memory-index] HTTP daemon listening on http://{mcp.settings.host}:{port}/mcp/<api_key>",
         file=sys.stderr,
     )
 

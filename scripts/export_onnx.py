@@ -18,10 +18,10 @@ from sentence_transformers import SentenceTransformer
 
 print("[INFO] Loading CodeRankEmbed model with PyTorch...")
 t0 = time.time()
-model = SentenceTransformer("nomic-ai/CodeRankEmbed", trust_remote_code=True)
+model = SentenceTransformer("nomic-ai/CodeRankEmbed", trust_remote_code=True, device="cpu")
 print(f"  Model loaded in {time.time()-t0:.1f}s")
 
-transformer = model[0].auto_model
+transformer = model[0].auto_model.to("cpu")
 tokenizer = model[0].tokenizer
 
 dummy = tokenizer("test", return_tensors="pt", padding=True, truncation=True, max_length=8192)
