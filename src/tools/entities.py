@@ -54,23 +54,27 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
 
 
 def tool_get_entity(name_or_id: str, vault: str = "",
-                    offset: int = 0, limit: int = 30,
+                    offset: int = 0, limit: int = 10,
                     full: bool = False,
-                    include_superseded: bool = False) -> str:
+                    include_superseded: bool = False,
+                    show_ids: bool = False) -> str:
     """Get entity details with observations and relations.
 
     By default returns header + counts + all relations + the `limit` most
     recent active observations. Set full=True to dump everything in one call.
-    Superseded observations are hidden by default; pass include_superseded=True
-    to also list them (for full history use the temporal tools).
+    Observation IDs are hidden by default; pass show_ids=True when you need
+    them (e.g. to supersede or delete). Superseded observations are hidden by
+    default; pass include_superseded=True to also list them (for full history
+    use the temporal tools).
 
     Args:
         name_or_id: Entity name or ID.
         vault: Vault name (helps disambiguate names across vaults).
         offset: Skip this many active observations (newest-first ordering).
-        limit: Max active observations to show (default 30, ignored if full=True).
+        limit: Max active observations to show (default 10, ignored if full=True).
         full: If True, return every active observation, ignoring offset/limit.
         include_superseded: If True, also list superseded observations.
+        show_ids: If True, append observation IDs inline (for supersede/delete).
 
     Returns:
         Entity details with observations and relations.
@@ -99,15 +103,14 @@ def tool_get_entity(name_or_id: str, vault: str = "",
         limit_used = max(1, limit)
         shown_obs = obs_active[offset_used:offset_used + limit_used]
 
+    obs_summary = f"{obs_total} active obs"
+    if superseded_only:
+        obs_summary += f" (+{len(superseded_only)} superseded)"
     lines = [
-        f"Entity: {entity.name} ({entity.entity_type})",
-        f"  ID: {entity.id}",
-        f"  Vault: {entity.vault}",
-        f"  Created: {entity.created_at}",
-        f"  Updated: {entity.updated_at}",
-        f"  Observations: {obs_total} active"
-        + (f" + {len(superseded_only)} superseded" if superseded_only else ""),
-        f"  Relations: {len(relations)}",
+        f"Entity: {entity.name} ({entity.entity_type}) · "
+        f"id={entity.id} · vault={entity.vault}",
+        f"  {obs_summary} · {len(relations)} relations · "
+        f"updated {entity.updated_at}",
         "",
     ]
 
@@ -116,14 +119,15 @@ def tool_get_entity(name_or_id: str, vault: str = "",
             lines.append(f"Observations ({obs_total}, newest first):")
         else:
             end = offset_used + len(shown_obs)
+            remaining = obs_total - end
             lines.append(
-                f"Observations (showing {offset_used + 1}-{end} of {obs_total}, "
-                f"newest first; use offset={end} for next page or full=True to "
-                f"dump all):"
+                f"Observations ({offset_used + 1}-{end}/{obs_total}, "
+                f"+{remaining} more, offset={end}):"
             )
         for obs in shown_obs:
-            src = f" [source: {obs.source}]" if obs.source else ""
-            lines.append(f"  - {obs.content}{src} (id: {obs.id})")
+            src = f" [src: {obs.source}]" if obs.source else ""
+            tail = f" (id: {obs.id})" if show_ids else ""
+            lines.append(f"  - {obs.content}{src}{tail}")
         lines.append("")
     elif obs_total > 0 and offset_used >= obs_total:
         lines.append(
@@ -135,18 +139,21 @@ def tool_get_entity(name_or_id: str, vault: str = "",
     if superseded_only:
         lines.append(f"Superseded observations ({len(superseded_only)}):")
         for obs in superseded_only:
-            lines.append(
-                f"  - [old] {obs.content} (id: {obs.id} -> {obs.superseded_by})"
-            )
+            tail = f" (id: {obs.id} -> {obs.superseded_by})" if show_ids else ""
+            lines.append(f"  - [old] {obs.content}{tail}")
         lines.append("")
 
     if relations:
+        # Resolve names once so the model can act on them without a second lookup.
+        from src.indexer.store import get_entity as _store_get_entity
         lines.append(f"Relations ({len(relations)}):")
         for rel in relations:
             arrow = "->" if rel.from_entity == entity.id else "<-"
-            other = rel.to_entity if rel.from_entity == entity.id else rel.from_entity
-            ctx = f" - {rel.context}" if rel.context else ""
-            lines.append(f"  {arrow} {other} [{rel.relation_type}]{ctx}")
+            other_id = rel.to_entity if rel.from_entity == entity.id else rel.from_entity
+            other_ent = _store_get_entity(other_id)
+            other_name = other_ent.name if other_ent else other_id
+            ctx = f" — {rel.context}" if rel.context else ""
+            lines.append(f"  {arrow} {other_name} [{rel.relation_type}]{ctx}")
 
     return "\n".join(lines)
 
@@ -267,6 +274,51 @@ def tool_add_observation(name_or_id: str, content: str,
     if supersedes:
         msg += f", supersedes={supersedes}"
     return msg
+
+
+def tool_add_observations(name_or_id: str, contents: str,
+                          vault: str = "", source: str = "") -> str:
+    """Add multiple observations to a single entity in one call.
+
+    Each pipe-separated content becomes its own observation (one embedding per
+    fact — atomicity preserved per CLAUDE.md), but the MCP round-trip is
+    collapsed to one. Use this when you have several facts about the same
+    entity to record in a single thought.
+
+    Args:
+        name_or_id: Entity name or ID.
+        contents: Pipe-separated observation contents (e.g., "Fact 1|Fact 2|Fact 3").
+        vault: Vault name (helps disambiguate names).
+        source: Optional source attribution applied to all added observations.
+
+    Returns:
+        Confirmation listing each added observation ID, or error.
+    """
+    if not contents or not contents.strip():
+        return "Error: contents is required."
+
+    entity = resolve_entity(name_or_id, vault or None)
+    if entity is None:
+        return f"Entity not found: '{name_or_id}'"
+
+    items = [c.strip() for c in contents.split("|") if c.strip()]
+    if not items:
+        return "Error: no non-empty observation contents."
+
+    added_ids: list[str] = []
+    for content in items:
+        obs = add_observation(entity.id, content, source=source)
+        if obs is None:
+            return (
+                f"Error: failed to add observation after {len(added_ids)} succeeded. "
+                f"Added IDs: {', '.join(added_ids) if added_ids else '(none)'}"
+            )
+        added_ids.append(obs.id)
+
+    lines = [f"Added {len(added_ids)} observations to '{entity.name}':"]
+    for oid in added_ids:
+        lines.append(f"  id={oid}")
+    return "\n".join(lines)
 
 
 def tool_delete_observation(observation_id: str) -> str:

@@ -397,46 +397,49 @@ def _normalized_score(distance: float, vault: str) -> float:
         return 0.0
 
 
+_CONFIDENCE_SHORT = {"HIGH": "HIGH", "MEDIUM": "MED", "LOW": "LOW"}
+
+
 def _format_text(results: list[dict], entity_obs: dict[str, list[dict]],
                  query: str) -> str:
     lines = []
     for i, item in enumerate(results):
         vault = item["vault"]
         confidence = _confidence_label(item["distance"], vault)
+        conf_short = _CONFIDENCE_SHORT.get(confidence, confidence)
         score = _normalized_score(item["distance"], vault)
         is_boosted = bool(item.get("graph_boosted"))
-        boosted = " [graph-boosted]" if is_boosted else ""
+        boosted = " +graph" if is_boosted else ""
+        eid = item["entity_id"]
 
-        lines.append(f"--- Result {i + 1} (relevance: {score}%, confidence: {confidence}{boosted}) ---")
-        lines.append(f"  Entity: {item['entity_name']} ({item['entity_type']})")
-        lines.append(f"  Vault: {vault}")
-        lines.append(f"  Entity ID: {item['entity_id']}")
+        lines.append(
+            f"[{i + 1}] {score}% {conf_short}{boosted} · "
+            f"{item['entity_name']} ({item['entity_type']}) · "
+            f"{vault} · id={eid}"
+        )
 
         # Show top observations by relevance.
         # Direct semantic hits keep their distance per observation, so we sort
         # by distance ascending (best first). Graph-boosted hits have only one
         # representative observation injected upstream — sort is a no-op there.
-        obs_list = entity_obs.get(item["entity_id"], [])
+        obs_list = entity_obs.get(eid, [])
         if obs_list:
             obs_sorted = sorted(obs_list, key=lambda o: o.get("distance", float("inf")))
             cap = 1 if is_boosted else 3
             shown = obs_sorted[:cap]
 
-            # Total observations on the entity (for the "showing N of M" hint).
+            # Total observations on the entity (for the "N/M" hint).
             # max(...) handles cases where the entity isn't in the store
             # (e.g. unit-test fixtures) — fall back to len(obs_list).
-            total_obs = max(len(get_observations(item["entity_id"])), len(obs_list))
+            total_obs = max(len(get_observations(eid)), len(obs_list))
 
             if total_obs > len(shown):
-                lines.append(
-                    f"  Observations (showing {len(shown)} of {total_obs} — "
-                    f"call get_entity('{item['entity_id']}') for full):"
-                )
+                lines.append(f"  obs ({len(shown)}/{total_obs}):")
             else:
-                lines.append(f"  Observations ({total_obs}):")
+                lines.append(f"  obs ({total_obs}):")
 
             for obs in shown:
-                src = f" [source: {obs.get('source', '')}]" if obs.get("source") else ""
+                src = f" [src: {obs.get('source', '')}]" if obs.get("source") else ""
                 old = " [superseded]" if obs.get("superseded") else ""
                 lines.append(f"    - {obs['content']}{src}{old}")
         lines.append("")

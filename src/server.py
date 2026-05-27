@@ -83,27 +83,32 @@ def create_entity(name: str, entity_type: str, vault: str,
 
 @mcp.tool()
 def get_entity(name_or_id: str, vault: str = "",
-               offset: int = 0, limit: int = 30,
+               offset: int = 0, limit: int = 10,
                full: bool = False,
-               include_superseded: bool = False) -> str:
+               include_superseded: bool = False,
+               show_ids: bool = False) -> str:
     """Get entity details with observations and relations.
 
     Returns header + counts + all relations + the `limit` most recent
     active observations (newest first). Use offset/limit to paginate, or
-    full=True to dump everything in one call. Superseded observations are
-    hidden unless include_superseded=True (use temporal tools for history).
+    full=True to dump everything in one call. Observation IDs are hidden
+    unless show_ids=True (set when you intend to supersede/delete).
+    Superseded observations are hidden unless include_superseded=True
+    (use temporal tools for history).
 
     Args:
         name_or_id: Entity name or ID.
         vault: Vault name (helps disambiguate names across vaults).
         offset: Skip this many active observations (newest-first).
-        limit: Max active observations to show (default 30, ignored if full).
+        limit: Max active observations to show (default 10, ignored if full).
         full: If True, return every active observation in one call.
         include_superseded: If True, also list superseded observations.
+        show_ids: If True, append observation IDs inline (for supersede/delete).
     """
     from src.tools.entities import tool_get_entity
     return tool_get_entity(name_or_id, vault, offset=offset, limit=limit,
-                           full=full, include_superseded=include_superseded)
+                           full=full, include_superseded=include_superseded,
+                           show_ids=show_ids)
 
 
 @mcp.tool()
@@ -166,6 +171,26 @@ def add_observation(name_or_id: str, content: str,
     """
     from src.tools.entities import tool_add_observation
     return tool_add_observation(name_or_id, content, vault, source, supersedes)
+
+
+@mcp.tool()
+def add_observations(name_or_id: str, contents: str,
+                     vault: str = "", source: str = "") -> str:
+    """Add multiple observations to a single entity in one call.
+
+    Each pipe-separated content becomes its own observation (one embedding per
+    fact — atomicity preserved per CLAUDE.md), but the MCP round-trip is
+    collapsed to one. Use this when you have several facts about the same
+    entity to record in a single thought.
+
+    Args:
+        name_or_id: Entity name or ID.
+        contents: Pipe-separated observation contents (e.g., "Fact 1|Fact 2|Fact 3").
+        vault: Vault name (helps disambiguate names).
+        source: Optional source attribution applied to all added observations.
+    """
+    from src.tools.entities import tool_add_observations
+    return tool_add_observations(name_or_id, contents, vault, source)
 
 
 @mcp.tool()
