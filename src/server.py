@@ -567,6 +567,9 @@ def _configure_http_transport(port: int, api_key: str) -> None:
     (it does GET /mcp/<key> after init without echoing Mcp-Session-Id, which
     a stateful FastMCP rejects).
     """
+    # Default 127.0.0.1 keeps macOS dev boxes private (avoids firewall prompts).
+    # Hosts that must serve remote clients (e.g. steef-server over Tailscale) MUST
+    # set MCP_HOST=0.0.0.0 in their service env, or remote connects get ConnectionRefused.
     mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
     mcp.settings.port = port
     mcp.settings.streamable_http_path = f"/mcp/{api_key}"
