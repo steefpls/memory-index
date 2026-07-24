@@ -36,11 +36,14 @@ _NONSENSE_QUERIES = [
 
 _MIN_SAMPLES = 10  # minimum observations before sampling is useful
 
-# Fallback thresholds if no calibration file exists
+# Fallback thresholds if no calibration file exists.
+# EmbeddingGemma vectors are L2-normalized, so Chroma's squared-L2 distance
+# lives in [0, 4] (d = 2 - 2*cosine). These are rough priors; per-vault
+# calibration replaces them on first run.
 _DEFAULT_THRESHOLDS = {
-    "HIGH": 650,
-    "MEDIUM": 775,
-    "LOW": 875,
+    "HIGH": 0.9,
+    "MEDIUM": 1.2,
+    "LOW": 1.5,
 }
 
 

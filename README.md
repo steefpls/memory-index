@@ -170,7 +170,7 @@ Unless the agent is explicitly told otherwise, all operations should target a si
 
 ## Search
 
-1. Embed query with CodeRankEmbed (CPU, ONNX)
+1. Embed query with EmbeddingGemma-300m (CPU, ONNX q8)
 2. ChromaDB similarity search across vault(s), with optional temporal + entity type filters
 3. Filter superseded observations (unless `include_superseded=True`)
 4. Deduplicate by entity, merge observations
@@ -188,7 +188,7 @@ Confidence thresholds are derived per-vault by sampling real observations as "sh
 
 ## Architecture
 
-Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline (CodeRankEmbed, 137M params, 768-dim), simplified to CPU-only.
+Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline shape, simplified to CPU-only; the model was swapped from CodeRankEmbed (a code retriever) to google/embeddinggemma-300m (768-dim, ONNX q8) for natural-language memory retrieval.
 
 ```
 src/

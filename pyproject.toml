@@ -8,8 +8,6 @@ dependencies = [
     "chromadb",
     "sentence-transformers",
     "transformers",
-    "einops",
-    "onnxscript",
     "onnxruntime",
     "networkx",
     "scikit-learn",

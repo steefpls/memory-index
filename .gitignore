@@ -12,6 +12,7 @@ data/*_calibration.json
 
 # ONNX model (downloaded/exported by setup.bat)
 data/coderank_onnx/
+data/embeddinggemma_onnx/
 
 # Logs
 data/server.log

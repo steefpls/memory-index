@@ -16,6 +16,8 @@ class TestDBSCAN(unittest.TestCase):
     def test_finds_clusters(self):
         from src.tools.librarian import _run_dbscan
 
+        # Seeded: an unseeded noise point occasionally lands inside a cluster
+        np.random.seed(42)
         # Two tight clusters + one noise point
         cluster_a = np.random.randn(5, 10) * 0.1 + np.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         cluster_b = np.random.randn(5, 10) * 0.1 + np.array([0, 0, 0, 0, 0, 1, 0, 0, 0, 0])

@@ -1,8 +1,9 @@
-"""ChromaDB + CodeRankEmbed embedding setup (CPU-only).
+"""ChromaDB + EmbeddingGemma-300m embedding setup (CPU-only).
 
-Memory operations embed one observation at a time (~10ms), so GPU acceleration
-adds complexity with no practical benefit. This is a simplified CPU-only
-embedder derived from code-index's full GPU/CPU version.
+Memory operations embed one observation at a time, so GPU acceleration
+adds complexity with no practical benefit. Uses the onnx-community q8 export,
+whose graph bakes in mean pooling, the dense projections, and L2 normalization —
+the session outputs a finished `sentence_embedding` tensor directly.
 """
 
 import logging
@@ -14,7 +15,15 @@ import gc
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
-from src.config import CHROMA_DIR, CODERANK_MODEL, CODERANK_QUERY_PREFIX, CODERANK_ONNX_DIR
+from src.config import (
+    CHROMA_DIR,
+    EMBED_ONNX_DIR,
+    EMBED_ONNX_FILENAME,
+    EMBED_PT_MODEL,
+    EMBED_QUERY_PREFIX,
+    EMBED_DOC_PREFIX,
+    EMBED_MAX_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +41,7 @@ class _FastTokenizerWrapper:
 
     def __call__(self, texts: list[str], return_tensors: str = "np",
                  padding: bool = True, truncation: bool = True,
-                 max_length: int = 8192) -> dict:
+                 max_length: int = EMBED_MAX_TOKENS) -> dict:
         import numpy as np
 
         if truncation:
@@ -41,6 +50,7 @@ class _FastTokenizerWrapper:
             self._tok.no_truncation()
 
         if padding:
+            # Gemma pad token id is 0 (<pad>)
             self._tok.enable_padding(pad_id=0)
         else:
             self._tok.no_padding()
@@ -54,15 +64,15 @@ class _FastTokenizerWrapper:
 
 
 _client: chromadb.ClientAPI | None = None
-_embedding_fn: "CodeRankEmbedder | None" = None
+_embedding_fn: "GemmaEmbedder | None" = None
 _active_backend: str = "not initialized"
 
 
-class CodeRankEmbedder(EmbeddingFunction[Documents]):
-    """CodeRankEmbed embeddings (137M params, 768-dim), CPU-only ONNX.
+class GemmaEmbedder(EmbeddingFunction[Documents]):
+    """EmbeddingGemma-300m embeddings (308M params, 768-dim), CPU-only ONNX q8.
 
-    CLS-token pooling (first token) per model config.
-    Falls back to PyTorch CPU if ONNX model not found.
+    The ONNX graph outputs L2-normalized sentence embeddings directly.
+    Falls back to PyTorch CPU if the ONNX model is not found.
     """
 
     def __init__(self):
@@ -71,7 +81,7 @@ class CodeRankEmbedder(EmbeddingFunction[Documents]):
         self._pt_model = None
         self.backend = "not initialized"
 
-        onnx_path = CODERANK_ONNX_DIR / "model.onnx"
+        onnx_path = EMBED_ONNX_DIR / EMBED_ONNX_FILENAME
         if onnx_path.exists():
             self._init_onnx(str(onnx_path))
         else:
@@ -82,21 +92,10 @@ class CodeRankEmbedder(EmbeddingFunction[Documents]):
         logger.info("ONNX init: importing onnxruntime (CPU-only)")
         import onnxruntime as ort
 
-        # Use pre-optimized CPU model if available (saves ~30s cold-start)
-        pre_optimized = CODERANK_ONNX_DIR / "model_optimized_cpu.onnx"
-        if pre_optimized.exists():
-            onnx_path = str(pre_optimized)
-            logger.info("Using pre-optimized CPU model: %s", pre_optimized)
-
         sess_opts = ort.SessionOptions()
-        if str(onnx_path).endswith("_cpu.onnx"):
-            # Pre-optimized: skip graph optimization
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        else:
-            # First load: optimize and persist for next time
-            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            optimized_path = CODERANK_ONNX_DIR / "model_optimized_cpu.onnx"
-            sess_opts.optimized_model_filepath = str(optimized_path)
+        # No persist-optimized-graph flow here: the q8 model uses external
+        # weight data, and session creation is only a few seconds.
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         # CPU thread tuning
         cores = os.cpu_count() or 4
@@ -109,46 +108,52 @@ class CodeRankEmbedder(EmbeddingFunction[Documents]):
         )
 
         # Tokenizer
-        tokenizer_json = CODERANK_ONNX_DIR / "tokenizer.json"
+        tokenizer_json = EMBED_ONNX_DIR / "tokenizer.json"
         if tokenizer_json.exists():
             self._tokenizer = _FastTokenizerWrapper(str(tokenizer_json))
         else:
             from transformers import AutoTokenizer
-            self._tokenizer = AutoTokenizer.from_pretrained(str(CODERANK_ONNX_DIR))
+            self._tokenizer = AutoTokenizer.from_pretrained(str(EMBED_ONNX_DIR))
 
         self.backend = "ONNX + CPU"
-        logger.info("CodeRankEmbed loaded: %s (%d threads)", self.backend, usable)
+        logger.info("EmbeddingGemma loaded: %s (%d threads)", self.backend, usable)
 
     def _init_pytorch(self):
-        """Fallback: load via sentence-transformers (PyTorch CPU)."""
+        """Fallback: load via sentence-transformers (PyTorch CPU).
+
+        Prefixes are applied manually before encode(), so encode() must not
+        also apply the model's built-in prompts.
+        """
         from sentence_transformers import SentenceTransformer
         logger.warning(
-            "ONNX model not found at %s — using PyTorch CPU (slower). "
-            "Run setup.bat to export the ONNX model.",
-            CODERANK_ONNX_DIR,
+            "ONNX model not found at %s — using PyTorch CPU (slower, and %s is "
+            "a gated repo requiring HF login). Run scripts/download_model.py "
+            "to fetch the ONNX model.",
+            EMBED_ONNX_DIR, EMBED_PT_MODEL,
         )
-        self._pt_model = SentenceTransformer(CODERANK_MODEL, trust_remote_code=True)
-        self.backend = "PyTorch CPU (no ONNX export)"
-        logger.info("CodeRankEmbed loaded: %s", self.backend)
+        self._pt_model = SentenceTransformer(EMBED_PT_MODEL)
+        self.backend = "PyTorch CPU (no ONNX download)"
+        logger.info("EmbeddingGemma loaded: %s", self.backend)
 
     def warmup(self):
         """Run a single dummy inference to initialize the session."""
         if self._ort_session is not None:
             import numpy as np
             dummy = self._tokenizer(["warmup"], return_tensors="np",
-                                    padding=True, truncation=True, max_length=8192)
+                                    padding=True, truncation=True,
+                                    max_length=EMBED_MAX_TOKENS)
             feed = {
                 "input_ids": dummy["input_ids"].astype(np.int64),
                 "attention_mask": dummy["attention_mask"].astype(np.int64),
             }
             try:
-                self._ort_session.run(None, feed)
+                self._ort_session.run(["sentence_embedding"], feed)
             except Exception as e:
                 logger.warning("Warmup failed: %s", e)
-            logger.info("CodeRankEmbed warmup complete")
+            logger.info("EmbeddingGemma warmup complete")
 
     def _onnx_embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed texts via ONNX Runtime CPU. Simple batched inference with CLS pooling."""
+        """Embed texts via ONNX Runtime CPU. The graph pools and normalizes."""
         import numpy as np
 
         if not texts:
@@ -156,42 +161,45 @@ class CodeRankEmbedder(EmbeddingFunction[Documents]):
 
         # For memory-index, texts are typically 1-5 items. No adaptive batching needed.
         inp = self._tokenizer(list(texts), return_tensors="np",
-                              padding=True, truncation=True, max_length=8192)
+                              padding=True, truncation=True,
+                              max_length=EMBED_MAX_TOKENS)
         ids = inp["input_ids"].astype(np.int64)
         mask = inp["attention_mask"].astype(np.int64)
         feed = {"input_ids": ids, "attention_mask": mask}
 
         try:
-            out = self._ort_session.run(None, feed)[0]  # (batch, seq, 768)
+            out = self._ort_session.run(["sentence_embedding"], feed)[0]  # (batch, 768)
         except Exception as e:
             # Fallback: embed one at a time
             logger.warning("Batch embed failed, falling back to individual: %s", str(e)[:120])
             results = []
             for text in texts:
                 inp1 = self._tokenizer([text], return_tensors="np",
-                                       padding=True, truncation=True, max_length=512)
+                                       padding=True, truncation=True,
+                                       max_length=EMBED_MAX_TOKENS)
                 ids1 = inp1["input_ids"].astype(np.int64)
                 mask1 = inp1["attention_mask"].astype(np.int64)
-                out1 = self._ort_session.run(None, {"input_ids": ids1, "attention_mask": mask1})[0]
-                results.append(out1[0, 0, :].tolist())
+                out1 = self._ort_session.run(
+                    ["sentence_embedding"],
+                    {"input_ids": ids1, "attention_mask": mask1})[0]
+                results.append(out1[0].tolist())
             return results
 
-        return [out[i, 0, :].tolist() for i in range(out.shape[0])]  # CLS token
+        return [out[i].tolist() for i in range(out.shape[0])]
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        if self._ort_session is not None:
+            return self._onnx_embed(texts)
+        embeddings = self._pt_model.encode(texts, show_progress_bar=False)
+        return embeddings.tolist()
 
     def __call__(self, input: Documents) -> Embeddings:
-        """Embed documents (no prefix). Called by ChromaDB at add time."""
-        if self._ort_session is not None:
-            return self._onnx_embed(list(input))
-        embeddings = self._pt_model.encode(list(input), show_progress_bar=False)
-        return embeddings.tolist()
+        """Embed documents with the document prefix. Called by ChromaDB at add time."""
+        return self._embed([EMBED_DOC_PREFIX + t for t in input])
 
     def embed_queries(self, queries: list[str]) -> list[list[float]]:
-        """Embed queries WITH the search prefix. Used at query time."""
-        prefixed = [CODERANK_QUERY_PREFIX + q for q in queries]
-        if self._ort_session is not None:
-            return self._onnx_embed(prefixed)
-        embeddings = self._pt_model.encode(prefixed, show_progress_bar=False)
-        return embeddings.tolist()
+        """Embed queries with the retrieval query prefix. Used at query time."""
+        return self._embed([EMBED_QUERY_PREFIX + q for q in queries])
 
     def close(self) -> None:
         """Release model/session references."""
@@ -201,11 +209,11 @@ class CodeRankEmbedder(EmbeddingFunction[Documents]):
         self.backend = "released"
 
 
-def get_embedding_function(role: str = "index", mode: str | None = None) -> CodeRankEmbedder:
-    """Get or create the singleton CodeRankEmbedder (CPU-only, one instance)."""
+def get_embedding_function(role: str = "index", mode: str | None = None) -> GemmaEmbedder:
+    """Get or create the singleton GemmaEmbedder (CPU-only, one instance)."""
     global _embedding_fn, _active_backend
     if _embedding_fn is None:
-        _embedding_fn = CodeRankEmbedder()
+        _embedding_fn = GemmaEmbedder()
         _active_backend = _embedding_fn.backend
     return _embedding_fn
 

@@ -375,9 +375,9 @@ def _normalized_score(distance: float, vault: str) -> float:
       distance > floor  →  0%
     """
     thresholds = _get_thresholds_cached(vault)
-    high = thresholds.get("HIGH", 700)
-    med = thresholds.get("MEDIUM", 800)
-    low = thresholds.get("LOW", 900)
+    high = thresholds.get("HIGH", 0.9)
+    med = thresholds.get("MEDIUM", 1.2)
+    low = thresholds.get("LOW", 1.5)
     floor = low * 1.2
 
     if distance <= 0:

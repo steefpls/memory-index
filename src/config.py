@@ -16,10 +16,17 @@ VAULTS_FILE = DATA_DIR / "vaults.json"
 ENTITIES_FILE = DATA_DIR / "memory_entities.json"
 GRAPH_FILE = DATA_DIR / "memory_graph.json"
 
-# Embedding model — same as code-index (nomic-embed based, handles natural language)
-CODERANK_MODEL = "nomic-ai/CodeRankEmbed"
-CODERANK_QUERY_PREFIX = "Represent this query for searching relevant knowledge: "
-CODERANK_ONNX_DIR = DATA_DIR / "coderank_onnx"
+# Embedding model — EmbeddingGemma-300m (swapped from CodeRankEmbed 2026-07-25).
+# ONNX weights come from the ungated onnx-community mirror; the q8 variant is
+# required — EmbeddingGemma activations are documented broken under fp16.
+EMBED_ONNX_REPO = "onnx-community/embeddinggemma-300m-ONNX"
+EMBED_ONNX_FILENAME = "model_quantized.onnx"  # q8; ships with external .onnx_data
+EMBED_PT_MODEL = "google/embeddinggemma-300m"  # PyTorch fallback (gated, needs HF login)
+EMBED_ONNX_DIR = DATA_DIR / "embeddinggemma_onnx"
+# Prompt prefixes are mandatory for retrieval quality — exact strings from the model card.
+EMBED_QUERY_PREFIX = "task: search result | query: "
+EMBED_DOC_PREFIX = "title: none | text: "
+EMBED_MAX_TOKENS = 2048
 
 
 @dataclass

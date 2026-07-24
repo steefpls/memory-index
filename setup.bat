@@ -56,7 +56,7 @@ if errorlevel 1 (
 )
 
 echo [INFO] Installing embedding model packages...
-"%VENV_PYTHON%" -m pip install -q sentence-transformers transformers einops onnxscript
+"%VENV_PYTHON%" -m pip install -q sentence-transformers transformers
 if errorlevel 1 (
     echo [ERROR] Failed to install embedding model packages.
     set "EXIT_CODE=1"
@@ -73,16 +73,17 @@ if errorlevel 1 (
 
 echo [OK] Dependencies installed
 
-REM --- Download model and export to ONNX ---
+REM --- Download ONNX embedding model ---
 echo.
-echo [INFO] Downloading CodeRankEmbed model and exporting to ONNX...
-echo        (first run downloads ~274MB model, then exports for CPU inference)
+echo [INFO] Downloading EmbeddingGemma-300m ONNX model...
+echo        (first run downloads ~350MB of model files for CPU inference)
 echo.
 
 set PYTHONIOENCODING=utf-8
-"%VENV_PYTHON%" scripts\export_onnx.py
+"%VENV_PYTHON%" scripts\download_model.py
 if errorlevel 1 (
-    echo [ERROR] ONNX export failed. The server will still work using PyTorch CPU ^(slower^).
+    echo [ERROR] Model download failed. Re-run setup.bat, or the server will try
+    echo         PyTorch CPU as a fallback ^(slower, requires HF login^).
 )
 
 REM --- Register MCP server with available AI CLIs ---
