@@ -113,15 +113,19 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     neighbor_arr = np.array(neighbor_distances) if neighbor_distances else self_arr
     nonsense_arr = np.array(nonsense_distances)
 
-    self_p50 = float(np.percentile(self_arr, 50))
     self_p75 = float(np.percentile(self_arr, 75))
+    neighbor_p50 = float(np.percentile(neighbor_arr, 50))
     nonsense_p25 = float(np.percentile(nonsense_arr, 25))
 
-    # HIGH: as close as perfect matches get. MEDIUM: midway from there to the
-    # noise floor (where good paraphrases land). LOW: the noise floor itself.
-    high = self_p75
-    medium = self_p50 + 0.5 * (nonsense_p25 - self_p50)
+    # HIGH: as close as genuinely *related* content typically sits (a good
+    # paraphrase query behaves like related content, so this band is reachable
+    # — verbatim self-match distance is not). MEDIUM: midway from there to the
+    # noise floor. LOW: the noise floor itself. The self-match p75 is a lower
+    # guard so a near-duplicate-heavy vault can't drag HIGH below the best
+    # distance a perfect query achieves.
+    high = max(neighbor_p50, self_p75)
     low = nonsense_p25
+    medium = high + 0.5 * (low - high)
     # Enforce ordering for degenerate distributions
     medium = max(medium, high * 1.15)
     low = max(low, medium * 1.15)
