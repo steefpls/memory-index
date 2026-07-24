@@ -41,9 +41,9 @@ _MIN_SAMPLES = 10  # minimum observations before sampling is useful
 # lives in [0, 4] (d = 2 - 2*cosine). These are rough priors; per-vault
 # calibration replaces them on first run.
 _DEFAULT_THRESHOLDS = {
-    "HIGH": 0.9,
-    "MEDIUM": 1.2,
-    "LOW": 1.5,
+    "HIGH": 0.6,
+    "MEDIUM": 1.0,
+    "LOW": 1.4,
 }
 
 
@@ -74,8 +74,13 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     """Run calibration queries and save per-vault thresholds.
 
     Samples real observations as "should match" probes and queries them
-    against the collection (they'll match themselves or similar entries).
-    Gibberish probes establish the noise floor.
+    against the collection. With asymmetric query/document prefixes, a probe's
+    nearest hit (usually itself) is NOT at distance ~0 — it measures the best
+    distance a *perfect* query can achieve, which anchors the HIGH band.
+    Anchoring bands on second-nearest distances (the old scheme) tied labels
+    to vault density instead of match quality and made real paraphrase
+    queries read as LOW. Gibberish probes establish the noise floor;
+    MEDIUM sits midway between perfect-match and noise.
     """
     ef = get_embedding_function(role="index")
 
@@ -86,18 +91,16 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     knowledge_embeddings = all_embeddings[:len(knowledge_queries)]
     nonsense_embeddings = all_embeddings[len(knowledge_queries):]
 
-    # n_results=2 for knowledge probes: the closest match will be the
-    # observation itself (distance ~0), so we want the second-nearest
-    # to measure how close *other* content is.
     knowledge_result = collection.query(
         query_embeddings=knowledge_embeddings, n_results=2, include=["distances"],
     )
-    knowledge_distances = []
+    self_distances = []      # nearest hit — the perfect-match anchor
+    neighbor_distances = []  # second-nearest — vault density, diagnostics only
     for dists in knowledge_result["distances"]:
+        if dists:
+            self_distances.append(dists[0])
         if len(dists) >= 2:
-            knowledge_distances.append(dists[1])  # second-nearest
-        elif dists:
-            knowledge_distances.append(dists[0])
+            neighbor_distances.append(dists[1])
 
     nonsense_result = collection.query(
         query_embeddings=nonsense_embeddings, n_results=1, include=["distances"],
@@ -106,12 +109,31 @@ def calibrate_collection(collection, vault_name: str) -> dict:
         dists[0] for dists in nonsense_result["distances"] if dists
     ]
 
-    knowledge_arr = np.array(knowledge_distances)
+    self_arr = np.array(self_distances)
+    neighbor_arr = np.array(neighbor_distances) if neighbor_distances else self_arr
     nonsense_arr = np.array(nonsense_distances)
 
-    knowledge_p25 = float(np.percentile(knowledge_arr, 25))
-    knowledge_p75 = float(np.percentile(knowledge_arr, 75))
+    self_p50 = float(np.percentile(self_arr, 50))
+    self_p75 = float(np.percentile(self_arr, 75))
     nonsense_p25 = float(np.percentile(nonsense_arr, 25))
+
+    # HIGH: as close as perfect matches get. MEDIUM: midway from there to the
+    # noise floor (where good paraphrases land). LOW: the noise floor itself.
+    high = self_p75
+    medium = self_p50 + 0.5 * (nonsense_p25 - self_p50)
+    low = nonsense_p25
+    # Enforce ordering for degenerate distributions
+    medium = max(medium, high * 1.15)
+    low = max(low, medium * 1.15)
+
+    def _dist_stats(arr):
+        return {
+            "min": round(float(arr.min()), 3),
+            "p25": round(float(np.percentile(arr, 25)), 3),
+            "p50": round(float(np.percentile(arr, 50)), 3),
+            "p75": round(float(np.percentile(arr, 75)), 3),
+            "max": round(float(arr.max()), 3),
+        }
 
     calibration = {
         "vault_name": vault_name,
@@ -119,24 +141,13 @@ def calibrate_collection(collection, vault_name: str) -> dict:
         "knowledge_probe_count": len(knowledge_queries),
         "knowledge_probe_source": "sampled" if collection.count() >= _MIN_SAMPLES else "fallback",
         "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-        "knowledge_distances": {
-            "min": float(knowledge_arr.min()),
-            "p25": round(float(np.percentile(knowledge_arr, 25)), 1),
-            "p50": round(float(np.percentile(knowledge_arr, 50)), 1),
-            "p75": round(float(np.percentile(knowledge_arr, 75)), 1),
-            "max": float(knowledge_arr.max()),
-        },
-        "nonsense_distances": {
-            "min": float(nonsense_arr.min()),
-            "p25": round(float(np.percentile(nonsense_arr, 25)), 1),
-            "p50": round(float(np.percentile(nonsense_arr, 50)), 1),
-            "p75": round(float(np.percentile(nonsense_arr, 75)), 1),
-            "max": float(nonsense_arr.max()),
-        },
+        "self_distances": _dist_stats(self_arr),
+        "neighbor_distances": _dist_stats(neighbor_arr),
+        "nonsense_distances": _dist_stats(nonsense_arr),
         "thresholds": {
-            "HIGH": round(knowledge_p25, 1),
-            "MEDIUM": round(knowledge_p75, 1),
-            "LOW": round(nonsense_p25, 1),
+            "HIGH": round(high, 3),
+            "MEDIUM": round(medium, 3),
+            "LOW": round(low, 3),
         },
     }
 
