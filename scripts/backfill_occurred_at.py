@@ -25,6 +25,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Windows consoles default to cp1252, which chokes on characters like '→'
+# that appear in observation previews.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.indexer import store as store_mod
