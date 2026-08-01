@@ -265,6 +265,20 @@ Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` r
 - All store mutations and reads are guarded by a process-wide `RLock`, so concurrent MCP calls cannot interleave into a lost update. Expensive work (embedding, calibration, clustering) runs *outside* the lock so it never stalls readers.
 - Supersession records `superseded_at` on the old row — the pointer plus the stamp form a validity interval (`created_at` → `superseded_at`) that `point_in_time` and `query_timeline(include_superseded=True)` use to answer "what was believed then", not just "what is believed now".
 
+## Backup & restore
+
+`scripts/backup_to_drive.py` runs daily on the server: it exports the `work` vault to a date-stamped zip and uploads it to a Drive folder, keeping 7 days locally and 30 on Drive. Export is a concurrent reader — it runs as a separate process against the live WAL database while the daemon holds it open.
+
+**A restore preserves history, not just facts.** That property is easy to lose, because import replays rows through the normal write path and every write defaults its timestamps to *now*. Three things are carried across explicitly:
+
+- **`created_at`** on each observation — otherwise every restored row reads as "recorded today" and `point_in_time` returns nothing for any date before the restore.
+- **`created_at` / `updated_at`** on entities the import created, written back as the final step, because each observation write bumps its entity's `updated_at`.
+- **`superseded_at`**, and critically, its *absence*: a row superseded before the field existed stays unstamped rather than being dated to the restore, which is what lets `point_in_time` keep inferring the cutover from the replacement's `created_at`.
+
+An entity that already exists in the target vault is reused and its own timestamps are left alone — rewriting them would falsify history the target vault legitimately owns.
+
+**What an archive does not contain:** vectors, and the SQLite file itself. Restore re-embeds every observation and recalibrates the vault, so recovery is correct but slow (minutes, CPU-bound) rather than instant. `occurred_at` and all supersede chains survive; nothing about the graph or the facts is lost.
+
 ## Architecture
 
 Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline shape, simplified to CPU-only; the model was swapped from CodeRankEmbed (a code retriever) to google/embeddinggemma-300m (768-dim, ONNX q8) for natural-language memory retrieval.
