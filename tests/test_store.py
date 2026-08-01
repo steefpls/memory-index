@@ -31,12 +31,9 @@ class TestEntityStore(unittest.TestCase):
         for p in self.patches:
             p.start()
 
-        # Also patch the store module's imported references
-        p6 = patch("src.indexer.store.DATA_DIR", Path(self.tmpdir))
-        p7 = patch("src.indexer.store.ENTITIES_FILE", Path(self.tmpdir) / "memory_entities.json")
-        self.patches.extend([p6, p7])
-        p6.start()
-        p7.start()
+        # Point the SQLite store at the temp dir
+        from tests.support import patch_sqlite
+        self.db_mod = patch_sqlite(self.tmpdir, self.patches)
 
         # Reset store state
         import src.indexer.store as store_mod
@@ -66,6 +63,8 @@ class TestEntityStore(unittest.TestCase):
         p9.start()
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil
@@ -242,19 +241,20 @@ class TestEntityStore(unittest.TestCase):
         self.assertEqual(old_obs.superseded_by, new.id)
         self.assertTrue(old_obs.is_superseded)
 
-    def test_supersede_updates_chromadb_metadata(self):
-        """Superseding should update ChromaDB metadata, not delete the entry."""
+    def test_supersede_records_pointer_and_timestamp_in_store(self):
+        """Superseding is a store-only mutation: the old row gets the pointer
+        plus a superseded_at stamp, and Chroma is neither updated nor deleted
+        (the vector stays searchable; search joins back to the store row)."""
         from src.indexer.store import create_entity, add_observation
 
         entity = create_entity("Perception", "project", "test")
         old = add_observation(entity.id, "Uses .NET Framework")
         new = add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
 
-        # ChromaDB update should have been called (not delete)
-        self.mock_collection.update.assert_called()
-        update_call = self.mock_collection.update.call_args
-        meta = update_call[1]["metadatas"][0] if "metadatas" in update_call[1] else update_call[0][1][0]
-        self.assertEqual(meta.get("superseded_by"), new.id)
+        self.assertEqual(old.superseded_by, new.id)
+        self.assertTrue(old.superseded_at)
+        self.mock_collection.update.assert_not_called()
+        self.mock_collection.delete.assert_not_called()
 
     def test_superseded_excluded_from_count(self):
         """Observation count should not include superseded observations."""
@@ -298,17 +298,23 @@ class TestEntityStore(unittest.TestCase):
 
     # --- Temporal metadata tests ---
 
-    def test_observation_has_created_at_in_chromadb(self):
-        """ChromaDB metadata should include created_at timestamp."""
+    def test_chroma_metadata_is_minimal(self):
+        """Chroma metadata carries ONLY the keys its where-filters need.
+
+        Content, source, and timestamps live in the SQLite store; duplicating
+        them into Chroma is what let the two stores hold divergent copies of a
+        fact.
+        """
         from src.indexer.store import create_entity, add_observation
 
         entity = create_entity("Python", "technology", "test")
-        obs = add_observation(entity.id, "A fact")
+        add_observation(entity.id, "A fact")
 
         add_call = self.mock_collection.add.call_args
         meta = add_call[1]["metadatas"][0] if "metadatas" in add_call[1] else add_call[0][3][0]
-        self.assertIn("created_at", meta)
-        self.assertEqual(meta["created_at"], obs.created_at)
+        self.assertEqual(set(meta.keys()), {"entity_id", "entity_type"})
+        self.assertEqual(meta["entity_id"], entity.id)
+        self.assertEqual(meta["entity_type"], "technology")
 
     def test_observation_serialization_with_superseded(self):
         """Observation to_dict/from_dict should roundtrip superseded_by."""
@@ -358,16 +364,17 @@ class TestEntityStore(unittest.TestCase):
         contents = {o.content for o in get_observations(entity.id)}
         self.assertEqual(contents, {"Fact A", "Fact B", "Fact C"})
 
-    def test_add_observations_one_save_per_batch(self):
-        """The batch path writes the store file once, not once per fact."""
+    def test_add_observations_one_db_write_per_batch(self):
+        """The batch path persists observations in one DB call, not one per fact."""
         import src.indexer.store as store_mod
         from src.indexer.store import create_entity, add_observations
 
         entity = create_entity("Python", "technology", "test")
-        with patch.object(store_mod, "_save_store",
-                          wraps=store_mod._save_store) as spy:
+        with patch.object(store_mod.db, "upsert_observations",
+                          wraps=store_mod.db.upsert_observations) as spy:
             add_observations(entity.id, ["A", "B", "C", "D"])
         self.assertEqual(spy.call_count, 1)
+        self.assertEqual(len(spy.call_args[0][0]), 4)
 
     def test_add_observations_preserves_order_and_blank_filtering(self):
         from src.indexer.store import create_entity, add_observations
@@ -478,26 +485,17 @@ class TestEntityStore(unittest.TestCase):
         obs = add_observation(entity.id, "A fact")
         self.assertIsNone(obs.occurred_at)
 
-    def test_occurred_at_absent_from_chroma_metadata_when_unset(self):
-        """Chroma rejects None metadata values — the key must be omitted."""
+    def test_occurred_at_lives_in_store_not_chroma(self):
+        """occurred_at is store data; Chroma metadata stays minimal."""
         from src.indexer.store import create_entity, add_observation
 
         entity = create_entity("Python", "technology", "test")
         self.mock_collection.add.reset_mock()
-        add_observation(entity.id, "A fact")
+        obs = add_observation(entity.id, "A fact", occurred_at="2025-05-01")
 
+        self.assertEqual(obs.occurred_at, "2025-05-01")
         meta = self.mock_collection.add.call_args[1]["metadatas"][0]
         self.assertNotIn("occurred_at", meta)
-
-    def test_occurred_at_present_in_chroma_metadata_when_set(self):
-        from src.indexer.store import create_entity, add_observation
-
-        entity = create_entity("Python", "technology", "test")
-        self.mock_collection.add.reset_mock()
-        add_observation(entity.id, "A fact", occurred_at="2025-05-01")
-
-        meta = self.mock_collection.add.call_args[1]["metadatas"][0]
-        self.assertEqual(meta["occurred_at"], "2025-05-01")
 
     def test_add_observations_parallel_occurred_at(self):
         from src.indexer.store import create_entity, add_observations
@@ -654,27 +652,30 @@ class TestAtomicPersistence(unittest.TestCase):
 
         self.assertEqual(Path(seen["dir"]), Path(self.tmpdir))
 
-    def test_graph_save_is_atomic(self):
-        """graph.manager._save_graph goes through the same atomic writer."""
+    def test_graph_save_persists_to_sqlite(self):
+        """add_relation writes a durable row that a fresh load can read back."""
         import src.graph.manager as gm
         from src.models.relation import Relation
+        from tests.support import patch_sqlite, close_sqlite
 
-        tmp = Path(self.tmpdir)
-        with patch("src.graph.manager.GRAPH_FILE", tmp / "memory_graph.json"), \
-             patch("src.graph.manager.DATA_DIR", tmp):
+        patches = []
+        db_mod = patch_sqlite(self.tmpdir, patches)
+        try:
             gm._graph = None
             gm._relations = {}
             gm.add_relation(Relation(id="r1", from_entity="a", to_entity="b",
                                      relation_type="uses"))
 
-            data = json.loads((tmp / "memory_graph.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(data["relations"]), 1)
-            leftovers = [p.name for p in tmp.iterdir()
-                         if p.name != "memory_graph.json"]
-            self.assertEqual(leftovers, [])
-
-        gm._graph = None
-        gm._relations = {}
+            rows = db_mod.load_relations()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["id"], "r1")
+            self.assertEqual(rows[0]["relation_type"], "uses")
+        finally:
+            gm._graph = None
+            gm._relations = {}
+            close_sqlite()
+            for p in patches:
+                p.stop()
 
 
 class TestStoreConcurrency(unittest.TestCase):
@@ -683,16 +684,15 @@ class TestStoreConcurrency(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.patches = [
-            patch("src.config.DATA_DIR", Path(self.tmpdir)),
-            patch("src.config.ENTITIES_FILE", Path(self.tmpdir) / "memory_entities.json"),
-            patch("src.indexer.store.DATA_DIR", Path(self.tmpdir)),
-            patch("src.indexer.store.ENTITIES_FILE", Path(self.tmpdir) / "memory_entities.json"),
             patch("src.indexer.store.get_collection", return_value=MagicMock()),
             patch("src.indexer.store.get_embedding_function",
                   return_value=MagicMock(return_value=[[0.1] * 768])),
         ]
         for p in self.patches:
             p.start()
+
+        from tests.support import patch_sqlite
+        patch_sqlite(self.tmpdir, self.patches)
 
         import src.indexer.store as store_mod
         store_mod._entities = {}
@@ -705,6 +705,8 @@ class TestStoreConcurrency(unittest.TestCase):
         }
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil

@@ -2,6 +2,11 @@
 
 Manages the lifecycle of entities and their observations, embedding observation
 text into ChromaDB for semantic retrieval.
+
+The in-memory dicts are the working set; every mutation is persisted as a
+row-level SQLite transaction via `src.indexer.db` (single source of truth for
+content — Chroma holds only vectors plus the minimal metadata its `where`
+filters need).
 """
 
 import json
@@ -13,9 +18,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.config import DATA_DIR, ENTITIES_FILE, VAULTS, get_vault
+from src.config import VAULTS, get_vault
+from src.indexer import db
 from src.indexer.calibration import calibrate_collection
-from src.indexer.embedder import get_embedding_function, get_collection, get_chroma_client
+from src.indexer.embedder import get_embedding_function, get_collection
 from src.models.entity import Entity
 from src.models.observation import Observation
 
@@ -74,38 +80,26 @@ def atomic_write_json(path: Path, data, *, indent: int = 2) -> None:
 
 
 def _load_store() -> None:
-    """Load entities and observations from disk."""
+    """Load entities and observations from SQLite (migrating legacy JSON once)."""
     global _entities, _observations, _loaded
     with STORE_LOCK:
         if _loaded:
             return
 
-        if ENTITIES_FILE.exists():
-            try:
-                data = json.loads(ENTITIES_FILE.read_text(encoding="utf-8"))
-                for ed in data.get("entities", []):
-                    ent = Entity.from_dict(ed)
-                    _entities[ent.id] = ent
-                for od in data.get("observations", []):
-                    obs = Observation.from_dict(od)
-                    _observations[obs.id] = obs
-                logger.info("Loaded %d entities, %d observations from disk",
-                            len(_entities), len(_observations))
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Failed to load entity store: %s", e)
+        try:
+            ent_rows, obs_rows = db.load_entities_observations()
+            for ed in ent_rows:
+                ent = Entity.from_dict(ed)
+                _entities[ent.id] = ent
+            for od in obs_rows:
+                obs = Observation.from_dict(od)
+                _observations[obs.id] = obs
+            logger.info("Loaded %d entities, %d observations from SQLite",
+                        len(_entities), len(_observations))
+        except Exception as e:
+            logger.warning("Failed to load entity store: %s", e)
 
         _loaded = True
-
-
-def _save_store() -> None:
-    """Save entities and observations to disk (atomically)."""
-    with STORE_LOCK:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        data = {
-            "entities": [e.to_dict() for e in _entities.values()],
-            "observations": [o.to_dict() for o in _observations.values()],
-        }
-        atomic_write_json(ENTITIES_FILE, data)
 
 
 def snapshot_store() -> tuple[dict[str, Entity], dict[str, Observation]]:
@@ -163,7 +157,7 @@ def create_entity(name: str, entity_type: str, vault: str,
                 vault=vault,
             )
             _entities[target.id] = target
-            _save_store()
+            db.upsert_entities([target])
             logger.info("Created entity: %s (%s) in vault %s",
                         name, entity_type, vault)
 
@@ -209,7 +203,7 @@ def update_entity(entity_id: str, name: str | None = None,
             ent.entity_type = entity_type
         ent.updated_at = _now_iso()
 
-        _save_store()
+        db.upsert_entities([ent])
 
     # Re-embed all observations if entity name/type changed. Done outside the
     # lock — it's an embedder round-trip, not a store mutation.
@@ -236,10 +230,15 @@ def delete_entity(entity_id: str) -> bool:
 
         # Soft delete all observations
         obs_ids_to_remove = []
+        touched_obs = []
         for obs in _observations.values():
             if obs.entity_id == entity_id and not obs.deleted:
                 obs.deleted = True
                 obs_ids_to_remove.append(obs.id)
+                touched_obs.append(obs)
+
+        db.upsert_entities([ent])
+        db.upsert_observations(touched_obs)
 
     # Remove from ChromaDB
     if obs_ids_to_remove:
@@ -259,7 +258,6 @@ def delete_entity(entity_id: str) -> bool:
     except Exception as e:
         logger.warning("Failed to remove relations for entity %s: %s", entity_id, e)
 
-    _save_store()
     logger.info("Soft deleted entity: %s (%s)", ent.name, entity_id)
     return True
 
@@ -300,27 +298,19 @@ def resolve_entity(name_or_id: str, vault: str | None = None) -> Entity | None:
 
 # --- Observation CRUD ---
 
-def _obs_metadata(ent: Entity, obs: Observation,
-                  superseded_by: str = "") -> dict:
+def _obs_metadata(ent: Entity, obs: Observation) -> dict:
     """Build the Chroma metadata dict for an observation.
 
-    `occurred_at` and `superseded_by` are omitted entirely when unset —
-    Chroma rejects None values in metadata.
+    Deliberately minimal: only the keys Chroma `where` filters need
+    (entity_type equality, entity_id $in for the associative pass). Content,
+    source, timestamps, and supersession live in the SQLite store — search
+    joins back to it by observation id, so the two stores can no longer hold
+    divergent copies of a fact.
     """
-    meta = {
+    return {
         "entity_id": ent.id,
-        "entity_name": ent.name,
         "entity_type": ent.entity_type,
-        "content": obs.content,
-        "source": obs.source,
-        "vault": ent.vault,
-        "created_at": obs.created_at,
     }
-    if obs.occurred_at:
-        meta["occurred_at"] = obs.occurred_at
-    if superseded_by:
-        meta["superseded_by"] = superseded_by
-    return meta
 
 
 def _crossed_multiple(prev_count: int, new_count: int, every: int) -> bool:
@@ -423,34 +413,26 @@ def add_observation(entity_id: str, content: str, source: str = "",
         )
         _observations[obs.id] = obs
 
-        # Mark the old observation as superseded
-        superseded_target = None
+        # Mark the old observation as superseded. superseded_at records WHEN
+        # the supersession was applied, turning the pointer into a validity
+        # interval (believed from created_at until superseded_at).
+        touched = [obs]
         if supersedes:
             old_obs = _observations.get(supersedes)
             if old_obs and not old_obs.deleted and old_obs.entity_id == entity_id:
                 old_obs.superseded_by = obs.id
-                superseded_target = old_obs
+                old_obs.superseded_at = _now_iso()
+                touched.append(old_obs)
 
         ent.updated_at = _now_iso()
-        _save_store()
+        db.upsert_observations(touched)
+        db.upsert_entities([ent])
         vault = ent.vault
-        superseded_meta = (
-            _obs_metadata(ent, superseded_target, superseded_by=obs.id)
-            if superseded_target is not None else None
-        )
         embed_text = _make_embedding_text(ent, content)
         add_meta = _obs_metadata(ent, obs)
         vault_obs_count = get_observation_count(vault)
 
     # --- Chroma I/O outside the lock ---
-    if superseded_meta is not None:
-        # Update ChromaDB metadata to tag it as superseded (keep it searchable)
-        try:
-            collection = _get_collection_for_vault(vault)
-            collection.update(ids=[supersedes], metadatas=[superseded_meta])
-        except Exception as e:
-            logger.warning("Failed to tag superseded observation in ChromaDB: %s", e)
-
     try:
         collection = _get_collection_for_vault(vault)
         ef = get_embedding_function()
@@ -538,7 +520,8 @@ def add_observations(entity_id: str, contents: list[str], source: str = "",
             created.append(obs)
 
         ent.updated_at = _now_iso()
-        _save_store()
+        db.upsert_observations(created)
+        db.upsert_entities([ent])
 
         vault = ent.vault
         ids = [o.id for o in created]
@@ -566,7 +549,8 @@ def add_observations(entity_id: str, contents: list[str], source: str = "",
     return created
 
 
-def mark_superseded(observation_id: str, superseded_by: str) -> bool:
+def mark_superseded(observation_id: str, superseded_by: str,
+                    superseded_at: str = "") -> bool:
     """Flag an existing observation as superseded by another one.
 
     Unlike add_observation(supersedes=...), this does not create anything — it
@@ -577,6 +561,9 @@ def mark_superseded(observation_id: str, superseded_by: str) -> bool:
     `superseded_by` may be an ID that isn't present locally (a chain whose head
     was not in the archive); the row is still marked superseded, which is what
     keeps it out of active reads and search.
+
+    `superseded_at` lets import preserve the original supersession timestamp;
+    when empty, the current time is recorded.
     """
     _load_store()
     with STORE_LOCK:
@@ -584,19 +571,24 @@ def mark_superseded(observation_id: str, superseded_by: str) -> bool:
         if obs is None or obs.deleted or not superseded_by:
             return False
         obs.superseded_by = superseded_by
-        ent = _entities.get(obs.entity_id)
-        meta = _obs_metadata(ent, obs, superseded_by=superseded_by) if ent else None
-        vault = ent.vault if ent else None
-        _save_store()
-
-    if meta is not None:
-        try:
-            collection = _get_collection_for_vault(vault)
-            collection.update(ids=[observation_id], metadatas=[meta])
-        except Exception as e:
-            logger.warning("Failed to tag superseded observation %s in ChromaDB: %s",
-                           observation_id, e)
+        obs.superseded_at = (superseded_at or "").strip() or _now_iso()
+        db.upsert_observations([obs])
     return True
+
+
+def get_observation(observation_id: str) -> Observation | None:
+    """Get a single non-deleted observation by ID (superseded rows included).
+
+    Search uses this to join Chroma hits back to the authoritative store row —
+    a vector whose observation is gone (deleted or diverged) resolves to None
+    and is dropped from results.
+    """
+    _load_store()
+    with STORE_LOCK:
+        obs = _observations.get(observation_id)
+        if obs is None or obs.deleted:
+            return None
+        return obs
 
 
 def get_observations(entity_id: str, include_superseded: bool = False) -> list[Observation]:
@@ -627,7 +619,7 @@ def delete_observation(observation_id: str) -> bool:
         obs.deleted = True
         ent = _entities.get(obs.entity_id)
         vault = ent.vault if ent else None
-        _save_store()
+        db.upsert_observations([obs])
 
     # Remove from ChromaDB
     if vault is not None:

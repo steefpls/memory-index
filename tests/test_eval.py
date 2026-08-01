@@ -308,18 +308,16 @@ class TestNoGlobalStateLeaks(unittest.TestCase):
         import src.indexer.embedder as embedder
         import src.indexer.store as store
 
-        before = (config.DATA_DIR, config.CHROMA_DIR, config.ENTITIES_FILE,
-                  config.GRAPH_FILE, config.VAULTS_FILE, embedder.CHROMA_DIR,
-                  store.DATA_DIR, store.ENTITIES_FILE,
-                  store._run_post_write_hooks)
+        before = (config.DATA_DIR, config.CHROMA_DIR, config.DB_FILE,
+                  config.ENTITIES_FILE, config.GRAPH_FILE, config.VAULTS_FILE,
+                  embedder.CHROMA_DIR, store._run_post_write_hooks)
         vaults_before = dict(config.VAULTS)
 
         ev.run_eval()
 
-        after = (config.DATA_DIR, config.CHROMA_DIR, config.ENTITIES_FILE,
-                 config.GRAPH_FILE, config.VAULTS_FILE, embedder.CHROMA_DIR,
-                 store.DATA_DIR, store.ENTITIES_FILE,
-                 store._run_post_write_hooks)
+        after = (config.DATA_DIR, config.CHROMA_DIR, config.DB_FILE,
+                 config.ENTITIES_FILE, config.GRAPH_FILE, config.VAULTS_FILE,
+                 embedder.CHROMA_DIR, store._run_post_write_hooks)
         self.assertEqual(before, after)
         self.assertEqual(vaults_before, dict(config.VAULTS))
         self.assertNotIn("eval_fixture", config.VAULTS)

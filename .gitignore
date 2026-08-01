@@ -4,14 +4,18 @@
 # ChromaDB data (rebuilt by indexing)
 data/chroma/
 
-# Entity and graph data (runtime state)
+# Entity/observation/relation store (runtime state)
+data/memory.db
+data/memory.db-wal
+data/memory.db-shm
+
+# Legacy JSON store (kept as a frozen backup after SQLite migration)
 data/memory_entities.json
 data/memory_graph.json
 data/vaults.json
 data/*_calibration.json
 
 # ONNX model (downloaded/exported by setup.bat)
-data/coderank_onnx/
 data/embeddinggemma_onnx/
 
 # Logs

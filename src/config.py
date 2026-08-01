@@ -1,6 +1,5 @@
 """Configuration for memory-index: vault management, paths, model constants."""
 
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 CHROMA_DIR = DATA_DIR / "chroma"
 LOG_FILE = DATA_DIR / "server.log"
+DB_FILE = DATA_DIR / "memory.db"
+# Legacy JSON store files — read once by the SQLite auto-migration, then left
+# in place untouched as a backup. Never written to anymore.
 VAULTS_FILE = DATA_DIR / "vaults.json"
 ENTITIES_FILE = DATA_DIR / "memory_entities.json"
 GRAPH_FILE = DATA_DIR / "memory_graph.json"
@@ -61,28 +63,18 @@ VAULTS: dict[str, VaultConfig] = {}
 
 
 def _load_vaults() -> None:
-    """Load vault configs from disk."""
+    """Load vault configs from the SQLite store (auto-migrating legacy JSON)."""
     global VAULTS
-    if VAULTS_FILE.exists():
-        try:
-            data = json.loads(VAULTS_FILE.read_text(encoding="utf-8"))
-            VAULTS = {
-                name: VaultConfig.from_dict(cfg)
-                for name, cfg in data.get("vaults", {}).items()
-            }
-            logger.info("Loaded %d vaults from %s", len(VAULTS), VAULTS_FILE)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to load vaults: %s", e)
-            VAULTS = {}
-    else:
+    try:
+        from src.indexer import db
+        VAULTS = {
+            d["name"]: VaultConfig.from_dict(d)
+            for d in db.get_all_vaults()
+        }
+        logger.info("Loaded %d vaults from %s", len(VAULTS), DB_FILE)
+    except Exception as e:
+        logger.warning("Failed to load vaults: %s", e)
         VAULTS = {}
-
-
-def _save_vaults() -> None:
-    """Save vault configs to disk."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    data = {"vaults": {name: cfg.to_dict() for name, cfg in VAULTS.items()}}
-    VAULTS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def create_vault(name: str) -> VaultConfig:
@@ -95,7 +87,8 @@ def create_vault(name: str) -> VaultConfig:
         created_at=datetime.now(timezone.utc).isoformat(),
     )
     VAULTS[name] = vault
-    _save_vaults()
+    from src.indexer import db
+    db.upsert_vault(vault.to_dict())
     logger.info("Created vault: %s (collection: %s)", name, vault.collection_name)
     return vault
 
@@ -105,7 +98,8 @@ def delete_vault(name: str) -> bool:
     if name not in VAULTS:
         return False
     del VAULTS[name]
-    _save_vaults()
+    from src.indexer import db
+    db.delete_vault_row(name)
     logger.info("Deleted vault: %s", name)
     return True
 

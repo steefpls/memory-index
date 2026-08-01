@@ -200,9 +200,20 @@ The confidence labels search returns are calibrated distances, not truth values.
 
 ### Entity type conventions
 
-Suggested types (free-form strings — no enum enforced):
+Canonical types (a closed set, **enforced at the write boundary** — `create_entity` / `update_entity` reject anything else with the valid list):
 
-`person`, `project`, `concept`, `decision`, `error`, `solution`, `technology`, `pattern`, `preference`, `organization`, `event`, `reference`
+`person`, `project`, `concept`, `decision`, `error`, `solution`, `technology`, `pattern`, `preference`, `organization`, `event`, `reference`, `location`, `process`, `artifact`
+
+### Relation type conventions
+
+Also a closed, enforced set — one spelling per meaning. Common synonyms are auto-canonicalized at write time, including direction-flipped forms (`created_by` becomes `created` with the endpoints swapped, and the response says so). Anything unknown is rejected with the valid list; `related_to` is the deliberate escape hatch, with the nuance carried in `context`.
+
+- generic: `related_to`
+- structure & artifacts: `part_of`, `uses`, `depends_on`, `involves`, `applies_to`, `builds_on`, `replaces`, `created`, `maintains`
+- people & organizations: `works_at`, `worked_at`, `works_on`, `reports_to`, `leads`, `founded`, `funds`, `friend_of`, `collaborates_with`, `learned_from`, `participated_in`
+- knowledge & causality: `solves`, `caused_by`, `contradicts`, `blocks`
+
+`scripts/canonicalize_relations.py` (dry-run default) collapses pre-enforcement legacy types onto this set, preserving the original spelling in the relation's context.
 
 ### Default vault
 
@@ -215,7 +226,7 @@ Unless the agent is explicitly told otherwise, all operations should target a si
 Pipeline:
 
 1. Embed the query with EmbeddingGemma-300m (CPU, ONNX q8), using the retrieval-query prefix
-2. Query each in-scope vault's ChromaDB collection, applying `entity_type`, `since`, `before`, and superseded filters in the vector store's `where` clause
+2. Query each in-scope vault's ChromaDB collection for ids + distances (`entity_type` is the only filter pushed into the `where` clause), then **join every hit back to its SQLite store row** — content, source, entity context, supersession, and timestamps all come from the store, so a stray vector can never resurrect a deleted or divergent fact. Superseded and `since`/`before` filters apply on the store row; the date window tests `created_at` by default or event time with `date_axis="event"`.
 3. Flatten every matching observation into one list across vaults and rank it by calibrated relevance score (a strictly decreasing function of distance within a vault, and the only key that compares fairly across vaults when searching all of them)
 4. Gate on the vault's calibrated noise floor — an observation is *above threshold* when its band is anything other than `NO MATCH`
 5. Select results (below)
@@ -247,9 +258,12 @@ Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` r
 
 ## Storage & concurrency
 
-- Entity/observation JSON and the graph JSON are written **atomically** — write to a sibling temp file, `fsync`, then `os.replace` — so a crash mid-write can never truncate the store.
+- Entities, observations, relations, and vault configs live in **SQLite** (`data/memory.db`, WAL mode). Every mutation is a row-level transaction — write cost is O(1) per row, not O(corpus) — and SQLite's file locking makes a second writing process fail loudly instead of silently clobbering the store.
+- The working set stays in memory (dicts + a NetworkX graph) for fast reads/traversal; SQLite is the durable source of truth underneath.
+- On first startup after upgrading, a **one-time auto-migration** imports the legacy JSON store files (`memory_entities.json`, `memory_graph.json`, `vaults.json`) into the DB and leaves them in place as a frozen backup. They are never written again.
+- ChromaDB holds vectors plus only the metadata its `where` filters need (`entity_id`, `entity_type`). Observation content is **not** duplicated into Chroma — search joins hits back to the store row, so the two stores cannot hold divergent copies of a fact.
 - All store mutations and reads are guarded by a process-wide `RLock`, so concurrent MCP calls cannot interleave into a lost update. Expensive work (embedding, calibration, clustering) runs *outside* the lock so it never stalls readers.
-- ChromaDB I/O sits outside the lock; only metadata preparation is inside it.
+- Supersession records `superseded_at` on the old row — the pointer plus the stamp form a validity interval (`created_at` → `superseded_at`) that `point_in_time` and `query_timeline(include_superseded=True)` use to answer "what was believed then", not just "what is believed now".
 
 ## Architecture
 
@@ -260,16 +274,17 @@ src/
 ├── server.py              # FastMCP, 26 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
 ├── indexer/
+│   ├── db.py              # SQLite DAL (row-level transactions, legacy-JSON auto-migration)
 │   ├── embedder.py        # ONNX CPU embedder singleton + ChromaDB client
 │   ├── calibration.py     # Per-vault distance thresholds (randomly sampled probes)
-│   └── store.py           # Entity/observation CRUD, atomic writes, RLock, auto-recalibrate
+│   └── store.py           # Entity/observation CRUD, in-memory cache over SQLite, RLock
 ├── graph/
-│   ├── manager.py         # NetworkX MultiDiGraph, atomic JSON persistence
+│   ├── manager.py         # NetworkX MultiDiGraph over SQLite relation rows
 │   └── traversal.py       # Neighbors, spreading activation (nomination only)
 ├── models/
-│   ├── entity.py
-│   ├── observation.py     # content, source, created_at, occurred_at, superseded_by
-│   └── relation.py
+│   ├── entity.py          # + canonical ENTITY_TYPES (enforced)
+│   ├── observation.py     # content, source, created_at, occurred_at, superseded_by/_at
+│   └── relation.py        # + canonical RELATION_TYPES and aliases (enforced)
 └── tools/
     ├── search.py          # Observation-level ranked search + threshold gate
     ├── entities.py        # Entity/observation tool impls
@@ -287,6 +302,8 @@ scripts/
 ├── recalibrate.py            # Force per-vault threshold recalibration
 ├── reembed_all.py            # Re-embed every observation (model change)
 ├── backfill_occurred_at.py   # Infer occurred_at from ISO dates in text (dry-run default)
+├── canonicalize_relations.py # Collapse legacy relation types onto the canonical set (dry-run default)
+├── eval_search.py            # Retrieval eval harness (golden queries, recall@k / MRR)
 └── backup_to_drive.py        # Vault backup
 ```
 
@@ -304,4 +321,4 @@ Run them all:
 for f in tests/test_*.py; do PYTHONPATH=. python "$f"; done
 ```
 
-194 tests across 9 files, covering entity CRUD and superseding, batched observation writes, atomic-write and concurrency behaviour, observation-level search ranking and threshold selection, graph traversal and analysis, the librarian, temporal queries with event time, vault export/import round-trips, maintenance, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.
+278 tests across 12 files, covering entity CRUD and superseding, batched observation writes, SQLite persistence and the legacy-JSON migration, concurrency behaviour, ontology enforcement, observation-level search ranking and threshold selection, graph traversal and analysis, the librarian, temporal queries on both time axes, vault export/import round-trips, maintenance, the eval harness, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.

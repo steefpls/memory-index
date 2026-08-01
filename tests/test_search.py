@@ -118,6 +118,8 @@ class SearchTestCase(unittest.TestCase):
 
     def setUp(self):
         from src.tools.search import _calibration_cache
+        from src.models.observation import Observation
+        from src.models.entity import Entity
 
         self.collections = {
             "test": FakeCollection(list(self.rows), self.hidden_entities),
@@ -125,8 +127,31 @@ class SearchTestCase(unittest.TestCase):
         _calibration_cache["test"] = dict(TEST_THRESHOLDS)
         _calibration_cache["other"] = dict(TEST_THRESHOLDS)
 
+        # Search joins Chroma hits back to the store, so the fixture rows must
+        # exist as store objects too — the meta dict now only feeds the fake
+        # collection's `where` evaluation.
+        self.store_observations: dict = {}
+        self.store_entities: dict = {}
+        for r in self.rows:
+            meta = r["meta"]
+            self.store_observations[r["id"]] = Observation(
+                id=r["id"],
+                entity_id=meta["entity_id"],
+                content=meta["content"],
+                source=meta.get("source", ""),
+                created_at=meta.get("created_at", ""),
+                superseded_by=meta.get("superseded_by", ""),
+            )
+            self.store_entities[meta["entity_id"]] = Entity(
+                id=meta["entity_id"],
+                name=meta.get("entity_name", meta["entity_id"].upper()),
+                entity_type=meta.get("entity_type", "technology"),
+                vault=meta.get("vault", "test"),
+            )
+
         self.spread = MagicMock(return_value={})
-        self.get_entity = MagicMock(return_value=None)
+        self.get_entity = MagicMock(
+            side_effect=lambda eid: self.store_entities.get(eid))
 
         self.patches = [
             patch("src.tools.search.VAULTS", {"test": object()}),
@@ -138,6 +163,8 @@ class SearchTestCase(unittest.TestCase):
                   return_value=[[0.1] * 8]),
             patch("src.tools.search.spread_activation", self.spread),
             patch("src.tools.search.get_entity", self.get_entity),
+            patch("src.tools.search.get_observation",
+                  side_effect=lambda oid: self.store_observations.get(oid)),
         ]
         for p in self.patches:
             p.start()
@@ -344,6 +371,44 @@ class TestFilters(SearchTestCase):
         self.assertIn("Error", result)
         self.assertIn("since", result)
 
+    def test_invalid_date_axis_is_reported(self):
+        from src.tools.search import search_memory
+        result = search_memory("a query", vault="test", date_axis="wat")
+        self.assertIn("Error", result)
+        self.assertIn("date_axis", result)
+
+
+class TestDateAxis(SearchTestCase):
+    """since/before can window on record time (default) or event time."""
+
+    rows = [
+        # Recorded May 2026, no event time.
+        _row("o1", "e1", 0.10, "plain recent fact", created_at="2026-05-01"),
+        # Recorded May 2026 about a 1991 event.
+        _row("o2", "e1", 0.20, "historical fact", created_at="2026-05-01"),
+        _row("o3", "e1", 0.30, "another recent fact", created_at="2026-05-02"),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.store_observations["o2"].occurred_at = "1991-02-20"
+
+    def test_record_axis_is_default(self):
+        payload = self.search_json(vault="test", since="2026-01-01")
+        ids = {r["observation_id"] for r in payload["results"]}
+        self.assertEqual(ids, {"o1", "o2", "o3"})
+
+    def test_event_axis_windows_on_occurred_at(self):
+        payload = self.search_json(vault="test", since="2026-01-01",
+                                   date_axis="event")
+        ids = {r["observation_id"] for r in payload["results"]}
+        self.assertEqual(ids, {"o1", "o3"})  # o2 happened in 1991
+
+        payload = self.search_json(vault="test", since="1991-01-01",
+                                   before="1992-01-01", date_axis="event")
+        ids = {r["observation_id"] for r in payload["results"]}
+        self.assertIn("o2", ids)
+
 
 class TestStrategyDefaults(SearchTestCase):
     rows = [
@@ -384,11 +449,6 @@ class TestAssociativeScoring(SearchTestCase):
     def setUp(self):
         super().setUp()
         self.spread.return_value = {"e9": 0.7}
-        self.get_entity.side_effect = lambda eid: (
-            types.SimpleNamespace(id="e9", name="NEIGHBOUR",
-                                  entity_type="concept", vault="test")
-            if eid == "e9" else None
-        )
 
     def test_neighbour_scored_with_real_distance(self):
         payload = self.search_json(vault="test", strategy="associative")
@@ -435,11 +495,6 @@ class TestAssociativeDegradesGracefully(SearchTestCase):
     def setUp(self):
         super().setUp()
         self.spread.return_value = {"e9": 0.9}
-        self.get_entity.side_effect = lambda eid: (
-            types.SimpleNamespace(id="e9", name="NEIGHBOUR",
-                                  entity_type="concept", vault="test")
-            if eid == "e9" else None
-        )
 
     def test_matches_semantic_result(self):
         associative = self.search_json(vault="test", strategy="associative")

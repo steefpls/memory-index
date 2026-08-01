@@ -4,11 +4,64 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
+# Closed canonical set — enforced at the write boundary (create_relation).
+# One spelling per meaning; synonyms live in RELATION_ALIASES below and are
+# canonicalized at write time. `related_to` is the deliberate escape hatch:
+# anything that fits nothing else goes there, with the nuance in `context`.
 RELATION_TYPES = frozenset({
-    "depends_on", "solves", "related_to", "contradicts", "builds_on",
-    "applies_to", "caused_by", "part_of", "uses", "created_by",
-    "maintained_by", "replaces", "extends", "implements", "blocks",
+    # generic
+    "related_to",
+    # structure & artifacts
+    "part_of", "uses", "depends_on", "involves", "applies_to",
+    "builds_on", "replaces", "created", "maintains",
+    # people & organizations
+    "works_at", "worked_at", "works_on", "reports_to", "leads",
+    "founded", "funds", "friend_of", "collaborates_with",
+    "learned_from", "participated_in",
+    # knowledge & causality
+    "solves", "caused_by", "contradicts", "blocks",
 })
+
+# Synonym → (canonical, flip). flip=True means the alias states the same fact
+# in the opposite direction, so from/to must be swapped when canonicalizing
+# (e.g. "A created_by B" becomes "B created A").
+RELATION_ALIASES: dict[str, tuple[str, bool]] = {
+    "created_by": ("created", True),
+    "creates": ("created", False),
+    "authored": ("created", False),
+    "built": ("created", False),
+    "maintained_by": ("maintains", True),
+    "causes": ("caused_by", True),
+    "solved_by": ("solves", True),
+    "friends_with": ("friend_of", False),
+    "close_friend_of": ("friend_of", False),
+    "worked_with": ("collaborates_with", False),
+    "works_with": ("collaborates_with", False),
+    "collaborated_with": ("collaborates_with", False),
+    "member_of": ("part_of", False),
+    "belongs_to": ("part_of", False),
+    "project_of": ("part_of", False),
+    "extends": ("builds_on", False),
+    "implements": ("builds_on", False),
+    "wraps": ("builds_on", False),
+    "employs": ("works_at", True),
+    "employed_by": ("works_at", False),
+    "led": ("leads", False),
+    "founded_by": ("founded", True),
+    "funded_by": ("funds", True),
+}
+
+
+def canonicalize_relation_type(relation_type: str) -> tuple[str, bool] | None:
+    """Resolve a relation type to its canonical form.
+
+    Returns (canonical_type, flip) — flip=True means from/to must be swapped —
+    or None if the type is neither canonical nor a known alias.
+    """
+    rt = (relation_type or "").strip().lower()
+    if rt in RELATION_TYPES:
+        return rt, False
+    return RELATION_ALIASES.get(rt)
 
 
 @dataclass

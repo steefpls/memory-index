@@ -129,6 +129,7 @@ def backfill(vault: str | None, apply_changes: bool) -> int:
         return 0
 
     written = 0
+    touched = []
     with store_mod.STORE_LOCK:
         for obs_id, date, _content in matched:
             obs = store_mod._observations.get(obs_id)
@@ -137,12 +138,13 @@ def backfill(vault: str | None, apply_changes: bool) -> int:
             if obs is None or obs.deleted or obs.occurred_at:
                 continue
             obs.occurred_at = date
+            touched.append(obs)
             written += 1
-        store_mod._save_store()
+        if touched:
+            from src.indexer import db
+            db.upsert_observations(touched)
 
     print(f"\n  Applied: {written} observation(s) updated on disk.")
-    print("  Note: Chroma metadata is refreshed on the next re-embed "
-          "(scripts/reembed_all.py) — the JSON store is the source of truth.")
     return 0
 
 

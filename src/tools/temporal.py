@@ -75,6 +75,8 @@ def _snapshot_store() -> tuple[dict, dict]:
 
 def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
                         entity_type: str = "", limit: int = 50,
+                        date_axis: str = "event",
+                        include_superseded: bool = False,
                         output_format: str = "text") -> str:
     """Query observations across a time range, ordered chronologically.
 
@@ -86,11 +88,23 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
         end: End date/datetime (ISO format, exclusive). Empty = no upper bound.
         entity_type: Optional filter by entity type.
         limit: Max results (default 50, max 200).
+        date_axis: Which timestamp to window and order on — "event" (default,
+                   occurred_at when known, else created_at: when the fact
+                   happened) or "record" (created_at: when it was written
+                   down). Same semantics as search_memory's axis.
+        include_superseded: If True, also include observations that have since
+                            been replaced, labelled with when they were
+                            superseded — "what did the timeline believe",
+                            not just what is believed now.
         output_format: "text" (default) or "json".
     """
     output_format = (output_format or "text").lower()
     if output_format not in {"text", "json"}:
         return "Error: output_format must be 'text' or 'json'."
+
+    date_axis = (date_axis or "event").lower()
+    if date_axis not in {"event", "record"}:
+        return "Error: date_axis must be 'event' or 'record'."
 
     limit = min(max(limit, 1), 200)
 
@@ -125,13 +139,16 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
     # Collect observations in the time window
     timeline_items = []
     for obs in observations_snapshot.values():
-        if obs.deleted or obs.is_superseded:
+        if obs.deleted:
+            continue
+        if obs.is_superseded and not include_superseded:
             continue
         if obs.entity_id not in entity_ids_in_scope:
             continue
 
-        # Timelines window on EVENT time — "what happened in this range".
-        obs_dt = _obs_effective_dt(obs)
+        # Window on the chosen axis — "event" asks what happened in this
+        # range, "record" asks what was written down in this range.
+        obs_dt = _obs_effective_dt(obs) if date_axis == "event" else _obs_created_dt(obs)
         if obs_dt is None:
             continue
         if start_dt and obs_dt < start_dt:
@@ -153,12 +170,17 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
             "source": obs.source,
             "created_at": obs.created_at,
             "occurred_at": getattr(obs, "occurred_at", None),
-            # What this item was ordered and filtered on.
+            "superseded": obs.is_superseded,
+            "superseded_at": getattr(obs, "superseded_at", None),
+            # Event-time stamp (occurred_at when known, else created_at).
             "effective_at": _obs_effective_at(obs),
         })
 
-    # Sort chronologically on event time (falling back to ingestion time)
-    timeline_items.sort(key=lambda x: x["effective_at"])
+    # Sort chronologically on the chosen axis
+    def _axis_stamp(item: dict) -> str:
+        return item["effective_at"] if date_axis == "event" else item["created_at"]
+
+    timeline_items.sort(key=_axis_stamp)
     timeline_items = timeline_items[:limit]
 
     if not timeline_items:
@@ -175,21 +197,27 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
             "count": len(timeline_items),
             "start": start or None,
             "end": end or None,
+            "date_axis": date_axis,
+            "include_superseded": include_superseded,
         }, indent=2)
 
     # Text format
-    lines = [f"Timeline ({len(timeline_items)} observations):"]
+    lines = [f"Timeline ({len(timeline_items)} observations, {date_axis} time):"]
     current_date = ""
     for item in timeline_items:
-        # Group by date (event date when known, else ingestion date)
-        item_date = item["effective_at"][:10]
+        # Group by date on the chosen axis
+        item_date = _axis_stamp(item)[:10]
         if item_date != current_date:
             current_date = item_date
             lines.append(f"\n  [{current_date}]")
         src = f" [source: {item['source']}]" if item.get("source") else ""
-        occ = " (event time)" if item.get("occurred_at") else ""
+        occ = " (event time)" if item.get("occurred_at") and date_axis == "event" else ""
+        old = ""
+        if item.get("superseded"):
+            until = (item.get("superseded_at") or "")[:10]
+            old = f" [superseded{' ' + until if until else ''}]"
         lines.append(f"    {item['entity_name']} ({item['entity_type']}): "
-                     f"{item['content']}{src}{occ}")
+                     f"{item['content']}{src}{occ}{old}")
         lines.append(f"      obs: {item['observation_id']}  entity: {item['entity_id']}")
 
     return "\n".join(lines)
@@ -246,13 +274,17 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
         if obs_dt > as_of_dt:
             continue  # wasn't recorded yet
 
-        # Check if this was superseded BEFORE as_of
+        # Check if this was superseded BEFORE as_of. superseded_at (recorded
+        # at supersede time) is authoritative; legacy rows that predate the
+        # field fall back to the replacement's created_at.
         if obs.superseded_by:
-            replacement = observations_snapshot.get(obs.superseded_by)
-            if replacement:
-                repl_dt = _obs_created_dt(replacement)
-                if repl_dt and repl_dt <= as_of_dt:
-                    continue  # was already superseded by as_of, skip
+            superseded_dt = _parse_iso(getattr(obs, "superseded_at", None) or "")
+            if superseded_dt is None:
+                replacement = observations_snapshot.get(obs.superseded_by)
+                if replacement:
+                    superseded_dt = _obs_created_dt(replacement)
+            if superseded_dt and superseded_dt <= as_of_dt:
+                continue  # was already superseded by as_of, skip
 
         obs_at_time.append(obs)
 

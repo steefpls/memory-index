@@ -1,18 +1,15 @@
-"""NetworkX MultiDiGraph wrapper with JSON persistence.
+"""NetworkX MultiDiGraph wrapper with SQLite persistence.
 
 Manages the relation graph between entities. In-memory for fast traversal,
-persisted to JSON for durability.
+persisted row-by-row to SQLite for durability.
 """
 
-import json
 import logging
 import threading
-from pathlib import Path
 
 import networkx as nx
-from networkx.readwrite import json_graph
 
-from src.config import GRAPH_FILE, DATA_DIR
+from src.indexer import db
 from src.models.relation import Relation
 
 logger = logging.getLogger(__name__)
@@ -39,55 +36,29 @@ def _get_graph() -> nx.MultiDiGraph:
 
 
 def _load_graph() -> None:
-    """Load graph and relations from disk."""
+    """Load graph and relations from SQLite."""
     global _graph, _relations
     with GRAPH_LOCK:
         if _graph is None:
             _graph = nx.MultiDiGraph()
 
-        if GRAPH_FILE.exists():
-            try:
-                data = json.loads(GRAPH_FILE.read_text(encoding="utf-8"))
-
-                # Load relations
-                for rd in data.get("relations", []):
-                    rel = Relation.from_dict(rd)
-                    _relations[rel.id] = rel
-                    _graph.add_edge(
-                        rel.from_entity, rel.to_entity,
-                        key=rel.id,
-                        relation_type=rel.relation_type,
-                        weight=rel.weight,
-                        context=rel.context,
-                        created_at=rel.created_at,
-                    )
-                logger.info("Loaded graph: %d nodes, %d edges, %d relations",
-                            _graph.number_of_nodes(), _graph.number_of_edges(),
-                            len(_relations))
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Failed to load graph: %s", e)
-
-
-def _save_graph() -> None:
-    """Save relations to disk.
-
-    Uses the same crash-safe temp-file + os.replace swap as the entity store,
-    so an interrupted write can never leave a truncated graph JSON behind.
-    The snapshot is built under GRAPH_LOCK so the payload is also *consistent*
-    — a crash-safe swap of a torn payload is still a corrupt graph.
-    """
-    # Imported here (not at module top) to keep graph.manager free of a
-    # module-level dependency on the store, which lazily imports this module.
-    from src.indexer.store import atomic_write_json
-
-    with GRAPH_LOCK:
-        data = {
-            "relations": [r.to_dict() for r in _relations.values()],
-        }
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        # Kept inside the lock so concurrent saves can't land out of order and
-        # leave disk holding an older snapshot than memory.
-        atomic_write_json(GRAPH_FILE, data)
+        try:
+            for rd in db.load_relations():
+                rel = Relation.from_dict(rd)
+                _relations[rel.id] = rel
+                _graph.add_edge(
+                    rel.from_entity, rel.to_entity,
+                    key=rel.id,
+                    relation_type=rel.relation_type,
+                    weight=rel.weight,
+                    context=rel.context,
+                    created_at=rel.created_at,
+                )
+            logger.info("Loaded graph: %d nodes, %d edges, %d relations",
+                        _graph.number_of_nodes(), _graph.number_of_edges(),
+                        len(_relations))
+        except Exception as e:
+            logger.warning("Failed to load graph: %s", e)
 
 
 def add_relation(relation: Relation) -> None:
@@ -103,7 +74,7 @@ def add_relation(relation: Relation) -> None:
             context=relation.context,
             created_at=relation.created_at,
         )
-        _save_graph()
+        db.upsert_relations([relation])
     logger.info("Added relation: %s -[%s]-> %s",
                 relation.from_entity, relation.relation_type, relation.to_entity)
 
@@ -126,7 +97,7 @@ def remove_relation(relation_id: str) -> bool:
             if graph.has_node(node_id) and graph.degree(node_id) == 0:
                 graph.remove_node(node_id)
 
-        _save_graph()
+        db.delete_relation_row(relation_id)
     logger.info("Removed relation: %s", relation_id)
     return True
 

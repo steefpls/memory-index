@@ -14,19 +14,16 @@ def _make_test_patches(tmpdir):
     """Create standard patches for test isolation."""
     return [
         patch("src.config.DATA_DIR", Path(tmpdir)),
-        patch("src.config.ENTITIES_FILE", Path(tmpdir) / "memory_entities.json"),
-        patch("src.config.VAULTS_FILE", Path(tmpdir) / "vaults.json"),
-        patch("src.config.GRAPH_FILE", Path(tmpdir) / "memory_graph.json"),
+        patch("src.config.DB_FILE", Path(tmpdir) / "memory.db"),
         patch("src.config.CHROMA_DIR", Path(tmpdir) / "chroma"),
-        patch("src.indexer.store.DATA_DIR", Path(tmpdir)),
-        patch("src.indexer.store.ENTITIES_FILE", Path(tmpdir) / "memory_entities.json"),
-        patch("src.graph.manager.GRAPH_FILE", Path(tmpdir) / "memory_graph.json"),
-        patch("src.graph.manager.DATA_DIR", Path(tmpdir)),
     ]
 
 
 def _reset_state():
-    """Reset all in-memory state."""
+    """Reset all in-memory state (call AFTER the patches are started)."""
+    import src.indexer.db as db_mod
+    db_mod.reset()
+
     import src.indexer.store as store_mod
     store_mod._entities = {}
     store_mod._observations = {}
@@ -59,6 +56,8 @@ class TestEntityTools(unittest.TestCase):
         _reset_state()
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil
@@ -145,6 +144,8 @@ class TestRelationTools(unittest.TestCase):
         _reset_state()
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil
@@ -194,6 +195,8 @@ class TestStatusTools(unittest.TestCase):
         _reset_state()
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil
@@ -297,6 +300,109 @@ class TestStatusTools(unittest.TestCase):
             )
             self.assertEqual(len(store_mod._observations), 0)
             self.assertEqual(len(gm.get_all_relations()), 0)
+
+
+class TestOntologyEnforcement(unittest.TestCase):
+    """entity_type and relation_type are closed sets at the write boundary."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.patches = _make_test_patches(self.tmpdir)
+
+        mock_collection = MagicMock()
+        mock_ef = MagicMock()
+        mock_ef.__call__ = MagicMock(return_value=[[0.1] * 768])
+        self.patches.append(patch("src.indexer.store.get_collection", return_value=mock_collection))
+        self.patches.append(patch("src.indexer.store.get_embedding_function", return_value=mock_ef))
+
+        for p in self.patches:
+            p.start()
+        _reset_state()
+
+    def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
+        for p in self.patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ---- entity types ----
+
+    def test_unknown_entity_type_rejected_with_valid_list(self):
+        from src.tools.entities import tool_create_entity
+        result = tool_create_entity("Thing", "gizmo", "test")
+        self.assertIn("Error", result)
+        self.assertIn("gizmo", result)
+        self.assertIn("person", result)  # the valid list is spelled out
+
+    def test_entity_type_case_insensitive(self):
+        from src.tools.entities import tool_create_entity
+        result = tool_create_entity("Steve", "Person", "test")
+        self.assertIn("Entity created", result)
+        self.assertIn("(person)", result)
+
+    def test_update_entity_rejects_unknown_type(self):
+        from src.tools.entities import tool_create_entity, tool_update_entity
+        tool_create_entity("Steve", "person", "test")
+        result = tool_update_entity("Steve", new_type="wizard", vault="test")
+        self.assertIn("Error", result)
+        self.assertIn("wizard", result)
+
+    # ---- relation types ----
+
+    def _two_entities(self):
+        from src.tools.entities import tool_create_entity
+        tool_create_entity("A", "person", "test")
+        tool_create_entity("B", "organization", "test")
+
+    def test_canonical_relation_type_accepted(self):
+        from src.tools.relations import tool_create_relation
+        self._two_entities()
+        result = tool_create_relation("A", "B", "works_at", vault="test")
+        self.assertIn("Relation created", result)
+        self.assertIn("works_at", result)
+
+    def test_unknown_relation_type_rejected_with_valid_list(self):
+        from src.tools.relations import tool_create_relation
+        self._two_entities()
+        result = tool_create_relation("A", "B", "death_catalyzed", vault="test")
+        self.assertIn("Error", result)
+        self.assertIn("death_catalyzed", result)
+        self.assertIn("related_to", result)  # escape hatch is suggested
+
+    def test_alias_is_canonicalized(self):
+        from src.tools.relations import tool_create_relation
+        self._two_entities()
+        result = tool_create_relation("A", "B", "friends_with", vault="test")
+        self.assertIn("Relation created", result)
+        self.assertIn("[friend_of]", result)
+        self.assertIn("canonicalized from 'friends_with'", result)
+
+    def test_flipped_alias_swaps_endpoints(self):
+        from src.tools.relations import tool_create_relation
+        from src.graph.manager import get_all_relations
+        from src.indexer.store import get_entity_by_name
+        self._two_entities()
+
+        # "A created_by B" states the same fact as "B created A".
+        result = tool_create_relation("A", "B", "created_by", vault="test")
+        self.assertIn("Relation created", result)
+        self.assertIn("direction flipped", result)
+
+        a = get_entity_by_name("A", "test")
+        b = get_entity_by_name("B", "test")
+        rel = get_all_relations()[0]
+        self.assertEqual(rel.relation_type, "created")
+        self.assertEqual(rel.from_entity, b.id)
+        self.assertEqual(rel.to_entity, a.id)
+
+    def test_rejected_relation_writes_nothing(self):
+        from src.tools.relations import tool_create_relation
+        from src.graph.manager import get_all_relations
+        self._two_entities()
+        tool_create_relation("A", "B", "nonsense_type", vault="test")
+        self.assertEqual(get_all_relations(), [])
 
 
 if __name__ == "__main__":

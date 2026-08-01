@@ -132,11 +132,11 @@ def tool_delete_vault(name: str) -> str:
     store_mod._load_store()
     graph_mod._get_graph()
 
-    # The scan and the hard-pop run as ONE critical section under STORE_LOCK.
-    # Otherwise a concurrent write landing between them is clobbered by this
-    # function's full-file _save_store(), and the scans can trip over a
-    # dict that is mutating underneath them.
+    # The scan and the hard-pop run as ONE critical section under STORE_LOCK,
+    # so a concurrent write landing between them can't be clobbered and the
+    # scans can't trip over a dict that is mutating underneath them.
     with store_mod.STORE_LOCK:
+        from src.indexer import db
         vault_entity_ids = {
             e.id for e in store_mod._entities.values() if e.vault == name
         }
@@ -152,7 +152,8 @@ def tool_delete_vault(name: str) -> str:
         for eid in vault_entity_ids:
             store_mod._entities.pop(eid, None)
 
-        store_mod._save_store()
+        db.hard_delete_observations(obs_ids_to_drop)
+        db.hard_delete_entities(list(vault_entity_ids))
 
     # Remove relations involving any of these entities (graph has its own lock)
     for eid in vault_entity_ids:

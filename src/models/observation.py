@@ -14,18 +14,15 @@ class Observation:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     deleted: bool = False
     superseded_by: str = ""  # ID of the observation that replaced this one
+    # When the supersession was RECORDED (wall-clock, ISO datetime). Turns the
+    # forward pointer into a real validity interval: this row was believed
+    # current from created_at until superseded_at. None on active rows and on
+    # legacy rows superseded before this field existed — consumers fall back
+    # to the successor's created_at.
+    superseded_at: str | None = None
     # When the fact actually happened (event time), as an ISO date or datetime.
     # None means unknown — consumers fall back to created_at (ingestion time).
     occurred_at: str | None = None
-
-    @property
-    def embedding_text(self) -> str:
-        """Text used for embedding. Set externally by store using entity context."""
-        return getattr(self, "_embedding_text", self.content)
-
-    @embedding_text.setter
-    def embedding_text(self, value: str):
-        self._embedding_text = value
 
     @property
     def is_superseded(self) -> bool:
@@ -50,6 +47,8 @@ class Observation:
         }
         if self.superseded_by:
             d["superseded_by"] = self.superseded_by
+        if self.superseded_at:
+            d["superseded_at"] = self.superseded_at
         if self.occurred_at:
             d["occurred_at"] = self.occurred_at
         return d
@@ -64,5 +63,6 @@ class Observation:
             created_at=d.get("created_at", ""),
             deleted=d.get("deleted", False),
             superseded_by=d.get("superseded_by", ""),
+            superseded_at=d.get("superseded_at") or None,
             occurred_at=d.get("occurred_at") or None,
         )

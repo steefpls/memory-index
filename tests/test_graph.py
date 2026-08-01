@@ -18,11 +18,8 @@ class TestGraphManager(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.patches = []
 
-        p1 = patch("src.graph.manager.GRAPH_FILE", Path(self.tmpdir) / "memory_graph.json")
-        p2 = patch("src.graph.manager.DATA_DIR", Path(self.tmpdir))
-        self.patches.extend([p1, p2])
-        for p in self.patches:
-            p.start()
+        from tests.support import patch_sqlite
+        patch_sqlite(self.tmpdir, self.patches)
 
         # Reset graph state
         import src.graph.manager as gm
@@ -30,6 +27,8 @@ class TestGraphManager(unittest.TestCase):
         gm._relations = {}
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil
@@ -96,82 +95,47 @@ class TestGraphManager(unittest.TestCase):
             with gm.GRAPH_LOCK:
                 pass
 
-    def test_save_graph_payload_cannot_be_torn_by_a_concurrent_write(self):
-        """_save_graph serializes _relations under GRAPH_LOCK.
-
-        A crash-safe file swap does not help if the PAYLOAD is built while
-        another thread mutates _relations. Probed by firing a concurrent
-        add_relation from inside the serialization and checking it blocks.
-        """
+    def test_concurrent_writers_all_persist(self):
+        """Row-level writes: concurrent add_relations must all land in SQLite."""
         import threading
         import src.graph.manager as gm
+        import src.indexer.db as db_mod
         from src.models.relation import Relation
 
-        gm.add_relation(Relation(id="r1", from_entity="e1", to_entity="e2",
-                                 relation_type="uses"))
+        def writer(i):
+            gm.add_relation(Relation(id=f"r{i}", from_entity=f"a{i}",
+                                     to_entity=f"b{i}", relation_type="uses"))
 
-        probe = {}
-        started = threading.Event()
-        done = threading.Event()
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
 
-        def writer():
-            started.set()
-            gm.add_relation(Relation(id="r2", from_entity="e3", to_entity="e4",
-                                     relation_type="uses"))
-            done.set()
-
-        victim = gm._relations["r1"]
-        original_to_dict = victim.to_dict
-
-        def to_dict_probe():
-            if "fired" not in probe:
-                probe["fired"] = True
-                t = threading.Thread(target=writer)
-                probe["thread"] = t
-                t.start()
-                started.wait(5)
-                probe["ran_during_save"] = done.wait(0.5)
-            return original_to_dict()
-
-        victim.to_dict = to_dict_probe
-        gm._save_graph()
-        probe["thread"].join(5)
-
-        self.assertTrue(probe.get("fired"))
-        self.assertFalse(
-            probe["ran_during_save"],
-            "a relation was added while _save_graph was serializing _relations",
-        )
-        self.assertEqual(gm.get_relation_count(), 2)
+        self.assertEqual(gm.get_relation_count(), 8)
+        self.assertEqual(len(db_mod.load_relations()), 8)
 
     def test_persistence(self):
-        from src.graph.manager import add_relation, _save_graph
+        import src.indexer.db as db_mod
+        from src.graph.manager import add_relation
         from src.models.relation import Relation
 
         add_relation(Relation(id="r1", from_entity="e1", to_entity="e2", relation_type="uses"))
 
-        # Check file was written
-        graph_file = Path(self.tmpdir) / "memory_graph.json"
-        self.assertTrue(graph_file.exists())
+        rows = db_mod.load_relations()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "r1")
 
-        data = json.loads(graph_file.read_text(encoding="utf-8"))
-        self.assertEqual(len(data["relations"]), 1)
-        self.assertEqual(data["relations"][0]["id"], "r1")
-
-    def test_load_from_disk(self):
+    def test_load_from_db(self):
+        import src.indexer.db as db_mod
         from src.models.relation import Relation
 
-        # Write graph file manually
-        graph_file = Path(self.tmpdir) / "memory_graph.json"
-        data = {
-            "relations": [
-                Relation(id="r1", from_entity="e1", to_entity="e2",
-                         relation_type="uses").to_dict()
-            ]
-        }
-        graph_file.write_text(json.dumps(data), encoding="utf-8")
+        # Seed the DB directly, then force a fresh in-memory load
+        db_mod.upsert_relations([
+            Relation(id="r1", from_entity="e1", to_entity="e2",
+                     relation_type="uses"),
+        ])
 
-        # Reset and reload
         import src.graph.manager as gm
         gm._graph = None
         gm._relations = {}
@@ -189,11 +153,8 @@ class TestGraphTraversal(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.patches = []
 
-        p1 = patch("src.graph.manager.GRAPH_FILE", Path(self.tmpdir) / "memory_graph.json")
-        p2 = patch("src.graph.manager.DATA_DIR", Path(self.tmpdir))
-        self.patches.extend([p1, p2])
-        for p in self.patches:
-            p.start()
+        from tests.support import patch_sqlite
+        patch_sqlite(self.tmpdir, self.patches)
 
         import src.graph.manager as gm
         gm._graph = None
@@ -208,6 +169,8 @@ class TestGraphTraversal(unittest.TestCase):
         add_relation(Relation(id="r3", from_entity="e1", to_entity="e4", relation_type="related_to"))
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil

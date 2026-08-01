@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from src.config import VAULTS, get_vault
 from src.indexer.embedder import get_collection, get_embedding_function, get_active_backend
 from src.indexer.calibration import get_thresholds
-from src.indexer.store import get_entity
+from src.indexer.store import get_entity, get_observation
 from src.graph.traversal import spread_activation
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ MIN_RESULTS = 3
 def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULTS,
                    entity_type: str = "",
                    since: str = "", before: str = "",
+                   date_axis: str = "record",
                    include_superseded: bool = False,
                    strategy: str = "semantic",
                    output_format: str = "text") -> str:
@@ -63,8 +64,12 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
         vault: Vault to search (empty = search all vaults).
         n_results: Max observations to return (default 5, max 30).
         entity_type: Optional entity type filter.
-        since: Only include observations created after this ISO date/datetime.
-        before: Only include observations created before this ISO date/datetime.
+        since: Only include observations after this ISO date/datetime.
+        before: Only include observations before this ISO date/datetime.
+        date_axis: Which timestamp since/before filter on — "record" (default,
+                   created_at: when the fact was written down) or "event"
+                   (occurred_at when known, else created_at: when the fact
+                   happened). Same semantics as query_timeline's axis.
         include_superseded: If True, include observations that have been replaced
                             by newer ones. Default False (only current facts).
         strategy: "semantic" (default — vector search only) or "associative"
@@ -78,6 +83,10 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     output_format = (output_format or "text").lower()
     if output_format not in {"text", "json"}:
         return "Error: output_format must be 'text' or 'json'."
+
+    date_axis = (date_axis or "record").lower()
+    if date_axis not in {"record", "event"}:
+        return "Error: date_axis must be 'record' or 'event'."
 
     n_results = min(max(n_results, 1), 30)
     strategy = (strategy or "semantic").lower()
@@ -113,7 +122,7 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
         return f"Error: invalid 'since' date '{since}'. Use ISO format (YYYY-MM-DD or full ISO datetime)."
     if before and _parse_bound(before) is None:
         return f"Error: invalid 'before' date '{before}'. Use ISO format (YYYY-MM-DD or full ISO datetime)."
-    date_bounds = (_parse_bound(since), _parse_bound(before))
+    date_bounds = (_parse_bound(since), _parse_bound(before), date_axis)
 
     # Over-fetch so the threshold gate and the min-3 rule both have material
     # to work with after superseded observations are dropped.
@@ -199,21 +208,24 @@ def _parse_bound(value: str) -> datetime | None:
     return dt
 
 
-def _in_date_range(meta: dict, date_bounds: tuple) -> bool:
-    """Apply the since/before window to an observation's `created_at`.
+def _in_date_range(obs, date_bounds: tuple) -> bool:
+    """Apply the since/before window to an observation on the chosen axis.
 
-    An observation whose `created_at` cannot be parsed is excluded whenever a
-    bound is active — it cannot be shown to satisfy the window.
+    Axis "record" tests created_at (when the fact was written down); "event"
+    tests effective_at (occurred_at when known, else created_at). An
+    observation whose timestamp cannot be parsed is excluded whenever a bound
+    is active — it cannot be shown to satisfy the window.
     """
-    since_dt, before_dt = date_bounds
+    since_dt, before_dt, axis = date_bounds
     if since_dt is None and before_dt is None:
         return True
-    created = _parse_bound(meta.get("created_at") or "")
-    if created is None:
+    stamp = obs.effective_at if axis == "event" else obs.created_at
+    when = _parse_bound(stamp or "")
+    if when is None:
         return False
-    if since_dt is not None and created < since_dt:
+    if since_dt is not None and when < since_dt:
         return False
-    if before_dt is not None and created >= before_dt:
+    if before_dt is not None and when >= before_dt:
         return False
     return True
 
@@ -230,8 +242,13 @@ def _query_vault(vault_name: str, query_embeddings, fetch_count: int,
                  where_conditions: list[dict], include_superseded: bool,
                  entity_ids: list[str] | None = None,
                  graph_boosted: bool = False,
-                 date_bounds: tuple = (None, None)) -> list[dict]:
+                 date_bounds: tuple = (None, None, "record")) -> list[dict]:
     """Run one Chroma query and return flat observation items.
+
+    Chroma supplies ids and distances only; every displayed field (content,
+    source, entity context, supersession, timestamps) is joined back from the
+    authoritative store row. A vector whose store row is missing is dropped —
+    a stray embedding can never resurrect a deleted fact.
 
     entity_ids restricts the query to a candidate set (used by the associative
     pass to score graph neighbours with the real query embedding).
@@ -254,7 +271,7 @@ def _query_vault(vault_name: str, query_embeddings, fetch_count: int,
             query_embeddings=query_embeddings,
             n_results=fetch_count,
             where=_combine_where(conditions),
-            include=["documents", "metadatas", "distances"],
+            include=["distances"],
         )
     except Exception as e:
         logger.warning("Search error in vault %s: %s", vault_name, e)
@@ -265,30 +282,31 @@ def _query_vault(vault_name: str, query_embeddings, fetch_count: int,
         return []
 
     ids = ids_batches[0]
-    metadatas = (results.get("metadatas") or [[]])[0]
     distances = (results.get("distances") or [[]])[0]
 
     items: list[dict] = []
     for i in range(len(ids)):
-        meta = metadatas[i] or {}
-        is_superseded = bool(meta.get("superseded_by"))
+        obs = get_observation(ids[i])
+        if obs is None:
+            continue  # deleted or diverged — the store row is authoritative
         # Skip superseded observations unless explicitly requested
-        if is_superseded and not include_superseded:
+        if obs.is_superseded and not include_superseded:
             continue
         # since/before window — applied here, not in the `where` clause.
-        if not _in_date_range(meta, date_bounds):
+        if not _in_date_range(obs, date_bounds):
             continue
+        ent = get_entity(obs.entity_id)
         items.append({
-            "observation_id": ids[i],
-            "entity_id": meta.get("entity_id", ""),
-            "entity_name": meta.get("entity_name", ""),
-            "entity_type": meta.get("entity_type", ""),
-            "content": meta.get("content", ""),
-            "source": meta.get("source", ""),
-            "vault": meta.get("vault", vault_name),
+            "observation_id": obs.id,
+            "entity_id": obs.entity_id,
+            "entity_name": ent.name if ent else "",
+            "entity_type": ent.entity_type if ent else "",
+            "content": obs.content,
+            "source": obs.source,
+            "vault": ent.vault if ent else vault_name,
             "distance": distances[i],
             "graph_boosted": graph_boosted,
-            "superseded": is_superseded,
+            "superseded": obs.is_superseded,
         })
     return items
 
@@ -311,7 +329,7 @@ def _score_graph_candidates(seed_items: list[dict], query_embeddings,
                             where_conditions: list[dict],
                             include_superseded: bool,
                             fetch_count: int,
-                            date_bounds: tuple = (None, None)) -> list[dict]:
+                            date_bounds: tuple = (None, None, "record")) -> list[dict]:
     """Score graph neighbours of the semantic hits against the real query.
 
     Spreading activation only *nominates* candidate entities. Their
@@ -405,39 +423,6 @@ def _ensure_backend():
 def _get_query_embeddings_with_guard(query: str) -> list[list[float]]:
     """Embed a query, initializing the backend on first use."""
     return _ensure_backend().embed_queries([query])
-
-
-def _rrf_merge(vector_ranked: list[dict], graph_ranked: list[dict],
-               k: int = 60) -> dict[str, float]:
-    """Reciprocal Rank Fusion — merge vector and graph result rankings.
-
-    NOTE: no longer used by search_memory. RRF is rank-only, so it has no
-    notion of match quality: a popularity-ranked graph neighbour could outrank
-    a genuine semantic hit. The associative strategy now scores graph
-    candidates against the real query embedding instead. Kept as a utility.
-
-    Combines rankings from two sources using RRF scoring:
-      score(entity) = sum(1 / (k + rank_i)) across all lists.
-
-    Args:
-        vector_ranked: Entities ranked by vector distance (best first).
-        graph_ranked: Entities ranked by activation energy (best first).
-        k: Smoothing constant (default 60, standard RRF value).
-
-    Returns:
-        Dict mapping entity_id -> RRF score (higher is better).
-    """
-    scores: dict[str, float] = {}
-
-    for rank, item in enumerate(vector_ranked, 1):
-        eid = item["entity_id"]
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
-
-    for rank, item in enumerate(graph_ranked, 1):
-        eid = item["entity_id"]
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
-
-    return scores
 
 
 def _get_thresholds_cached(vault: str) -> dict:

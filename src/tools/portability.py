@@ -4,7 +4,8 @@ The export format is a zip containing JSON files. Vector embeddings are NOT
 included; they are regenerated on import via the embedder. This keeps the
 archive portable across embedding model changes and keeps file size small.
 
-Format (version 1):
+Format (version 2 — v1 archives are still importable; v2 adds observation
+superseded_at):
     manifest.json     — format version, source vault, timestamp, counts
     entities.json     — list of entity dicts for the source vault
     observations.json — list of observation dicts whose entity is in the vault
@@ -47,7 +48,8 @@ from src.models.relation import Relation
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2  # v2 adds observation superseded_at
+SUPPORTED_FORMAT_VERSIONS = {1, 2}
 
 
 # ---------- Export ----------
@@ -188,10 +190,10 @@ def _read_archive(path: Path) -> tuple[dict, list, list, list]:
         observations = json.loads(zf.read("observations.json"))
         relations = json.loads(zf.read("relations.json"))
 
-    if manifest.get("format_version") != FORMAT_VERSION:
+    if manifest.get("format_version") not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
             f"Unsupported format_version {manifest.get('format_version')} "
-            f"(expected {FORMAT_VERSION})"
+            f"(supported: {sorted(SUPPORTED_FORMAT_VERSIONS)})"
         )
     return manifest, entities, observations, relations
 
@@ -379,7 +381,10 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
             # without conveying anything; leave it active instead.
             continue
 
-        if mark_superseded(local_id, new_pointer):
+        # Preserve the archive's supersession timestamp; a v1 archive has none
+        # and mark_superseded falls back to stamping the import time.
+        if mark_superseded(local_id, new_pointer,
+                           superseded_at=od.get("superseded_at") or ""):
             obs_superseded += 1
 
     # --- Relations: dedupe by (from, to, type) ---

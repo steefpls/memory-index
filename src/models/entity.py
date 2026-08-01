@@ -4,9 +4,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
+# Closed canonical set — enforced at the write boundary (create/update tools).
+# Superset of the types the CLAUDE.md conventions use plus the structural ones
+# from the original set, so no legacy row is non-conforming.
 ENTITY_TYPES = frozenset({
     "person", "project", "concept", "decision", "error", "solution",
     "technology", "event", "organization", "location", "process", "artifact",
+    "pattern", "preference", "reference",
 })
 
 

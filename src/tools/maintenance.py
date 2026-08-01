@@ -36,11 +36,10 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
     obs_to_remove: list[str] = []
     surviving_ent_ids: set[str] = set()
 
-    # The scan and the hard-removal must be ONE critical section. Splitting
-    # them let a concurrent add_observation land in between: the vacuum's own
-    # _save_store() then rewrote the whole file from a stale view and dropped
-    # the new row from disk (while it survived in Chroma). Holding the lock
-    # across both also stops the scans tripping over a mutating dict.
+    # The scan and the hard-removal must be ONE critical section, so a
+    # concurrent add_observation can't land in between and get its in-memory
+    # row swept by a stale scan. Holding the lock across both also stops the
+    # scans tripping over a mutating dict.
     with store_mod.STORE_LOCK:
         # ---- Entities to hard-remove ----
         for ent in list(store_mod._entities.values()):
@@ -78,11 +77,13 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
         ]
 
         if not dry_run:
+            from src.indexer import db
             for oid in obs_to_remove:
                 store_mod._observations.pop(oid, None)
             for eid in ent_to_remove:
                 store_mod._entities.pop(eid, None)
-            store_mod._save_store()
+            db.hard_delete_observations(obs_to_remove)
+            db.hard_delete_entities(ent_to_remove)
 
     # ---- Dangling relations ----
     rel_to_remove = []
@@ -117,9 +118,6 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
 
     for rid in rel_to_remove:
         graph_mod.remove_relation(rid)
-    # remove_relation already saves the graph, but call once more in case
-    # rel_to_remove was empty (no save) but we still want to be sure.
-    graph_mod._save_graph()
 
     logger.info(
         "Vacuum: removed %d entities, %d observations, %d relations",

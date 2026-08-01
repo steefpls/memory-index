@@ -24,20 +24,16 @@ class TestPortability(unittest.TestCase):
         # Patch all storage paths to the temp dir
         path_patches = [
             ("src.config.DATA_DIR", tmp),
-            ("src.config.ENTITIES_FILE", tmp / "memory_entities.json"),
-            ("src.config.VAULTS_FILE", tmp / "vaults.json"),
-            ("src.config.GRAPH_FILE", tmp / "memory_graph.json"),
             ("src.config.CHROMA_DIR", tmp / "chroma"),
-            ("src.indexer.store.DATA_DIR", tmp),
-            ("src.indexer.store.ENTITIES_FILE", tmp / "memory_entities.json"),
-            ("src.graph.manager.GRAPH_FILE", tmp / "memory_graph.json"),
-            ("src.graph.manager.DATA_DIR", tmp),
             ("src.tools.portability.DATA_DIR", tmp),
         ]
         for target, value in path_patches:
             p = patch(target, value)
             self.patches.append(p)
             p.start()
+
+        from tests.support import patch_sqlite
+        patch_sqlite(self.tmpdir, self.patches)
 
         # Reset module state
         import src.indexer.store as store_mod
@@ -67,6 +63,8 @@ class TestPortability(unittest.TestCase):
         p.start()
 
     def tearDown(self):
+        from tests.support import close_sqlite
+        close_sqlite()
         for p in self.patches:
             p.stop()
         import shutil

@@ -30,6 +30,15 @@ def _coerce_str_list(value) -> list[str]:
     return [str(v).strip() for v in value if str(v).strip()]
 
 
+def _validate_entity_type(entity_type: str) -> str | None:
+    """Return an error string if the type is not canonical, else None."""
+    if entity_type.strip().lower() not in ENTITY_TYPES:
+        valid = ", ".join(sorted(ENTITY_TYPES))
+        return (f"Error: unknown entity_type '{entity_type}'. "
+                f"Use one of: {valid}.")
+    return None
+
+
 def tool_create_entity(name: str, entity_type: str, vault: str,
                        observations: list[str] | None = None,
                        source: str = "") -> str:
@@ -37,8 +46,10 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
 
     Args:
         name: Entity name (e.g., "Python", "memory-index", "Alice").
-        entity_type: Type (person, project, concept, decision, error,
-                     solution, technology, event, organization, etc.).
+        entity_type: Canonical type — one of: person, project, organization,
+                     technology, concept, decision, event, preference,
+                     pattern, error, solution, reference, location, process,
+                     artifact.
         vault: Vault to store in. Created automatically if it doesn't exist.
         observations: List of observation strings, one atomic fact per item
                       (e.g., ["Fact 1", "Fact 2"]). Never split — a fact may
@@ -52,6 +63,9 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
         return "Error: name is required."
     if not entity_type or not entity_type.strip():
         return "Error: entity_type is required."
+    type_error = _validate_entity_type(entity_type)
+    if type_error:
+        return type_error
     if not vault or not vault.strip():
         return "Error: vault is required."
 
@@ -189,6 +203,11 @@ def tool_update_entity(name_or_id: str, new_name: str = "",
     Returns:
         Confirmation or error.
     """
+    if new_type:
+        type_error = _validate_entity_type(new_type)
+        if type_error:
+            return type_error
+
     entity = resolve_entity(name_or_id, vault or None)
     if entity is None:
         return f"Entity not found: '{name_or_id}'"

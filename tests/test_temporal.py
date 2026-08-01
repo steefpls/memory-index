@@ -18,11 +18,11 @@ def _make_entity(eid, name, etype="concept", vault="test"):
 
 
 def _make_obs(oid, entity_id, content, created_at, source="",
-              superseded_by="", occurred_at=None):
+              superseded_by="", superseded_at=None, occurred_at=None):
     obs = Observation(
         id=oid, entity_id=entity_id, content=content,
         source=source, created_at=created_at, superseded_by=superseded_by,
-        occurred_at=occurred_at,
+        superseded_at=superseded_at, occurred_at=occurred_at,
     )
     return obs
 
@@ -582,66 +582,118 @@ class TestTemporalReadsAreSnapshotted(unittest.TestCase):
         self.assertNotIn("late", obs)
 
 
-class TestRRFMerge(unittest.TestCase):
-    """Test Reciprocal Rank Fusion scoring."""
+class TestSupersededAtSemantics(unittest.TestCase):
+    """superseded_at turns the supersession pointer into a validity interval."""
 
-    def test_basic_merge(self):
-        from src.tools.search import _rrf_merge
+    def setUp(self):
+        self.entities = {"e1": _make_entity("e1", "Steve", "person")}
+        # v1 recorded in January; replacement v2 recorded in June, but the
+        # supersession itself was applied late (a gardener pass in July).
+        self.observations = {
+            "v1": _make_obs("v1", "e1", "Salary is 5k",
+                            "2026-01-01T00:00:00+00:00",
+                            superseded_by="v2",
+                            superseded_at="2026-07-01T04:00:00+00:00"),
+            "v2": _make_obs("v2", "e1", "Salary is 5.8k",
+                            "2026-06-01T00:00:00+00:00"),
+        }
 
-        vector = [
-            {"entity_id": "a", "distance": 100},
-            {"entity_id": "b", "distance": 200},
-            {"entity_id": "c", "distance": 300},
-        ]
-        graph = [
-            {"entity_id": "d", "_energy": 0.9},
-            {"entity_id": "b", "_energy": 0.5},
-        ]
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_uses_superseded_at(self, mock_entities, mock_obs,
+                                              mock_load, mock_resolve):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+        mock_resolve.return_value = self.entities["e1"]
 
-        scores = _rrf_merge(vector, graph)
+        from src.tools.temporal import tool_point_in_time
+        # Mid-June: v2 was already recorded, but the supersession of v1 was
+        # only applied in July — the store still believed v1 at this point.
+        result = tool_point_in_time("e1", "2026-06-15")
+        self.assertIn("Salary is 5k", result)
+        self.assertIn("Salary is 5.8k", result)
 
-        # 'a' only in vector (rank 1): 1/(60+1)
-        self.assertAlmostEqual(scores["a"], 1/61, places=6)
-        # 'b' in both (vector rank 2 + graph rank 2): 1/(60+2) + 1/(60+2)
-        self.assertAlmostEqual(scores["b"], 1/62 + 1/62, places=6)
-        # 'd' only in graph (rank 1): 1/(60+1)
-        self.assertAlmostEqual(scores["d"], 1/61, places=6)
+        # After the supersession was applied, v1 drops out.
+        result = tool_point_in_time("e1", "2026-07-02")
+        self.assertNotIn("Salary is 5k\n", result + "\n")
+        self.assertIn("Salary is 5.8k", result)
 
-    def test_entity_in_both_ranks_higher(self):
-        from src.tools.search import _rrf_merge
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_legacy_fallback(self, mock_entities, mock_obs,
+                                           mock_load, mock_resolve):
+        """Rows superseded before the field existed fall back to the
+        replacement's created_at, exactly as before."""
+        mock_entities.update(self.entities)
+        self.observations["v1"].superseded_at = None
+        mock_obs.update(self.observations)
+        mock_resolve.return_value = self.entities["e1"]
 
-        vector = [
-            {"entity_id": "a", "distance": 100},
-            {"entity_id": "b", "distance": 200},
-        ]
-        graph = [
-            {"entity_id": "b", "_energy": 0.9},
-            {"entity_id": "c", "_energy": 0.5},
-        ]
+        from src.tools.temporal import tool_point_in_time
+        # Without superseded_at, v2's created_at (June 1) is the cutover.
+        result = tool_point_in_time("e1", "2026-06-15")
+        self.assertNotIn("Salary is 5k\n", result + "\n")
+        self.assertIn("Salary is 5.8k", result)
 
-        scores = _rrf_merge(vector, graph)
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_hides_superseded_by_default(self, mock_entities, mock_obs, mock_load):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
 
-        # 'b' appears in both lists, should have highest composite score
-        self.assertGreater(scores["b"], scores["a"])
-        self.assertGreater(scores["b"], scores["c"])
+        from src.tools.temporal import tool_query_timeline
+        result = tool_query_timeline(vault="test")
+        self.assertNotIn("Salary is 5k\n", result + "\n")
+        self.assertIn("Salary is 5.8k", result)
 
-    def test_empty_graph(self):
-        from src.tools.search import _rrf_merge
-        vector = [{"entity_id": "a", "distance": 100}]
-        scores = _rrf_merge(vector, [])
-        self.assertEqual(len(scores), 1)
-        self.assertIn("a", scores)
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_include_superseded_labels_the_old_fact(self, mock_entities,
+                                                            mock_obs, mock_load):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
 
-    def test_custom_k(self):
-        from src.tools.search import _rrf_merge
-        vector = [{"entity_id": "a", "distance": 100}]
-        graph = [{"entity_id": "a", "_energy": 0.5}]
+        from src.tools.temporal import tool_query_timeline
+        result = tool_query_timeline(vault="test", include_superseded=True)
+        self.assertIn("Salary is 5k", result)
+        self.assertIn("[superseded 2026-07-01]", result)
 
-        scores_k10 = _rrf_merge(vector, graph, k=10)
-        scores_k60 = _rrf_merge(vector, graph, k=60)
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_date_axis_record_vs_event(self, mock_entities, mock_obs,
+                                                mock_load):
+        """The same window gives axis-dependent answers, by explicit choice."""
+        mock_entities.update(self.entities)
+        mock_obs.update({
+            # Recorded in 2026, about an event in 1991.
+            "h1": _make_obs("h1", "e1", "Born in Singapore",
+                            "2026-06-01T00:00:00+00:00",
+                            occurred_at="1991-02-20"),
+        })
 
-        # Lower k gives higher scores (more spread between ranks)
-        self.assertGreater(scores_k10["a"], scores_k60["a"])
+        from src.tools.temporal import tool_query_timeline
+        event_view = tool_query_timeline(vault="test", start="1991-01-01",
+                                         end="1992-01-01")
+        self.assertIn("Born in Singapore", event_view)
+
+        record_view = tool_query_timeline(vault="test", start="1991-01-01",
+                                          end="1992-01-01", date_axis="record")
+        self.assertNotIn("Born in Singapore", record_view)
+
+        record_2026 = tool_query_timeline(vault="test", start="2026-01-01",
+                                          end="2027-01-01", date_axis="record")
+        self.assertIn("Born in Singapore", record_2026)
+
+    def test_invalid_date_axis_rejected(self):
+        from src.tools.temporal import tool_query_timeline
+        self.assertIn("date_axis", tool_query_timeline(date_axis="wat"))
 
 
 if __name__ == "__main__":

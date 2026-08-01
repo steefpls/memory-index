@@ -157,6 +157,7 @@ def eval_environment(data_dir: Path, mock_embedder: bool = True,
     import src.config as config
     import src.graph.manager as graph_manager
     import src.indexer.calibration as calibration
+    import src.indexer.db as db
     import src.indexer.embedder as embedder
     import src.indexer.store as store
     import src.tools.search as search
@@ -166,32 +167,34 @@ def eval_environment(data_dir: Path, mock_embedder: bool = True,
 
     saved = {
         "config": {k: getattr(config, k) for k in
-                   ("DATA_DIR", "CHROMA_DIR", "VAULTS_FILE", "ENTITIES_FILE",
-                    "GRAPH_FILE")},
+                   ("DATA_DIR", "CHROMA_DIR", "DB_FILE", "VAULTS_FILE",
+                    "ENTITIES_FILE", "GRAPH_FILE")},
         "vaults": dict(config.VAULTS),
         "embedder": {k: getattr(embedder, k) for k in
                      ("CHROMA_DIR", "_client", "_embedding_fn", "_active_backend")},
         "calibration_data_dir": calibration.DATA_DIR,
         "store": {k: getattr(store, k) for k in
-                  ("DATA_DIR", "ENTITIES_FILE", "_entities", "_observations",
+                  ("_entities", "_observations",
                    "_loaded", "_run_post_write_hooks")},
         "graph": {k: getattr(graph_manager, k) for k in
-                  ("DATA_DIR", "GRAPH_FILE", "_graph", "_relations")},
+                  ("_graph", "_relations")},
         "calibration_cache": dict(search._calibration_cache),
     }
 
     try:
         config.DATA_DIR = data_dir
         config.CHROMA_DIR = data_dir / "chroma"
+        config.DB_FILE = data_dir / "memory.db"
+        # Legacy JSON paths still feed the one-time SQLite auto-migration when
+        # this runs against a pre-migration real data dir.
         config.VAULTS_FILE = data_dir / "vaults.json"
         config.ENTITIES_FILE = data_dir / "memory_entities.json"
         config.GRAPH_FILE = data_dir / "memory_graph.json"
+        db.reset()  # next store access opens (and if needed migrates) this DB
 
-        store.DATA_DIR = data_dir
-        store.ENTITIES_FILE = config.ENTITIES_FILE
         store._entities = {}
         store._observations = {}
-        store._loaded = False  # force a reload from the new ENTITIES_FILE
+        store._loaded = False  # force a reload from the new DB
         if disable_write_hooks:
             # Auto-recalibration and the auto-librarian fire every 10
             # observations. Both would mutate thresholds mid-ingest (and spawn
@@ -200,8 +203,6 @@ def eval_environment(data_dir: Path, mock_embedder: bool = True,
 
         calibration.DATA_DIR = data_dir
 
-        graph_manager.DATA_DIR = data_dir
-        graph_manager.GRAPH_FILE = config.GRAPH_FILE
         graph_manager._graph = None
         graph_manager._relations = {}
 
@@ -216,13 +217,11 @@ def eval_environment(data_dir: Path, mock_embedder: bool = True,
 
         # VAULTS is imported by reference elsewhere — mutate, never rebind.
         config.VAULTS.clear()
-        if config.VAULTS_FILE.exists():
-            try:
-                raw = json.loads(config.VAULTS_FILE.read_text(encoding="utf-8"))
-                for name, cfg in (raw.get("vaults") or {}).items():
-                    config.VAULTS[name] = config.VaultConfig.from_dict(cfg)
-            except (json.JSONDecodeError, OSError):
-                pass
+        try:
+            for d in db.get_all_vaults():
+                config.VAULTS[d["name"]] = config.VaultConfig.from_dict(d)
+        except Exception:
+            pass
 
         search._calibration_cache.clear()
 
@@ -233,6 +232,7 @@ def eval_environment(data_dir: Path, mock_embedder: bool = True,
         # already there (it belongs to the surrounding process).
         _shutdown_chroma(embedder._client,
                          clear_cache=saved["embedder"]["_client"] is None)
+        db.reset()
         for key, value in saved["config"].items():
             setattr(config, key, value)
         config.VAULTS.clear()
