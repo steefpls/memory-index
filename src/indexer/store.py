@@ -562,8 +562,14 @@ def mark_superseded(observation_id: str, superseded_by: str,
     was not in the archive); the row is still marked superseded, which is what
     keeps it out of active reads and search.
 
-    `superseded_at` lets import preserve the original supersession timestamp;
-    when empty, the current time is recorded.
+    `superseded_at` carries the ORIGINAL supersession timestamp. When it is
+    empty the row is left unstamped (None) rather than stamped with the
+    current time: this is a reconstruction primitive, so "now" is never the
+    truthful answer — an archive row without a stamp was superseded at some
+    unknown past moment, and None is what makes `point_in_time` fall back to
+    inferring the cutover from the replacement's created_at. Stamping now
+    would collapse every restored supersession onto the restore date and
+    silently rewrite history.
     """
     _load_store()
     with STORE_LOCK:
@@ -571,7 +577,7 @@ def mark_superseded(observation_id: str, superseded_by: str,
         if obs is None or obs.deleted or not superseded_by:
             return False
         obs.superseded_by = superseded_by
-        obs.superseded_at = (superseded_at or "").strip() or _now_iso()
+        obs.superseded_at = (superseded_at or "").strip() or None
         db.upsert_observations([obs])
     return True
 

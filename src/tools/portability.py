@@ -381,8 +381,11 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
             # without conveying anything; leave it active instead.
             continue
 
-        # Preserve the archive's supersession timestamp; a v1 archive has none
-        # and mark_superseded falls back to stamping the import time.
+        # Preserve the archive's supersession timestamp. A v1 archive (or a
+        # row superseded before the field existed) has none, and the row is
+        # then left unstamped so point_in_time keeps inferring the cutover
+        # from the replacement's created_at — stamping the import time would
+        # make every restored supersession look like it happened today.
         if mark_superseded(local_id, new_pointer,
                            superseded_at=od.get("superseded_at") or ""):
             obs_superseded += 1

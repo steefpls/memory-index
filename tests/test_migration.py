@@ -171,6 +171,42 @@ class TestDalRoundTrip(unittest.TestCase):
         self.assertEqual(len(ents), 1)
         self.assertEqual(ents[0]["name"], "New")
 
+    def test_mark_superseded_never_fabricates_a_timestamp(self):
+        """An unstamped supersession must stay unstamped.
+
+        mark_superseded is a reconstruction primitive (import / chain rebuild).
+        Defaulting an empty superseded_at to now() collapsed every restored
+        legacy supersession onto the restore date, which silently rewrote
+        point_in_time history for the whole vault.
+        """
+        from src.models.entity import Entity
+        from src.models.observation import Observation
+        import src.indexer.store as store_mod
+
+        with patch.object(store_mod, "_entities", {}), \
+             patch.object(store_mod, "_observations", {}), \
+             patch.object(store_mod, "_loaded", True):
+            ent = Entity(id="e1", name="A", entity_type="person", vault="work")
+            old = Observation(id="o1", entity_id="e1", content="v1")
+            new = Observation(id="o2", entity_id="e1", content="v2")
+            store_mod._entities["e1"] = ent
+            store_mod._observations["o1"] = old
+            store_mod._observations["o2"] = new
+
+            self.assertTrue(store_mod.mark_superseded("o1", "o2"))
+            self.assertTrue(old.is_superseded)
+            self.assertIsNone(
+                old.superseded_at,
+                "empty superseded_at must stay None so point_in_time falls "
+                "back to the replacement's created_at",
+            )
+
+            # An explicitly supplied stamp is still honoured verbatim.
+            self.assertTrue(
+                store_mod.mark_superseded("o1", "o2",
+                                          superseded_at="2026-05-02T07:26:07+00:00"))
+            self.assertEqual(old.superseded_at, "2026-05-02T07:26:07+00:00")
+
     def test_hard_deletes(self):
         from src.models.entity import Entity
         from src.models.observation import Observation
