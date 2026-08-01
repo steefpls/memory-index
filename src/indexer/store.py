@@ -380,7 +380,8 @@ def _run_post_write_hooks(vault: str, vault_obs_count: int,
 
 def add_observation(entity_id: str, content: str, source: str = "",
                     supersedes: str = "",
-                    occurred_at: str = "") -> Observation | None:
+                    occurred_at: str = "",
+                    created_at: str = "") -> Observation | None:
     """Add an observation to an entity and embed it in ChromaDB.
 
     Args:
@@ -392,6 +393,12 @@ def add_observation(entity_id: str, content: str, source: str = "",
         occurred_at: Optional ISO date/datetime for when the fact actually
                      happened (event time), as opposed to created_at which is
                      when it was recorded (ingestion time).
+        created_at: Optional ISO datetime overriding the record time. Only
+                    restore/migration should set this — it exists so an
+                    imported archive keeps the moment each fact was ORIGINALLY
+                    recorded. Without it every restored row reads as "recorded
+                    today", which flattens the whole record-time axis
+                    (point_in_time and record-axis timeline/search).
     """
     _load_store()
 
@@ -409,6 +416,7 @@ def add_observation(entity_id: str, content: str, source: str = "",
             entity_id=entity_id,
             content=content,
             source=source,
+            created_at=(created_at or "").strip() or _now_iso(),
             occurred_at=(occurred_at or "").strip() or None,
         )
         _observations[obs.id] = obs
@@ -579,6 +587,32 @@ def mark_superseded(observation_id: str, superseded_by: str,
         obs.superseded_by = superseded_by
         obs.superseded_at = (superseded_at or "").strip() or None
         db.upsert_observations([obs])
+    return True
+
+
+def restore_entity_timestamps(entity_id: str, created_at: str = "",
+                              updated_at: str = "") -> bool:
+    """Set an entity's created_at/updated_at to archived values.
+
+    Restore-only. Writing observations bumps `updated_at` to now, so import
+    calls this at the end to put the archived timestamps back — otherwise a
+    restored vault reports every entity as created and touched on the day of
+    the restore.
+    """
+    _load_store()
+    with STORE_LOCK:
+        ent = _entities.get(entity_id)
+        if ent is None or ent.deleted:
+            return False
+        created_at = (created_at or "").strip()
+        updated_at = (updated_at or "").strip()
+        if not created_at and not updated_at:
+            return False
+        if created_at:
+            ent.created_at = created_at
+        if updated_at:
+            ent.updated_at = updated_at
+        db.upsert_entities([ent])
     return True
 
 

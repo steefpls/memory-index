@@ -20,6 +20,13 @@ other row and then re-flagged as superseded (with their superseded_by pointers
 remapped to the new local IDs), so history is not silently dropped and old
 facts never resurface as current ones.
 
+Timestamps survive too. Observations keep their original created_at and
+occurred_at, entities this import created get their archived created_at /
+updated_at written back, and a supersession with no recorded timestamp stays
+unstamped rather than being dated to the restore. Without all three, a
+restored vault reports its entire history as having happened on the day of
+the restore, which silently breaks point_in_time and record-axis queries.
+
 The supersede pass is bounded by the additive contract: it only ever retires
 rows this import created. A row that deduped onto data the target vault
 already had — or onto a row an active archive entry also claims — stays
@@ -38,7 +45,7 @@ from src.config import (
 from src.indexer import store as store_mod
 from src.indexer.store import (
     create_entity, get_entity_by_name, add_observation, get_observations,
-    mark_superseded,
+    mark_superseded, restore_entity_timestamps,
 )
 from src.graph import manager as graph_mod
 from src.graph.manager import (
@@ -244,6 +251,9 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
 
     # --- Entities: merge by name, build old_id -> new_id map ---
     id_map: dict[str, str] = {}
+    # new_entity_id -> (archived created_at, archived updated_at), applied
+    # after all writes since adding observations bumps updated_at to now.
+    created_entity_stamps: dict[str, tuple[str, str]] = {}
     entities_created = 0
     entities_reused = 0
     entities_skipped_deleted = 0
@@ -264,6 +274,12 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
         else:
             new_ent = create_entity(name, etype, target_vault)
             id_map[ed["id"]] = new_ent.id
+            # Only entities this import CREATED get archived timestamps put
+            # back (below). A reused entity already belongs to the target
+            # vault, and rewriting its dates would falsify its own history.
+            created_entity_stamps[new_ent.id] = (
+                ed.get("created_at", ""), ed.get("updated_at", ""),
+            )
             entities_created += 1
 
     # --- Observations: dedupe by content per entity ---
@@ -327,10 +343,15 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
                 active_local_ids.add(local_id)
             continue
 
+        # created_at is carried over so the restored vault keeps the moment
+        # each fact was ORIGINALLY recorded. Letting it default to now would
+        # stamp every row with the restore date and flatten the record-time
+        # axis that point_in_time and record-axis timeline/search read.
         result = add_observation(
             new_eid, content,
             source=od.get("source", ""),
             occurred_at=od.get("occurred_at") or "",
+            created_at=od.get("created_at") or "",
         )
         if result is not None:
             obs_added += 1
@@ -432,6 +453,12 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
         add_relation(rel)
         existing_signatures.add(signature)
         rels_added += 1
+
+    # --- Entity timestamps: applied LAST ---
+    # Every add_observation above bumped its entity's updated_at to now, so
+    # the archived dates have to be written back after all row writes are done.
+    for new_eid, (c_at, u_at) in created_entity_stamps.items():
+        restore_entity_timestamps(new_eid, created_at=c_at, updated_at=u_at)
 
     source_vault = manifest.get("source_vault", "?")
     logger.info(

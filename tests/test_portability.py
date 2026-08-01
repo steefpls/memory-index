@@ -70,6 +70,93 @@ class TestPortability(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def test_restore_preserves_the_record_time_axis(self):
+        """A restored vault must keep WHEN each fact was recorded.
+
+        Import routes through add_observation, which stamps created_at with
+        now() by default. Left unchecked that dates every restored row to the
+        restore day and flattens point_in_time and record-axis timeline/search
+        for the whole vault.
+        """
+        from src.indexer.store import (
+            create_entity, add_observation, get_observations,
+            get_entity_by_name,
+        )
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        import src.config as config_mod
+        import src.indexer.store as store_mod
+
+        ent = create_entity("Steve", "person", "alpha")
+        add_observation(ent.id, "Salary is 5k", created_at="2026-01-01T00:00:00+00:00")
+        add_observation(ent.id, "Moved to Singapore",
+                        created_at="2026-02-01T00:00:00+00:00",
+                        occurred_at="2025-12-15")
+        # Backdate the entity so its archived stamps are distinguishable.
+        store_mod.restore_entity_timestamps(
+            ent.id, created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-02-01T00:00:00+00:00")
+
+        out = Path(self.tmpdir) / "ts.zip"
+        tool_export_vault("alpha", str(out))
+
+        config_mod.VAULTS["beta"] = config_mod.VaultConfig(
+            name="beta", collection_name="memory_beta")
+        tool_import_vault(str(out), "beta")
+
+        restored_ent = get_entity_by_name("Steve", "beta")
+        self.assertIsNotNone(restored_ent)
+        by_content = {o.content: o for o in get_observations(restored_ent.id)}
+
+        self.assertEqual(by_content["Salary is 5k"].created_at,
+                         "2026-01-01T00:00:00+00:00")
+        self.assertEqual(by_content["Moved to Singapore"].created_at,
+                         "2026-02-01T00:00:00+00:00")
+        # occurred_at already round-tripped; confirm it still does.
+        self.assertEqual(by_content["Moved to Singapore"].occurred_at, "2025-12-15")
+        # Entity stamps survive the observation writes that bump updated_at.
+        self.assertEqual(restored_ent.created_at, "2026-01-01T00:00:00+00:00")
+        self.assertEqual(restored_ent.updated_at, "2026-02-01T00:00:00+00:00")
+
+    def test_restore_preserves_point_in_time_answers(self):
+        """The semantic payoff: point_in_time must agree across a restore."""
+        from src.indexer.store import (
+            create_entity, add_observation, mark_superseded,
+        )
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.tools.temporal import tool_point_in_time
+        import src.config as config_mod
+
+        ent = create_entity("Steve", "person", "alpha")
+        old = add_observation(ent.id, "Salary is 5k",
+                              created_at="2026-01-01T00:00:00+00:00")
+        new = add_observation(ent.id, "Salary is 5.8k",
+                              created_at="2026-06-01T00:00:00+00:00")
+        # Backdate the supersession to match the replacement's record time.
+        # add_observation(supersedes=...) stamps it with now(), which would
+        # describe a history where the June fact sat alongside the January one
+        # until today — coherent, but not what this test is probing.
+        mark_superseded(old.id, new.id,
+                        superseded_at="2026-06-01T00:00:00+00:00")
+
+        before_restore = tool_point_in_time("Steve", "2026-03-01", vault="alpha")
+        self.assertIn("Salary is 5k", before_restore)
+        self.assertNotIn("Salary is 5.8k", before_restore)
+
+        out = Path(self.tmpdir) / "pit.zip"
+        tool_export_vault("alpha", str(out))
+        config_mod.VAULTS["beta"] = config_mod.VaultConfig(
+            name="beta", collection_name="memory_beta")
+        tool_import_vault(str(out), "beta")
+
+        after_restore = tool_point_in_time("Steve", "2026-03-01", vault="beta")
+        self.assertIn("Salary is 5k", after_restore)
+        self.assertNotIn("Salary is 5.8k", after_restore)
+
+        # And after the cutover the successor wins, in both vaults.
+        later = tool_point_in_time("Steve", "2026-07-01", vault="beta")
+        self.assertIn("Salary is 5.8k", later)
+        self.assertNotIn("Salary is 5k\n", later + "\n")
+
     # ----- helpers -----
 
     def _seed_alpha(self):
