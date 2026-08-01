@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -95,8 +96,11 @@ class TestEntityStore(unittest.TestCase):
         self.assertEqual(obs[0].content, "General purpose language")
         self.assertEqual(obs[1].content, "Created by Guido")
 
-        # Verify ChromaDB was called
-        self.assertEqual(self.mock_collection.add.call_count, 2)
+        # Initial observations go through the batch path: 2 facts, but only
+        # ONE Chroma add (and one embedder call) for the whole batch.
+        self.assertEqual(self.mock_collection.add.call_count, 1)
+        add_call = self.mock_collection.add.call_args
+        self.assertEqual(len(add_call[1]["ids"]), 2)
 
     def test_create_entity_idempotent(self):
         from src.indexer.store import create_entity
@@ -330,6 +334,476 @@ class TestEntityStore(unittest.TestCase):
         restored = Observation.from_dict(d)
         self.assertEqual(restored.superseded_by, "")
         self.assertFalse(restored.is_superseded)
+
+    # --- Batch write tests ---
+
+    def test_add_observations_single_embed_and_add(self):
+        """A batch of N facts costs ONE embedder call and ONE Chroma add."""
+        from src.indexer.store import create_entity, add_observations, get_observations
+
+        entity = create_entity("Python", "technology", "test")
+        self.mock_collection.add.reset_mock()
+        self.mock_ef.reset_mock()
+
+        created = add_observations(entity.id, ["Fact A", "Fact B", "Fact C"])
+
+        self.assertEqual(len(created), 3)
+        self.assertEqual(self.mock_collection.add.call_count, 1)
+        self.assertEqual(self.mock_ef.call_count, 1)
+
+        # The one embedder call received the whole list of texts.
+        embed_arg = self.mock_ef.call_args[0][0]
+        self.assertEqual(len(embed_arg), 3)
+
+        contents = {o.content for o in get_observations(entity.id)}
+        self.assertEqual(contents, {"Fact A", "Fact B", "Fact C"})
+
+    def test_add_observations_one_save_per_batch(self):
+        """The batch path writes the store file once, not once per fact."""
+        import src.indexer.store as store_mod
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        with patch.object(store_mod, "_save_store",
+                          wraps=store_mod._save_store) as spy:
+            add_observations(entity.id, ["A", "B", "C", "D"])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_add_observations_preserves_order_and_blank_filtering(self):
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        created = add_observations(entity.id, ["one", "  ", "two", ""])
+        self.assertEqual([o.content for o in created], ["one", "two"])
+
+    def test_add_observations_unknown_entity(self):
+        from src.indexer.store import add_observations
+        self.assertEqual(add_observations("nope", ["x"]), [])
+
+    def test_add_observations_empty_list(self):
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        self.assertEqual(add_observations(entity.id, []), [])
+
+    def test_add_observations_pipe_survives(self):
+        """A fact containing '|' must be stored verbatim, never split."""
+        from src.indexer.store import create_entity, add_observations, get_observations
+
+        entity = create_entity("Python", "technology", "test")
+        fact = "Pipeline is stdin | grep | wc -l"
+        add_observations(entity.id, [fact])
+
+        obs = get_observations(entity.id)
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0].content, fact)
+
+    # --- Auto-recalibration triggers (must survive batched writes) ---
+
+    def test_batch_write_crossing_the_boundary_recalibrates(self):
+        """A batch that steps OVER the every-10 boundary must still trigger.
+
+        The old modulo test only fired on an exact landing, so 7 + 5 = 12
+        skipped the trigger permanently.
+        """
+        import src.indexer.store as store_mod
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        add_observations(entity.id, [f"f{i}" for i in range(7)])
+
+        with patch.object(store_mod, "calibrate_collection") as cal, \
+             patch.object(store_mod, "_LIBRARIAN_EVERY", 10_000):
+            add_observations(entity.id, [f"g{i}" for i in range(5)])  # 7 -> 12
+
+        cal.assert_called_once()
+
+    def test_boundary_fires_exactly_once(self):
+        """Crossing 10 fires; the next write inside the same decade does not."""
+        import src.indexer.store as store_mod
+        from src.indexer.store import create_entity, add_observation, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        add_observations(entity.id, [f"f{i}" for i in range(12)])  # 0 -> 12
+
+        with patch.object(store_mod, "calibrate_collection") as cal, \
+             patch.object(store_mod, "_LIBRARIAN_EVERY", 10_000):
+            add_observation(entity.id, "one more")  # 12 -> 13
+        cal.assert_not_called()
+
+    def test_single_writes_still_trigger_on_the_boundary(self):
+        import src.indexer.store as store_mod
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        for i in range(9):
+            add_observation(entity.id, f"f{i}")
+
+        with patch.object(store_mod, "calibrate_collection") as cal, \
+             patch.object(store_mod, "_LIBRARIAN_EVERY", 10_000):
+            add_observation(entity.id, "the tenth")  # 9 -> 10
+        cal.assert_called_once()
+
+    def test_crossed_multiple_helper(self):
+        from src.indexer.store import _crossed_multiple
+
+        self.assertTrue(_crossed_multiple(7, 12, 10))
+        self.assertTrue(_crossed_multiple(9, 10, 10))
+        self.assertTrue(_crossed_multiple(0, 25, 10))
+        self.assertFalse(_crossed_multiple(10, 11, 10))
+        self.assertFalse(_crossed_multiple(12, 13, 10))
+        self.assertFalse(_crossed_multiple(12, 11, 10))  # supersession shrank it
+        self.assertFalse(_crossed_multiple(0, 0, 10))
+
+    def test_add_observations_mismatched_occurred_at_raises(self):
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        with self.assertRaises(ValueError):
+            add_observations(entity.id, ["a", "b"], occurred_at=["2026-01-01"])
+
+    # --- occurred_at tests ---
+
+    def test_add_observation_occurred_at_stored(self):
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        obs = add_observation(entity.id, "Released 3.13", occurred_at="2024-10-07")
+        self.assertEqual(obs.occurred_at, "2024-10-07")
+
+    def test_add_observation_occurred_at_defaults_none(self):
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        obs = add_observation(entity.id, "A fact")
+        self.assertIsNone(obs.occurred_at)
+
+    def test_occurred_at_absent_from_chroma_metadata_when_unset(self):
+        """Chroma rejects None metadata values — the key must be omitted."""
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        self.mock_collection.add.reset_mock()
+        add_observation(entity.id, "A fact")
+
+        meta = self.mock_collection.add.call_args[1]["metadatas"][0]
+        self.assertNotIn("occurred_at", meta)
+
+    def test_occurred_at_present_in_chroma_metadata_when_set(self):
+        from src.indexer.store import create_entity, add_observation
+
+        entity = create_entity("Python", "technology", "test")
+        self.mock_collection.add.reset_mock()
+        add_observation(entity.id, "A fact", occurred_at="2025-05-01")
+
+        meta = self.mock_collection.add.call_args[1]["metadatas"][0]
+        self.assertEqual(meta["occurred_at"], "2025-05-01")
+
+    def test_add_observations_parallel_occurred_at(self):
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        created = add_observations(
+            entity.id, ["First", "Second"],
+            occurred_at=["2024-01-01", "2025-02-02"],
+        )
+        self.assertEqual(created[0].occurred_at, "2024-01-01")
+        self.assertEqual(created[1].occurred_at, "2025-02-02")
+
+    def test_add_observations_partial_occurred_at(self):
+        """Blank entries in the occurred_at list mean 'unknown', not ''."""
+        from src.indexer.store import create_entity, add_observations
+
+        entity = create_entity("Python", "technology", "test")
+        created = add_observations(entity.id, ["First", "Second"],
+                                   occurred_at=["2024-01-01", ""])
+        self.assertEqual(created[0].occurred_at, "2024-01-01")
+        self.assertIsNone(created[1].occurred_at)
+
+    def test_observation_occurred_at_roundtrip(self):
+        from src.models.observation import Observation
+
+        obs = Observation(id="a", entity_id="b", content="c",
+                          occurred_at="2026-03-13")
+        d = obs.to_dict()
+        self.assertEqual(d["occurred_at"], "2026-03-13")
+        self.assertEqual(Observation.from_dict(d).occurred_at, "2026-03-13")
+
+    def test_observation_occurred_at_omitted_when_unset(self):
+        from src.models.observation import Observation
+
+        d = Observation(id="a", entity_id="b", content="c").to_dict()
+        self.assertNotIn("occurred_at", d)
+        self.assertIsNone(Observation.from_dict(d).occurred_at)
+
+    def test_effective_at_prefers_occurred_at(self):
+        from src.models.observation import Observation
+
+        with_event = Observation(id="a", entity_id="b", content="c",
+                                 created_at="2026-08-01T00:00:00+00:00",
+                                 occurred_at="2020-01-01")
+        self.assertEqual(with_event.effective_at, "2020-01-01")
+
+        without = Observation(id="a", entity_id="b", content="c",
+                              created_at="2026-08-01T00:00:00+00:00")
+        self.assertEqual(without.effective_at, "2026-08-01T00:00:00+00:00")
+
+    # --- mark_superseded ---
+
+    def test_mark_superseded(self):
+        from src.indexer.store import (
+            create_entity, add_observation, mark_superseded, get_observations,
+        )
+
+        entity = create_entity("Python", "technology", "test")
+        old = add_observation(entity.id, "Old")
+        new = add_observation(entity.id, "New")
+
+        self.assertTrue(mark_superseded(old.id, new.id))
+        active = get_observations(entity.id)
+        self.assertEqual([o.content for o in active], ["New"])
+
+    def test_mark_superseded_tolerates_unresolved_pointer(self):
+        """A dangling pointer still takes the row out of active reads."""
+        from src.indexer.store import (
+            create_entity, add_observation, mark_superseded, get_observations,
+        )
+
+        entity = create_entity("Python", "technology", "test")
+        old = add_observation(entity.id, "Old")
+
+        self.assertTrue(mark_superseded(old.id, "not-a-local-id"))
+        self.assertEqual(len(get_observations(entity.id)), 0)
+        self.assertEqual(len(get_observations(entity.id, include_superseded=True)), 1)
+
+    def test_mark_superseded_unknown_observation(self):
+        from src.indexer.store import mark_superseded
+        self.assertFalse(mark_superseded("nope", "also-nope"))
+
+
+class TestAtomicPersistence(unittest.TestCase):
+    """The store and graph must never leave a half-written JSON file behind."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_atomic_write_creates_file(self):
+        from src.indexer.store import atomic_write_json
+
+        target = Path(self.tmpdir) / "out.json"
+        atomic_write_json(target, {"a": 1})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"a": 1})
+
+    def test_atomic_write_replaces_existing(self):
+        from src.indexer.store import atomic_write_json
+
+        target = Path(self.tmpdir) / "out.json"
+        atomic_write_json(target, {"v": 1})
+        atomic_write_json(target, {"v": 2})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"v": 2})
+
+    def test_atomic_write_leaves_no_temp_files(self):
+        from src.indexer.store import atomic_write_json
+
+        target = Path(self.tmpdir) / "out.json"
+        atomic_write_json(target, {"a": 1})
+        leftovers = [p.name for p in Path(self.tmpdir).iterdir()
+                     if p.name != "out.json"]
+        self.assertEqual(leftovers, [])
+
+    def test_failed_write_preserves_old_file_and_cleans_up(self):
+        """If serialization/IO blows up mid-write, the old file survives."""
+        from src.indexer.store import atomic_write_json
+
+        target = Path(self.tmpdir) / "out.json"
+        atomic_write_json(target, {"good": True})
+
+        class Boom:
+            pass
+
+        with self.assertRaises(TypeError):
+            atomic_write_json(target, {"bad": Boom()})
+
+        # Old content intact...
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")),
+                         {"good": True})
+        # ...and no orphaned temp file left in the directory.
+        leftovers = [p.name for p in Path(self.tmpdir).iterdir()
+                     if p.name != "out.json"]
+        self.assertEqual(leftovers, [])
+
+    def test_temp_file_is_created_in_target_directory(self):
+        """os.replace is only atomic within a volume, so the temp file must
+        be a sibling of the target — not in the system temp dir."""
+        import src.indexer.store as store_mod
+
+        target = Path(self.tmpdir) / "out.json"
+        seen = {}
+        real_mkstemp = store_mod.tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            seen["dir"] = kwargs.get("dir")
+            return real_mkstemp(*args, **kwargs)
+
+        with patch.object(store_mod.tempfile, "mkstemp", side_effect=spy):
+            store_mod.atomic_write_json(target, {"a": 1})
+
+        self.assertEqual(Path(seen["dir"]), Path(self.tmpdir))
+
+    def test_graph_save_is_atomic(self):
+        """graph.manager._save_graph goes through the same atomic writer."""
+        import src.graph.manager as gm
+        from src.models.relation import Relation
+
+        tmp = Path(self.tmpdir)
+        with patch("src.graph.manager.GRAPH_FILE", tmp / "memory_graph.json"), \
+             patch("src.graph.manager.DATA_DIR", tmp):
+            gm._graph = None
+            gm._relations = {}
+            gm.add_relation(Relation(id="r1", from_entity="a", to_entity="b",
+                                     relation_type="uses"))
+
+            data = json.loads((tmp / "memory_graph.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(data["relations"]), 1)
+            leftovers = [p.name for p in tmp.iterdir()
+                         if p.name != "memory_graph.json"]
+            self.assertEqual(leftovers, [])
+
+        gm._graph = None
+        gm._relations = {}
+
+
+class TestStoreConcurrency(unittest.TestCase):
+    """Concurrent writers must not corrupt the in-memory dicts."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.patches = [
+            patch("src.config.DATA_DIR", Path(self.tmpdir)),
+            patch("src.config.ENTITIES_FILE", Path(self.tmpdir) / "memory_entities.json"),
+            patch("src.indexer.store.DATA_DIR", Path(self.tmpdir)),
+            patch("src.indexer.store.ENTITIES_FILE", Path(self.tmpdir) / "memory_entities.json"),
+            patch("src.indexer.store.get_collection", return_value=MagicMock()),
+            patch("src.indexer.store.get_embedding_function",
+                  return_value=MagicMock(return_value=[[0.1] * 768])),
+        ]
+        for p in self.patches:
+            p.start()
+
+        import src.indexer.store as store_mod
+        store_mod._entities = {}
+        store_mod._observations = {}
+        store_mod._loaded = True
+
+        import src.config as config_mod
+        config_mod.VAULTS = {
+            "test": config_mod.VaultConfig(name="test", collection_name="memory_test"),
+        }
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_store_lock_is_reentrant(self):
+        """Nested store calls (create_entity -> add_observations) must not
+        self-deadlock, which requires an RLock rather than a plain Lock."""
+        import src.indexer.store as store_mod
+        self.assertIsInstance(store_mod.STORE_LOCK, type(threading.RLock()))
+
+        with store_mod.STORE_LOCK:
+            with store_mod.STORE_LOCK:
+                pass  # would hang on a non-reentrant lock
+
+    def test_concurrent_writes_do_not_lose_observations(self):
+        import threading as _threading
+        from src.indexer.store import create_entity, add_observation, get_observations
+
+        entity = create_entity("Python", "technology", "test")
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(20):
+                    add_observation(entity.id, f"w{n}-fact{i}")
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [_threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(get_observations(entity.id)), 80)
+
+    def test_concurrent_readers_never_see_a_mutating_dict(self):
+        """Full-dict scans run under the lock, so a reader can't trip over a
+        'dict changed size during iteration' RuntimeError."""
+        import threading as _threading
+        from src.indexer.store import (
+            create_entity, add_observation, get_observation_count, list_entities,
+        )
+
+        entity = create_entity("Python", "technology", "test")
+        stop = _threading.Event()
+        errors = []
+
+        def writer():
+            try:
+                for i in range(150):
+                    add_observation(entity.id, f"fact{i}")
+            finally:
+                stop.set()
+
+        def reader():
+            try:
+                while not stop.is_set():
+                    get_observation_count("test")
+                    list_entities(vault="test")
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [_threading.Thread(target=writer)] + [
+            _threading.Thread(target=reader) for _ in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+
+    def test_concurrent_create_entity_is_idempotent(self):
+        """Racing creates of the same name must yield exactly one entity."""
+        import threading as _threading
+        from src.indexer.store import create_entity, list_entities
+
+        barrier = _threading.Barrier(6)
+        results = []
+        lock = _threading.Lock()
+
+        def worker():
+            barrier.wait()
+            ent = create_entity("Racy", "concept", "test")
+            with lock:
+                results.append(ent.id)
+
+        threads = [_threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(set(results)), 1)
+        entities, total = list_entities(vault="test")
+        self.assertEqual(total, 1)
 
 
 if __name__ == "__main__":

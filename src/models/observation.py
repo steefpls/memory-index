@@ -14,6 +14,9 @@ class Observation:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     deleted: bool = False
     superseded_by: str = ""  # ID of the observation that replaced this one
+    # When the fact actually happened (event time), as an ISO date or datetime.
+    # None means unknown — consumers fall back to created_at (ingestion time).
+    occurred_at: str | None = None
 
     @property
     def embedding_text(self) -> str:
@@ -28,6 +31,14 @@ class Observation:
     def is_superseded(self) -> bool:
         return bool(self.superseded_by)
 
+    @property
+    def effective_at(self) -> str:
+        """Event time if known, else ingestion time.
+
+        This is the timestamp temporal queries should order and window on.
+        """
+        return self.occurred_at or self.created_at
+
     def to_dict(self) -> dict:
         d = {
             "id": self.id,
@@ -39,6 +50,8 @@ class Observation:
         }
         if self.superseded_by:
             d["superseded_by"] = self.superseded_by
+        if self.occurred_at:
+            d["occurred_at"] = self.occurred_at
         return d
 
     @classmethod
@@ -51,4 +64,5 @@ class Observation:
             created_at=d.get("created_at", ""),
             deleted=d.get("deleted", False),
             superseded_by=d.get("superseded_by", ""),
+            occurred_at=d.get("occurred_at") or None,
         )

@@ -7,7 +7,7 @@ from src.config import VAULTS, get_vault, create_vault as config_create_vault
 from src.indexer.store import (
     create_entity, get_entity, get_entity_by_name, update_entity,
     delete_entity, list_entities, resolve_entity,
-    add_observation, get_observations, delete_observation,
+    add_observation, add_observations, get_observations, delete_observation,
 )
 from src.graph.manager import get_relations_for_entity, remove_entity_relations
 from src.models.entity import ENTITY_TYPES
@@ -15,8 +15,24 @@ from src.models.entity import ENTITY_TYPES
 logger = logging.getLogger(__name__)
 
 
+def _coerce_str_list(value) -> list[str]:
+    """Normalize a list-of-strings param into a clean list.
+
+    Accepts a real list (the supported form) or a bare string, which is
+    treated as ONE item. Deliberately does NOT split on any delimiter — a
+    fact containing '|' must survive intact.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
 def tool_create_entity(name: str, entity_type: str, vault: str,
-                       observations: str = "", source: str = "") -> str:
+                       observations: list[str] | None = None,
+                       source: str = "") -> str:
     """Create a named entity with optional initial observations.
 
     Args:
@@ -24,7 +40,9 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
         entity_type: Type (person, project, concept, decision, error,
                      solution, technology, event, organization, etc.).
         vault: Vault to store in. Created automatically if it doesn't exist.
-        observations: Pipe-separated observations (e.g., "Fact 1|Fact 2|Fact 3").
+        observations: List of observation strings, one atomic fact per item
+                      (e.g., ["Fact 1", "Fact 2"]). Never split — a fact may
+                      contain any character, including '|'.
         source: Optional source attribution for observations.
 
     Returns:
@@ -41,7 +59,7 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
     if vault not in VAULTS:
         config_create_vault(vault)
 
-    obs_list = [o.strip() for o in observations.split("|") if o.strip()] if observations else None
+    obs_list = _coerce_str_list(observations) or None
 
     entity = create_entity(name.strip(), entity_type.strip().lower(), vault.strip(),
                           observations=obs_list, source=source)
@@ -247,7 +265,8 @@ def tool_list_entities(vault: str = "", entity_type: str = "",
 
 def tool_add_observation(name_or_id: str, content: str,
                          vault: str = "", source: str = "",
-                         supersedes: str = "") -> str:
+                         supersedes: str = "",
+                         occurred_at: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
     Args:
@@ -257,6 +276,8 @@ def tool_add_observation(name_or_id: str, content: str,
         source: Optional source attribution.
         supersedes: Optional observation ID that this replaces. The old
                     observation is kept for history but excluded from search.
+        occurred_at: Optional ISO date/datetime for when the fact actually
+                     happened. Defaults to empty, meaning "use ingestion time".
 
     Returns:
         Confirmation or error.
@@ -266,58 +287,77 @@ def tool_add_observation(name_or_id: str, content: str,
         return f"Entity not found: '{name_or_id}'"
 
     obs = add_observation(entity.id, content, source=source,
-                          supersedes=supersedes)
+                          supersedes=supersedes, occurred_at=occurred_at)
     if obs is None:
         return "Error: failed to add observation."
 
     msg = f"Observation added to '{entity.name}': id={obs.id}"
     if supersedes:
         msg += f", supersedes={supersedes}"
+    if obs.occurred_at:
+        msg += f", occurred_at={obs.occurred_at}"
     return msg
 
 
-def tool_add_observations(name_or_id: str, contents: str,
-                          vault: str = "", source: str = "") -> str:
+def tool_add_observations(name_or_id: str, contents: list[str],
+                          vault: str = "", source: str = "",
+                          occurred_at: list[str] | None = None) -> str:
     """Add multiple observations to a single entity in one call.
 
-    Each pipe-separated content becomes its own observation (one embedding per
-    fact — atomicity preserved per CLAUDE.md), but the MCP round-trip is
-    collapsed to one. Use this when you have several facts about the same
-    entity to record in a single thought.
+    Each list item becomes its own observation (one embedding per fact —
+    atomicity preserved per CLAUDE.md), but the MCP round-trip and the
+    embed/save work are collapsed to one batch.
 
     Args:
         name_or_id: Entity name or ID.
-        contents: Pipe-separated observation contents (e.g., "Fact 1|Fact 2|Fact 3").
+        contents: List of observation strings, one atomic fact per item
+                  (e.g., ["Fact 1", "Fact 2"]). Contents are never split, so a
+                  fact containing '|' is stored verbatim.
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution applied to all added observations.
+        occurred_at: Optional parallel list of ISO date/datetime strings (event
+                     time), same length as contents. Use "" for items with no
+                     known event time. Omit entirely to use ingestion time.
 
     Returns:
         Confirmation listing each added observation ID, or error.
     """
-    if not contents or not contents.strip():
-        return "Error: contents is required."
+    items = _coerce_str_list(contents)
+    if not items:
+        return "Error: contents is required (a non-empty list of strings)."
+
+    # Validate occurred_at against the RAW contents, before blanks are dropped,
+    # so the caller's parallel-list indices are the ones being checked.
+    when_list: list[str] | None = None
+    if occurred_at is not None:
+        raw = contents if isinstance(contents, list) else [contents]
+        if isinstance(occurred_at, str):
+            occurred_at = [occurred_at]
+        if len(occurred_at) != len(raw):
+            return (
+                f"Error: occurred_at has {len(occurred_at)} entries but contents "
+                f"has {len(raw)} — they must match (or omit occurred_at)."
+            )
+        # Re-pair after dropping blank contents.
+        when_list = [
+            (occurred_at[i] or "")
+            for i, c in enumerate(raw)
+            if str(c or "").strip()
+        ]
 
     entity = resolve_entity(name_or_id, vault or None)
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    items = [c.strip() for c in contents.split("|") if c.strip()]
-    if not items:
-        return "Error: no non-empty observation contents."
+    created = add_observations(entity.id, items, source=source,
+                               occurred_at=when_list)
+    if not created:
+        return "Error: failed to add observations."
 
-    added_ids: list[str] = []
-    for content in items:
-        obs = add_observation(entity.id, content, source=source)
-        if obs is None:
-            return (
-                f"Error: failed to add observation after {len(added_ids)} succeeded. "
-                f"Added IDs: {', '.join(added_ids) if added_ids else '(none)'}"
-            )
-        added_ids.append(obs.id)
-
-    lines = [f"Added {len(added_ids)} observations to '{entity.name}':"]
-    for oid in added_ids:
-        lines.append(f"  id={oid}")
+    lines = [f"Added {len(created)} observations to '{entity.name}':"]
+    for obs in created:
+        when = f"  occurred_at={obs.occurred_at}" if obs.occurred_at else ""
+        lines.append(f"  id={obs.id}{when}")
     return "\n".join(lines)
 
 

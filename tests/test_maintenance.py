@@ -178,6 +178,68 @@ class TestMaintenance(unittest.TestCase):
         self.assertIn("Observations to remove: 0", result)
         self.assertIn("Relations to remove: 0", result)
 
+    # ---- concurrency ----
+
+    def test_vacuum_scan_and_removal_are_one_critical_section(self):
+        """A concurrent write must not be able to land between vacuum's scan
+        and its hard-pop + _save_store.
+
+        Probed deterministically from inside the scan (via VAULTS lookup)
+        rather than by racing threads: with the scan unlocked the writer runs
+        straight through; holding STORE_LOCK across scan and removal blocks it
+        until the vacuum is done.
+        """
+        import threading
+        from src.indexer.store import create_entity, delete_entity, add_observation
+        import src.indexer.store as store_mod
+        import src.tools.maintenance as maint
+
+        keep = create_entity("Keep", "concept", "alpha")
+        junk = create_entity("Junk", "concept", "alpha",
+                             observations=["junk fact"])
+        delete_entity(junk.id)
+
+        probe = {}
+        writer_started = threading.Event()
+        writer_done = threading.Event()
+
+        def writer():
+            writer_started.set()
+            add_observation(keep.id, "concurrent fact")
+            writer_done.set()
+
+        class ProbingVaults(dict):
+            """Fires once, at the point in the scan that reads a vault."""
+
+            def __getitem__(self, key):
+                if "fired" not in probe:
+                    probe["fired"] = True
+                    t = threading.Thread(target=writer)
+                    probe["thread"] = t
+                    t.start()
+                    writer_started.wait(5)
+                    probe["ran_during_scan"] = writer_done.wait(0.5)
+                return super().__getitem__(key)
+
+        with patch.object(maint, "VAULTS", ProbingVaults(maint.VAULTS)):
+            result = maint.tool_vacuum_store()
+
+        probe["thread"].join(5)
+
+        self.assertTrue(probe.get("fired"), "probe never ran — scan changed shape")
+        self.assertFalse(
+            probe["ran_during_scan"],
+            "a write completed while vacuum was mid-scan: the scan and the "
+            "hard-pop are not one critical section",
+        )
+
+        # The vacuum still did its job, and the concurrent write survived.
+        self.assertIn("1 soft-deleted", result)
+        self.assertNotIn(junk.id, store_mod._entities)
+        self.assertIn(keep.id, store_mod._entities)
+        contents = {o.content for o in store_mod._observations.values()}
+        self.assertIn("concurrent fact", contents)
+
 
 if __name__ == "__main__":
     unittest.main()

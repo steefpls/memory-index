@@ -1,0 +1,248 @@
+{
+  "version": 1,
+  "vault": "eval_fixture",
+  "note": "Synthetic retrieval answer key for memory-index. The corpus is fictional (Ferroline Robotics) so it can never collide with real vault content. `entities` is ingested through the real store APIs; `queries` is the answer key. A result counts as relevant if its observation text is listed in expect_contents, or (for entity-level questions) its entity name is listed in expect_entities.",
+  "entities": [
+    {
+      "name": "Marcus Lee",
+      "type": "person",
+      "source": "fixture: ferroline onboarding pack 2026-01-12",
+      "observations": [
+        "Leads the perception team at Ferroline Robotics",
+        "Prefers written design documents over long meetings",
+        "Owns the release sign-off for the Halberd planner",
+        "Studied mechanical engineering at Delft"
+      ]
+    },
+    {
+      "name": "Priya Raghavan",
+      "type": "person",
+      "source": "fixture: ferroline onboarding pack 2026-01-12",
+      "observations": [
+        "Runs the weekly Kestrel fleet triage every Tuesday",
+        "Wrote the original TimescaleDB ingestion pipeline",
+        "Mentors two junior engineers on the Sable Vision team",
+        "Keeps open office hours on Thursday afternoons"
+      ]
+    },
+    {
+      "name": "Tomas Berg",
+      "type": "person",
+      "source": "fixture: ferroline onboarding pack 2026-01-12",
+      "observations": [
+        "Works remotely from Gothenburg in the CET timezone",
+        "Maintains the Kestrel dashboard frontend",
+        "Escalates production incidents to the Northwind Freight account manager",
+        "Allergic to peanuts, so team lunches avoid satay"
+      ]
+    },
+    {
+      "name": "Ferroline Robotics",
+      "type": "organization",
+      "source": "fixture: company brief 2026-02-03",
+      "observations": [
+        "Builds pick-and-place robot cells for warehouse customers",
+        "Headquartered in Singapore with a satellite office in Rotterdam",
+        "Raised a Series B round of 42 million dollars in March 2025",
+        "Runs a four-day engineering week during December"
+      ]
+    },
+    {
+      "name": "Northwind Freight",
+      "type": "organization",
+      "source": "fixture: account review 2026-02-19",
+      "observations": [
+        "Largest logistics customer of Ferroline Robotics by contract value",
+        "Operates 14 distribution centres across northern Europe",
+        "Requires SOC 2 evidence before approving any software rollout",
+        "Renews its service contract every February"
+      ]
+    },
+    {
+      "name": "Halberd",
+      "type": "project",
+      "source": "fixture: halberd design doc 2026-03-08",
+      "observations": [
+        "Motion planner that sequences pick-and-place grasps for robot cells",
+        "Written in Rust with Python bindings for the simulation harness",
+        "Replaced a legacy sampling planner that timed out on cluttered bins",
+        "Deploys to the cell controller as a signed OTA bundle"
+      ]
+    },
+    {
+      "name": "Kestrel",
+      "type": "project",
+      "source": "fixture: kestrel design doc 2026-03-08",
+      "observations": [
+        "Web dashboard showing live status for the mobile robot fleet",
+        "Streams telemetry over websockets with a five second refresh",
+        "Stores fleet telemetry history in TimescaleDB",
+        "Has an offline mode that caches the last known fleet state"
+      ]
+    },
+    {
+      "name": "Sable Vision",
+      "type": "project",
+      "source": "fixture: sable vision design doc 2026-03-22",
+      "observations": [
+        "Calibrates the 3D cameras mounted above each robot cell",
+        "Uses a checkerboard target and a bundle adjustment solve",
+        "Calibration fails when the warehouse lighting flickers",
+        "Exports camera intrinsics as a YAML file consumed by Halberd"
+      ]
+    },
+    {
+      "name": "Telemetry storage decision",
+      "type": "decision",
+      "source": "fixture: adr-014 2026-04-02",
+      "observations": [
+        "Chose TimescaleDB over InfluxDB for fleet telemetry storage",
+        "Deciding factor was native SQL support for the existing reporting stack",
+        "Accepted a higher storage cost in exchange for simpler backups",
+        "Agreed to revisit the choice if telemetry volume exceeds two terabytes"
+      ]
+    },
+    {
+      "name": "TimescaleDB",
+      "type": "technology",
+      "source": "fixture: platform notes 2026-04-15",
+      "observations": [
+        "PostgreSQL extension that adds hypertables for time series data",
+        "Compression policy shrinks fleet telemetry after seven days",
+        "Continuous aggregates power the weekly utilisation report",
+        "Runs on the same Postgres instance as the Kestrel application tables"
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "id": "q01",
+      "query": "who leads the perception team",
+      "expect_contents": ["Leads the perception team at Ferroline Robotics"]
+    },
+    {
+      "id": "q02",
+      "query": "which engineer prefers written design documents over meetings",
+      "expect_contents": ["Prefers written design documents over long meetings"]
+    },
+    {
+      "id": "q03",
+      "query": "who owns the release sign-off for Halberd",
+      "expect_contents": ["Owns the release sign-off for the Halberd planner"]
+    },
+    {
+      "id": "q04",
+      "query": "where did Marcus Lee study mechanical engineering",
+      "expect_contents": ["Studied mechanical engineering at Delft"]
+    },
+    {
+      "id": "q05",
+      "query": "when is the weekly Kestrel fleet triage",
+      "expect_contents": ["Runs the weekly Kestrel fleet triage every Tuesday"]
+    },
+    {
+      "id": "q06",
+      "query": "who wrote the TimescaleDB ingestion pipeline",
+      "expect_contents": ["Wrote the original TimescaleDB ingestion pipeline"]
+    },
+    {
+      "id": "q07",
+      "query": "who mentors the junior engineers on Sable Vision",
+      "expect_contents": ["Mentors two junior engineers on the Sable Vision team"]
+    },
+    {
+      "id": "q08",
+      "query": "when does Priya Raghavan keep office hours",
+      "expect_contents": ["Keeps open office hours on Thursday afternoons"]
+    },
+    {
+      "id": "q09",
+      "query": "which timezone does Tomas Berg work remotely from",
+      "expect_contents": ["Works remotely from Gothenburg in the CET timezone"]
+    },
+    {
+      "id": "q10",
+      "query": "who maintains the Kestrel dashboard frontend",
+      "expect_contents": ["Maintains the Kestrel dashboard frontend"]
+    },
+    {
+      "id": "q11",
+      "query": "who is allergic to peanuts",
+      "expect_contents": ["Allergic to peanuts, so team lunches avoid satay"]
+    },
+    {
+      "id": "q12",
+      "query": "what does Ferroline Robotics build for warehouse customers",
+      "expect_contents": ["Builds pick-and-place robot cells for warehouse customers"]
+    },
+    {
+      "id": "q13",
+      "query": "where is Ferroline Robotics headquartered",
+      "expect_contents": ["Headquartered in Singapore with a satellite office in Rotterdam"]
+    },
+    {
+      "id": "q14",
+      "query": "how much did Ferroline raise in its Series B round",
+      "expect_contents": ["Raised a Series B round of 42 million dollars in March 2025"]
+    },
+    {
+      "id": "q15",
+      "query": "which logistics customer is the largest by contract value",
+      "expect_contents": ["Largest logistics customer of Ferroline Robotics by contract value"]
+    },
+    {
+      "id": "q16",
+      "query": "how many distribution centres does Northwind Freight operate",
+      "expect_contents": ["Operates 14 distribution centres across northern Europe"]
+    },
+    {
+      "id": "q17",
+      "query": "what compliance evidence does Northwind require before a rollout",
+      "expect_contents": ["Requires SOC 2 evidence before approving any software rollout"]
+    },
+    {
+      "id": "q18",
+      "query": "what language is the Halberd planner written in",
+      "expect_contents": ["Written in Rust with Python bindings for the simulation harness"]
+    },
+    {
+      "id": "q19",
+      "query": "why was the legacy sampling planner replaced",
+      "expect_contents": ["Replaced a legacy sampling planner that timed out on cluttered bins"]
+    },
+    {
+      "id": "q20",
+      "query": "how does Halberd deploy to the cell controller",
+      "expect_contents": ["Deploys to the cell controller as a signed OTA bundle"]
+    },
+    {
+      "id": "q21",
+      "query": "why does Sable Vision calibration fail in the warehouse",
+      "expect_contents": ["Calibration fails when the warehouse lighting flickers"]
+    },
+    {
+      "id": "q22",
+      "query": "what file format holds the exported camera intrinsics",
+      "expect_contents": ["Exports camera intrinsics as a YAML file consumed by Halberd"]
+    },
+    {
+      "id": "q23",
+      "query": "why did we choose TimescaleDB over InfluxDB",
+      "expect_contents": ["Chose TimescaleDB over InfluxDB for fleet telemetry storage"]
+    },
+    {
+      "id": "q24",
+      "query": "how long until fleet telemetry gets compressed",
+      "expect_contents": ["Compression policy shrinks fleet telemetry after seven days"]
+    },
+    {
+      "id": "q25",
+      "query": "telemetry storage tradeoffs we accepted and when to revisit them",
+      "expect_contents": [
+        "Accepted a higher storage cost in exchange for simpler backups",
+        "Agreed to revisit the choice if telemetry volume exceeds two terabytes"
+      ],
+      "note": "multi-answer: both observations must land in the top-k"
+    }
+  ]
+}

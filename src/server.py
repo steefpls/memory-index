@@ -66,7 +66,8 @@ mcp = FastMCP("memory-index")
 
 @mcp.tool()
 def create_entity(name: str, entity_type: str, vault: str,
-                  observations: str = "", source: str = "") -> str:
+                  observations: list[str] | None = None,
+                  source: str = "") -> str:
     """Create a named entity with optional initial observations.
 
     Args:
@@ -74,7 +75,9 @@ def create_entity(name: str, entity_type: str, vault: str,
         entity_type: Type (person, project, concept, decision, error,
                      solution, technology, event, organization, etc.).
         vault: Vault to store in. Created automatically if it doesn't exist.
-        observations: Pipe-separated observations (e.g., "Fact 1|Fact 2|Fact 3").
+        observations: Array of observation strings, one atomic fact per item
+                      (e.g., ["Fact 1", "Fact 2"]). Contents are stored
+                      verbatim — never split — so a fact may contain '|'.
         source: Optional source attribution for observations.
     """
     from src.tools.entities import tool_create_entity
@@ -158,7 +161,7 @@ def list_entities(vault: str = "", entity_type: str = "",
 @mcp.tool()
 def add_observation(name_or_id: str, content: str,
                     vault: str = "", source: str = "",
-                    supersedes: str = "") -> str:
+                    supersedes: str = "", occurred_at: str = "") -> str:
     """Add an observation (fact) to an existing entity.
 
     Args:
@@ -168,29 +171,39 @@ def add_observation(name_or_id: str, content: str,
         source: Optional source attribution.
         supersedes: Optional observation ID that this replaces. The old
                     observation is kept for history but excluded from search.
+        occurred_at: Optional ISO date/datetime (YYYY-MM-DD or full ISO) for
+                     when the fact actually happened, as distinct from when it
+                     was recorded. Leave empty to use the ingestion time.
     """
     from src.tools.entities import tool_add_observation
-    return tool_add_observation(name_or_id, content, vault, source, supersedes)
+    return tool_add_observation(name_or_id, content, vault, source, supersedes,
+                                occurred_at)
 
 
 @mcp.tool()
-def add_observations(name_or_id: str, contents: str,
-                     vault: str = "", source: str = "") -> str:
+def add_observations(name_or_id: str, contents: list[str],
+                     vault: str = "", source: str = "",
+                     occurred_at: list[str] | None = None) -> str:
     """Add multiple observations to a single entity in one call.
 
-    Each pipe-separated content becomes its own observation (one embedding per
-    fact — atomicity preserved per CLAUDE.md), but the MCP round-trip is
-    collapsed to one. Use this when you have several facts about the same
-    entity to record in a single thought.
+    Each array item becomes its own observation (one embedding per fact —
+    atomicity preserved per CLAUDE.md), but the MCP round-trip and the
+    embed/save work collapse into a single batch.
 
     Args:
         name_or_id: Entity name or ID.
-        contents: Pipe-separated observation contents (e.g., "Fact 1|Fact 2|Fact 3").
+        contents: Array of observation strings, one atomic fact per item
+                  (e.g., ["Fact 1", "Fact 2"]). Contents are stored verbatim —
+                  never split — so a fact may contain '|'.
         vault: Vault name (helps disambiguate names).
         source: Optional source attribution applied to all added observations.
+        occurred_at: Optional array of ISO date/datetime strings (event time)
+                     parallel to contents, same length. Use "" for items with
+                     no known event time. Omit to use ingestion time.
     """
     from src.tools.entities import tool_add_observations
-    return tool_add_observations(name_or_id, contents, vault, source)
+    return tool_add_observations(name_or_id, contents, vault, source,
+                                 occurred_at)
 
 
 @mcp.tool()
@@ -240,31 +253,38 @@ def delete_relation(relation_id: str) -> str:
 # ========== Search Tools ==========
 
 @mcp.tool()
-def search_memory(query: str, vault: str = "", n_results: int = 10,
+def search_memory(query: str, vault: str = "", n_results: int = 5,
                    entity_type: str = "",
                    since: str = "", before: str = "",
                    include_superseded: bool = False,
-                   strategy: str = "associative",
+                   strategy: str = "semantic",
                    output_format: str = "text") -> str:
-    """Semantic memory search with spreading activation and RRF fusion.
+    """Semantic memory search. Each result is a single observation (fact).
 
-    Finds entities and observations matching your query using vector similarity,
-    then explores the knowledge graph outward from hits via spreading activation,
-    and merges both rankings with Reciprocal Rank Fusion.
+    Every matching observation is ranked flat by calibrated relevance — results
+    are individual facts with their entity as context, not entities with a
+    sample of their facts. Only observations above the vault's calibrated noise
+    threshold are returned; if fewer than 3 clear it, the best 3 overall come
+    back anyway with honest LOW / NO MATCH labels so you can judge them.
 
     Args:
         query: Natural language query describing what you're looking for.
         vault: Vault to search (empty = search all vaults).
-        n_results: Number of results (default 10, max 30).
+        n_results: Max observations to return (default 5, max 30).
         entity_type: Optional entity type filter.
         since: Only include observations created after this ISO date/datetime
                (e.g., "2026-03-01", "2026-03-13T10:00:00").
         before: Only include observations created before this ISO date/datetime.
         include_superseded: Include observations that have been replaced by
                             newer ones (default False). Useful for history queries.
-        strategy: "associative" (default — spreading activation + RRF fusion)
-                  or "semantic" (vector-only, no graph expansion).
-        output_format: "text" (default) or "json".
+        strategy: "semantic" (default — vector search only) or "associative"
+                  (additionally probes graph neighbours of the hits; a
+                  neighbour is admitted only if its own observations clear the
+                  same relevance threshold, so it never pads results with
+                  weakly-related entities).
+        output_format: "text" (default — ranked facts grouped under one line of
+                       entity context) or "json" (flat ranked list of
+                       observation objects, including observation ids).
     """
     from src.tools.search import search_memory as do_search
     return do_search(query, vault, n_results, entity_type,

@@ -20,7 +20,7 @@ def tool_memory_status() -> str:
     Returns:
         Status summary.
     """
-    backend = get_active_backend(role="search")
+    backend = get_active_backend()
 
     vaults = config_list_vaults()
     vault_details = []
@@ -132,26 +132,31 @@ def tool_delete_vault(name: str) -> str:
     store_mod._load_store()
     graph_mod._get_graph()
 
-    vault_entity_ids = {
-        e.id for e in store_mod._entities.values() if e.vault == name
-    }
-    entity_count = len(vault_entity_ids)
+    # The scan and the hard-pop run as ONE critical section under STORE_LOCK.
+    # Otherwise a concurrent write landing between them is clobbered by this
+    # function's full-file _save_store(), and the scans can trip over a
+    # dict that is mutating underneath them.
+    with store_mod.STORE_LOCK:
+        vault_entity_ids = {
+            e.id for e in store_mod._entities.values() if e.vault == name
+        }
+        entity_count = len(vault_entity_ids)
 
-    # Remove relations involving any of these entities
+        # Hard-pop observations and entities from the in-memory stores
+        obs_ids_to_drop = [
+            oid for oid, o in store_mod._observations.items()
+            if o.entity_id in vault_entity_ids
+        ]
+        for oid in obs_ids_to_drop:
+            store_mod._observations.pop(oid, None)
+        for eid in vault_entity_ids:
+            store_mod._entities.pop(eid, None)
+
+        store_mod._save_store()
+
+    # Remove relations involving any of these entities (graph has its own lock)
     for eid in vault_entity_ids:
         graph_mod.remove_entity_relations(eid)
-
-    # Hard-pop observations and entities from the in-memory stores
-    obs_ids_to_drop = [
-        oid for oid, o in store_mod._observations.items()
-        if o.entity_id in vault_entity_ids
-    ]
-    for oid in obs_ids_to_drop:
-        store_mod._observations.pop(oid, None)
-    for eid in vault_entity_ids:
-        store_mod._entities.pop(eid, None)
-
-    store_mod._save_store()
 
     # Drop the ChromaDB collection (cleans all vectors at once)
     try:

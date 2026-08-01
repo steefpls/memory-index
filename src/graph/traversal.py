@@ -84,6 +84,12 @@ def spread_activation(seed_ids: set[str], decay: float = 0.7,
     decay per hop. Energy accumulates across paths. Lateral inhibition
     keeps only top-K per hop to prevent explosion.
 
+    Activation energy is a *nomination* signal, not a relevance score: an
+    activated entity has merely been reached through the graph and may have
+    nothing to do with the query. Callers must score candidates independently
+    (e.g. against the query embedding) before presenting them as matches —
+    never reuse energy, or a stand-in distance, as a search score.
+
     Args:
         seed_ids: Starting entity IDs (typically from vector search).
         decay: Energy decay per hop (0.0 to 1.0, default 0.7).

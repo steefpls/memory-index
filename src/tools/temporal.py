@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from src.config import VAULTS
 from src.indexer.store import (
     resolve_entity, get_entity, get_observations,
-    _load_store, _entities, _observations,
+    _load_store, _entities, _observations, STORE_LOCK,
 )
 from src.graph.traversal import get_neighbors
 
@@ -32,9 +32,45 @@ def _parse_iso(dt_str: str) -> datetime | None:
         return None
 
 
+def _obs_effective_at(obs) -> str:
+    """The timestamp string temporal queries should use for an observation.
+
+    Prefers occurred_at (when the fact actually happened) and falls back to
+    created_at (when it was recorded). Tolerates observations loaded from
+    older data that predate the occurred_at field.
+    """
+    return getattr(obs, "occurred_at", None) or obs.created_at
+
+
+def _obs_effective_dt(obs) -> datetime | None:
+    """An observation's EVENT timestamp as a datetime (occurred_at-first).
+
+    Used for ordering and for windowing a timeline, where the question is
+    "when did this happen?".
+    """
+    return _parse_iso(_obs_effective_at(obs))
+
+
 def _obs_created_dt(obs) -> datetime | None:
-    """Get observation created_at as datetime."""
+    """An observation's INGESTION timestamp as a datetime (created_at only).
+
+    Used wherever the question is "did we know this yet?" — point-in-time
+    reconstruction and supersession ordering. Deliberately ignores
+    occurred_at: a fact about 1991 recorded in 2026 was not knowledge in 1995.
+    """
     return _parse_iso(obs.created_at)
+
+
+def _snapshot_store() -> tuple[dict, dict]:
+    """Shallow copies of the store dicts, taken under STORE_LOCK.
+
+    Every full-dict scan in this module goes through here. Iterating the live
+    dicts unguarded raced concurrent writes (the auto-librarian thread and
+    FastMCP's concurrent HTTP handlers make that routine) and blew up with
+    "dictionary changed size during iteration".
+    """
+    with STORE_LOCK:
+        return dict(_entities), dict(_observations)
 
 
 def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
@@ -67,13 +103,14 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
         return f"Error: invalid end date '{end}'. Use ISO format (YYYY-MM-DD or full ISO datetime)."
 
     _load_store()
+    entities_snapshot, observations_snapshot = _snapshot_store()
 
     # Determine which entity IDs are in scope
     vault_filter = vault or None
     type_filter = entity_type.strip().lower() if entity_type else None
 
     entity_ids_in_scope = set()
-    for ent in _entities.values():
+    for ent in entities_snapshot.values():
         if ent.deleted:
             continue
         if vault_filter and ent.vault != vault_filter:
@@ -87,13 +124,14 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
 
     # Collect observations in the time window
     timeline_items = []
-    for obs in _observations.values():
+    for obs in observations_snapshot.values():
         if obs.deleted or obs.is_superseded:
             continue
         if obs.entity_id not in entity_ids_in_scope:
             continue
 
-        obs_dt = _obs_created_dt(obs)
+        # Timelines window on EVENT time — "what happened in this range".
+        obs_dt = _obs_effective_dt(obs)
         if obs_dt is None:
             continue
         if start_dt and obs_dt < start_dt:
@@ -101,7 +139,7 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
         if end_dt and obs_dt >= end_dt:
             continue
 
-        ent = _entities.get(obs.entity_id)
+        ent = entities_snapshot.get(obs.entity_id)
         if ent is None:
             continue
 
@@ -114,10 +152,13 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
             "content": obs.content,
             "source": obs.source,
             "created_at": obs.created_at,
+            "occurred_at": getattr(obs, "occurred_at", None),
+            # What this item was ordered and filtered on.
+            "effective_at": _obs_effective_at(obs),
         })
 
-    # Sort chronologically
-    timeline_items.sort(key=lambda x: x["created_at"])
+    # Sort chronologically on event time (falling back to ingestion time)
+    timeline_items.sort(key=lambda x: x["effective_at"])
     timeline_items = timeline_items[:limit]
 
     if not timeline_items:
@@ -140,14 +181,15 @@ def tool_query_timeline(vault: str = "", start: str = "", end: str = "",
     lines = [f"Timeline ({len(timeline_items)} observations):"]
     current_date = ""
     for item in timeline_items:
-        # Group by date
-        item_date = item["created_at"][:10]
+        # Group by date (event date when known, else ingestion date)
+        item_date = item["effective_at"][:10]
         if item_date != current_date:
             current_date = item_date
             lines.append(f"\n  [{current_date}]")
         src = f" [source: {item['source']}]" if item.get("source") else ""
+        occ = " (event time)" if item.get("occurred_at") else ""
         lines.append(f"    {item['entity_name']} ({item['entity_type']}): "
-                     f"{item['content']}{src}")
+                     f"{item['content']}{src}{occ}")
         lines.append(f"      obs: {item['observation_id']}  entity: {item['entity_id']}")
 
     return "\n".join(lines)
@@ -160,6 +202,12 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
     Reconstructs the entity's state by including only observations that
     existed at the given timestamp, respecting superseding chains — if an
     observation was superseded before as_of, the replacement is shown instead.
+
+    This is an as-of-KNOWLEDGE reconstruction, so existence and supersession
+    are judged on created_at (when the fact was recorded), never on
+    occurred_at. A fact about 1991 that was only written down in 2026 was not
+    known in 1995 and must not appear in a 1995 snapshot. occurred_at is still
+    used for ordering and is reported alongside created_at.
 
     Args:
         entity_name_or_id: Entity name or ID.
@@ -180,25 +228,27 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
         return f"Entity not found: '{entity_name_or_id}'"
 
     _load_store()
+    _, observations_snapshot = _snapshot_store()
 
     # Get ALL observations for this entity (including superseded)
     all_obs = [
-        o for o in _observations.values()
+        o for o in observations_snapshot.values()
         if o.entity_id == entity.id and not o.deleted
     ]
 
-    # Filter to observations that existed at as_of
+    # Filter to observations that existed at as_of. Both tests below are on
+    # created_at: this is a knowledge snapshot, not an event window.
     obs_at_time = []
     for obs in all_obs:
         obs_dt = _obs_created_dt(obs)
         if obs_dt is None:
             continue
         if obs_dt > as_of_dt:
-            continue  # didn't exist yet
+            continue  # wasn't recorded yet
 
         # Check if this was superseded BEFORE as_of
         if obs.superseded_by:
-            replacement = _observations.get(obs.superseded_by)
+            replacement = observations_snapshot.get(obs.superseded_by)
             if replacement:
                 repl_dt = _obs_created_dt(replacement)
                 if repl_dt and repl_dt <= as_of_dt:
@@ -206,7 +256,7 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
 
         obs_at_time.append(obs)
 
-    obs_at_time.sort(key=lambda o: o.created_at)
+    obs_at_time.sort(key=_obs_effective_at)
 
     if output_format == "json":
         return json.dumps({
@@ -221,6 +271,8 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
                     "content": o.content,
                     "source": o.source,
                     "created_at": o.created_at,
+                    "occurred_at": getattr(o, "occurred_at", None),
+                    "effective_at": _obs_effective_at(o),
                 }
                 for o in obs_at_time
             ],
@@ -238,7 +290,11 @@ def tool_point_in_time(entity_name_or_id: str, as_of: str,
     for obs in obs_at_time:
         src = f" [source: {obs.source}]" if obs.source else ""
         lines.append(f"    - {obs.content}{src}")
-        lines.append(f"      created: {obs.created_at}  id: {obs.id}")
+        occurred = getattr(obs, "occurred_at", None)
+        when = f"      created: {obs.created_at}"
+        if occurred:
+            when += f"  occurred: {occurred}"
+        lines.append(f"{when}  id: {obs.id}")
 
     return "\n".join(lines)
 
@@ -280,7 +336,9 @@ def tool_get_temporal_neighbors(entity_name_or_id: str, vault: str = "",
     if not entity_obs:
         return f"No observations for '{entity.name}' — cannot determine temporal position."
 
-    entity_times = [_obs_created_dt(o) for o in entity_obs]
+    # Temporal adjacency is about WHEN THINGS HAPPENED, so it anchors on event
+    # time (occurred_at-first), unlike point_in_time above.
+    entity_times = [_obs_effective_dt(o) for o in entity_obs]
     entity_times = [t for t in entity_times if t is not None]
     if not entity_times:
         return f"No valid timestamps for '{entity.name}'."
@@ -303,7 +361,7 @@ def tool_get_temporal_neighbors(entity_name_or_id: str, vault: str = "",
         if not nb_obs:
             continue
 
-        nb_times = [_obs_created_dt(o) for o in nb_obs]
+        nb_times = [_obs_effective_dt(o) for o in nb_obs]
         nb_times = [t for t in nb_times if t is not None]
         if not nb_times:
             continue

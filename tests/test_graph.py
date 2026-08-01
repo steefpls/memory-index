@@ -86,6 +86,64 @@ class TestGraphManager(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(get_relation_count(), 1)
 
+    def test_graph_lock_is_reentrant(self):
+        """add_relation -> _save_graph re-enters, so a plain Lock would hang."""
+        import threading
+        import src.graph.manager as gm
+
+        self.assertIsInstance(gm.GRAPH_LOCK, type(threading.RLock()))
+        with gm.GRAPH_LOCK:
+            with gm.GRAPH_LOCK:
+                pass
+
+    def test_save_graph_payload_cannot_be_torn_by_a_concurrent_write(self):
+        """_save_graph serializes _relations under GRAPH_LOCK.
+
+        A crash-safe file swap does not help if the PAYLOAD is built while
+        another thread mutates _relations. Probed by firing a concurrent
+        add_relation from inside the serialization and checking it blocks.
+        """
+        import threading
+        import src.graph.manager as gm
+        from src.models.relation import Relation
+
+        gm.add_relation(Relation(id="r1", from_entity="e1", to_entity="e2",
+                                 relation_type="uses"))
+
+        probe = {}
+        started = threading.Event()
+        done = threading.Event()
+
+        def writer():
+            started.set()
+            gm.add_relation(Relation(id="r2", from_entity="e3", to_entity="e4",
+                                     relation_type="uses"))
+            done.set()
+
+        victim = gm._relations["r1"]
+        original_to_dict = victim.to_dict
+
+        def to_dict_probe():
+            if "fired" not in probe:
+                probe["fired"] = True
+                t = threading.Thread(target=writer)
+                probe["thread"] = t
+                t.start()
+                started.wait(5)
+                probe["ran_during_save"] = done.wait(0.5)
+            return original_to_dict()
+
+        victim.to_dict = to_dict_probe
+        gm._save_graph()
+        probe["thread"].join(5)
+
+        self.assertTrue(probe.get("fired"))
+        self.assertFalse(
+            probe["ran_during_save"],
+            "a relation was added while _save_graph was serializing _relations",
+        )
+        self.assertEqual(gm.get_relation_count(), 2)
+
     def test_persistence(self):
         from src.graph.manager import add_relation, _save_graph
         from src.models.relation import Relation

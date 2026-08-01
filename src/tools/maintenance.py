@@ -29,44 +29,60 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
 
     valid_vaults = set(VAULTS.keys())
 
-    # ---- Entities to hard-remove ----
     ent_to_remove: list[str] = []
     ent_orphan_vault = 0
     ent_soft_deleted = 0
     chroma_targets: dict[str, list[str]] = {}  # collection_name -> obs ids
+    obs_to_remove: list[str] = []
+    surviving_ent_ids: set[str] = set()
 
-    for ent in list(store_mod._entities.values()):
-        reason = None
-        if ent.vault not in valid_vaults:
-            reason = "orphan_vault"
-            ent_orphan_vault += 1
-        elif ent.deleted:
-            reason = "soft_deleted"
-            ent_soft_deleted += 1
-        if reason is None:
-            continue
-        ent_to_remove.append(ent.id)
+    # The scan and the hard-removal must be ONE critical section. Splitting
+    # them let a concurrent add_observation land in between: the vacuum's own
+    # _save_store() then rewrote the whole file from a stale view and dropped
+    # the new row from disk (while it survived in Chroma). Holding the lock
+    # across both also stops the scans tripping over a mutating dict.
+    with store_mod.STORE_LOCK:
+        # ---- Entities to hard-remove ----
+        for ent in list(store_mod._entities.values()):
+            reason = None
+            if ent.vault not in valid_vaults:
+                reason = "orphan_vault"
+                ent_orphan_vault += 1
+            elif ent.deleted:
+                reason = "soft_deleted"
+                ent_soft_deleted += 1
+            if reason is None:
+                continue
+            ent_to_remove.append(ent.id)
 
-        # Collect Chroma cleanup targets even for vaults that still exist
-        if ent.vault in valid_vaults:
-            collection_name = VAULTS[ent.vault].collection_name
-            obs_ids = [
-                o.id for o in store_mod._observations.values()
-                if o.entity_id == ent.id
-            ]
-            if obs_ids:
-                chroma_targets.setdefault(collection_name, []).extend(obs_ids)
+            # Collect Chroma cleanup targets even for vaults that still exist
+            if ent.vault in valid_vaults:
+                collection_name = VAULTS[ent.vault].collection_name
+                obs_ids = [
+                    o.id for o in store_mod._observations.values()
+                    if o.entity_id == ent.id
+                ]
+                if obs_ids:
+                    chroma_targets.setdefault(collection_name, []).extend(obs_ids)
 
-    ent_to_remove_set = set(ent_to_remove)
+        ent_to_remove_set = set(ent_to_remove)
 
-    # ---- Observations whose entity is gone (now or already) ----
-    surviving_ent_ids = {
-        eid for eid in store_mod._entities.keys() if eid not in ent_to_remove_set
-    }
-    obs_to_remove = [
-        o.id for o in store_mod._observations.values()
-        if o.entity_id not in surviving_ent_ids
-    ]
+        # ---- Observations whose entity is gone (now or already) ----
+        surviving_ent_ids = {
+            eid for eid in store_mod._entities.keys()
+            if eid not in ent_to_remove_set
+        }
+        obs_to_remove = [
+            o.id for o in store_mod._observations.values()
+            if o.entity_id not in surviving_ent_ids
+        ]
+
+        if not dry_run:
+            for oid in obs_to_remove:
+                store_mod._observations.pop(oid, None)
+            for eid in ent_to_remove:
+                store_mod._entities.pop(eid, None)
+            store_mod._save_store()
 
     # ---- Dangling relations ----
     rel_to_remove = []
@@ -85,8 +101,7 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
     if dry_run:
         return "\n".join(summary_lines + ["  (dry run — nothing modified)"])
 
-    # ---- Execute ----
-    # Best-effort Chroma cleanup
+    # ---- Execute (store rows are already gone; the rest is best-effort) ----
     if chroma_targets:
         try:
             from src.indexer.embedder import get_chroma_client
@@ -100,16 +115,8 @@ def tool_vacuum_store(dry_run: bool = False) -> str:
         except Exception as e:
             logger.warning("Chroma client unavailable for vacuum: %s", e)
 
-    for oid in obs_to_remove:
-        store_mod._observations.pop(oid, None)
-
-    for eid in ent_to_remove:
-        store_mod._entities.pop(eid, None)
-
     for rid in rel_to_remove:
         graph_mod.remove_relation(rid)
-
-    store_mod._save_store()
     # remove_relation already saves the graph, but call once more in case
     # rel_to_remove was empty (no save) but we still want to be sure.
     graph_mod._save_graph()

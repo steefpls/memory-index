@@ -13,6 +13,16 @@ Format (version 1):
 Import is always ADDITIVE: existing data in the target vault is preserved.
 Entities are merged by name; observations are deduped by exact content per
 entity; relations are deduped by (from, to, type).
+
+Superseded observations survive the round-trip: they are imported like any
+other row and then re-flagged as superseded (with their superseded_by pointers
+remapped to the new local IDs), so history is not silently dropped and old
+facts never resurface as current ones.
+
+The supersede pass is bounded by the additive contract: it only ever retires
+rows this import created. A row that deduped onto data the target vault
+already had — or onto a row an active archive entry also claims — stays
+active, because import must never hide a fact the user already stored.
 """
 
 import json
@@ -27,6 +37,7 @@ from src.config import (
 from src.indexer import store as store_mod
 from src.indexer.store import (
     create_entity, get_entity_by_name, add_observation, get_observations,
+    mark_superseded,
 )
 from src.graph import manager as graph_mod
 from src.graph.manager import (
@@ -50,14 +61,19 @@ def _collect_vault_data(vault: str) -> dict:
     store_mod._load_store()
     graph_mod._get_graph()  # ensure relations are loaded
 
+    # Snapshot under STORE_LOCK: a concurrent write (or the background
+    # auto-librarian) mutating the live dicts mid-scan raised
+    # "dictionary changed size during iteration".
+    entities_snapshot, observations_snapshot = store_mod.snapshot_store()
+
     entities = [
-        e.to_dict() for e in store_mod._entities.values()
+        e.to_dict() for e in entities_snapshot.values()
         if e.vault == vault
     ]
     entity_ids = {e["id"] for e in entities}
 
     observations = [
-        o.to_dict() for o in store_mod._observations.values()
+        o.to_dict() for o in observations_snapshot.values()
         if o.entity_id in entity_ids
     ]
 
@@ -185,7 +201,12 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
 
     Existing entities are matched by name and reused. New observations are
     deduped against existing observations on the matched entity (exact content
-    match). Relations are deduped by (from, to, relation_type).
+    match, superseded rows included). Relations are deduped by
+    (from, to, relation_type).
+
+    Superseded observations are imported and re-flagged as superseded once all
+    IDs have been remapped, so exported history round-trips intact without old
+    facts reappearing as active ones. Soft-deleted rows are still skipped.
 
     Args:
         input_path: Path to a zip archive produced by export_vault.
@@ -244,13 +265,44 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
             entities_created += 1
 
     # --- Observations: dedupe by content per entity ---
+    #
+    # Superseded observations are imported too — dropping them made
+    # export -> import lossy (history silently vanished). They are created
+    # first like any other row, then re-flagged as superseded in a second pass
+    # once every ID has been remapped, so a superseded fact never lands in the
+    # target vault as an active one.
     obs_added = 0
     obs_duplicate = 0
     obs_orphan = 0
     obs_skipped_deleted = 0
+    obs_superseded = 0
+    obs_supersede_declined = 0
+
+    # old_obs_id -> id of the observation now representing it locally (freshly
+    # created, or the pre-existing duplicate it deduped onto).
+    obs_id_map: dict[str, str] = {}
+    # Local rows this import actually created. Only these may be retired in
+    # pass 2 — marking a row the target vault already owned would break the
+    # module's ADDITIVE contract.
+    created_local_ids: set[str] = set()
+    # Local rows that some ACTIVE archive row also maps to. If an archive holds
+    # two rows with identical content, one active and one superseded, they
+    # dedupe onto a single local row; retiring it would hide the active fact.
+    active_local_ids: set[str] = set()
+    # Per-entity content index, built once (cheaper than a rescan per row) and
+    # kept current as we add. Includes superseded rows so re-import is a no-op.
+    content_index: dict[str, dict[str, str]] = {}
+
+    def _entity_content_index(new_eid: str) -> dict[str, str]:
+        if new_eid not in content_index:
+            content_index[new_eid] = {
+                o.content: o.id
+                for o in get_observations(new_eid, include_superseded=True)
+            }
+        return content_index[new_eid]
 
     for od in raw_observations:
-        if od.get("deleted") or od.get("superseded_by"):
+        if od.get("deleted"):
             obs_skipped_deleted += 1
             continue
 
@@ -264,14 +316,71 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
         if not content:
             continue
 
-        existing_contents = {o.content for o in get_observations(new_eid)}
-        if content in existing_contents:
+        by_content = _entity_content_index(new_eid)
+        if content in by_content:
             obs_duplicate += 1
+            local_id = by_content[content]
+            obs_id_map[od["id"]] = local_id
+            if not od.get("superseded_by"):
+                active_local_ids.add(local_id)
             continue
 
-        result = add_observation(new_eid, content, source=od.get("source", ""))
+        result = add_observation(
+            new_eid, content,
+            source=od.get("source", ""),
+            occurred_at=od.get("occurred_at") or "",
+        )
         if result is not None:
             obs_added += 1
+            obs_id_map[od["id"]] = result.id
+            created_local_ids.add(result.id)
+            by_content[content] = result.id
+            if not od.get("superseded_by"):
+                active_local_ids.add(result.id)
+
+    # Second pass: rebuild supersede chains with remapped IDs.
+    for od in raw_observations:
+        if od.get("deleted"):
+            continue
+        old_superseded_by = od.get("superseded_by")
+        if not old_superseded_by:
+            continue
+
+        local_id = obs_id_map.get(od["id"])
+        if local_id is None:
+            continue
+
+        # Import is ADDITIVE: never retire a row this import did not create.
+        # Without this guard an archive's superseded row could dedupe onto a
+        # pre-existing ACTIVE fact in the target vault and silently hide it.
+        if local_id not in created_local_ids:
+            obs_supersede_declined += 1
+            continue
+
+        # Nor retire a row that an ACTIVE archive row also deduped onto — the
+        # active fact wins, exactly as it would if the rows were distinct.
+        if local_id in active_local_ids:
+            obs_supersede_declined += 1
+            continue
+
+        # Remap the pointer. If the replacement wasn't in the archive we keep
+        # the original (dangling) ID: the row still reads as superseded, which
+        # is what matters — it must not resurface as an active fact.
+        new_pointer = obs_id_map.get(old_superseded_by)
+        if new_pointer is None:
+            new_pointer = old_superseded_by
+            logger.warning(
+                "Import: observation %s superseded by %s, which is not in the "
+                "archive — marking superseded with an unresolved pointer.",
+                local_id, old_superseded_by,
+            )
+        if new_pointer == local_id:
+            # Self-reference would make the row permanently unreachable
+            # without conveying anything; leave it active instead.
+            continue
+
+        if mark_superseded(local_id, new_pointer):
+            obs_superseded += 1
 
     # --- Relations: dedupe by (from, to, type) ---
     rels_added = 0
@@ -327,8 +436,11 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
         f"  Entities: {entities_created} created, {entities_reused} reused"
         + (f", {entities_skipped_deleted} skipped (deleted)" if entities_skipped_deleted else ""),
         f"  Observations: {obs_added} added, {obs_duplicate} duplicate"
+        + (f", {obs_superseded} marked superseded" if obs_superseded else "")
+        + (f", {obs_supersede_declined} kept active (already present)"
+           if obs_supersede_declined else "")
         + (f", {obs_orphan} orphan" if obs_orphan else "")
-        + (f", {obs_skipped_deleted} skipped (deleted/superseded)" if obs_skipped_deleted else ""),
+        + (f", {obs_skipped_deleted} skipped (deleted)" if obs_skipped_deleted else ""),
         f"  Relations: {rels_added} added, {rels_duplicate} duplicate"
         + (f", {rels_orphan} orphan" if rels_orphan else ""),
     ]

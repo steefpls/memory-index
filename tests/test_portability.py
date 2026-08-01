@@ -249,6 +249,338 @@ class TestPortability(unittest.TestCase):
         result = tool_import_vault(str(Path(self.tmpdir) / "nope.zip"))
         self.assertIn("not found", result)
 
+    # ----- history preservation -----
+
+    def _seed_alpha_with_history(self):
+        """An entity whose fact was revised twice, leaving a supersede chain."""
+        from src.indexer.store import create_entity, add_observation
+
+        ent = create_entity("Perception", "project", "alpha")
+        v1 = add_observation(ent.id, "Uses .NET Framework")
+        v2 = add_observation(ent.id, "Migrated to .NET 8", supersedes=v1.id)
+        v3 = add_observation(ent.id, "Migrated to .NET 12", supersedes=v2.id)
+        return ent, v1, v2, v3
+
+    def test_export_includes_superseded_observations(self):
+        from src.tools.portability import tool_export_vault
+
+        self._seed_alpha_with_history()
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+
+        with zipfile.ZipFile(export_path) as zf:
+            obs = json.loads(zf.read("observations.json"))
+        self.assertEqual(len(obs), 3)
+        self.assertEqual(sum(1 for o in obs if o.get("superseded_by")), 2)
+
+    def test_import_preserves_superseded_history(self):
+        """Import must not discard superseded rows — export->import was lossy."""
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import get_entity_by_name, get_observations
+
+        self._seed_alpha_with_history()
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+
+        tool_import_vault(str(export_path), "beta")
+
+        ent = get_entity_by_name("Perception", "beta")
+        self.assertIsNotNone(ent)
+
+        # All three rows made it across...
+        all_obs = get_observations(ent.id, include_superseded=True)
+        self.assertEqual(len(all_obs), 3)
+        self.assertEqual(
+            {o.content for o in all_obs},
+            {"Uses .NET Framework", "Migrated to .NET 8", "Migrated to .NET 12"},
+        )
+
+        # ...but only the head of the chain is an ACTIVE fact.
+        active = get_observations(ent.id)
+        self.assertEqual([o.content for o in active], ["Migrated to .NET 12"])
+
+    def test_import_remaps_superseded_by_pointers(self):
+        """superseded_by must point at the NEW local IDs, not the archive's."""
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import get_entity_by_name, get_observations
+
+        _, v1, v2, v3 = self._seed_alpha_with_history()
+        old_ids = {v1.id, v2.id, v3.id}
+
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+        tool_import_vault(str(export_path), "beta")
+
+        ent = get_entity_by_name("Perception", "beta")
+        by_content = {o.content: o
+                      for o in get_observations(ent.id, include_superseded=True)}
+        local_ids = {o.id for o in by_content.values()}
+
+        # Fresh IDs, and every pointer resolves within the new vault.
+        self.assertEqual(local_ids & old_ids, set())
+        self.assertEqual(
+            by_content["Uses .NET Framework"].superseded_by,
+            by_content["Migrated to .NET 8"].id,
+        )
+        self.assertEqual(
+            by_content["Migrated to .NET 8"].superseded_by,
+            by_content["Migrated to .NET 12"].id,
+        )
+        self.assertEqual(by_content["Migrated to .NET 12"].superseded_by, "")
+
+    def test_import_superseded_never_lands_as_active(self):
+        """Even when the replacement is missing from the archive, the old row
+        must import as superseded — never resurface as a current fact."""
+        from src.tools.portability import tool_import_vault
+        from src.indexer.store import get_entity_by_name, get_observations
+
+        archive = Path(self.tmpdir) / "handmade.zip"
+        entities = [{
+            "id": "E1", "name": "Perception", "entity_type": "project",
+            "vault": "alpha", "deleted": False,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }]
+        observations = [
+            {"id": "O1", "entity_id": "E1", "content": "Old truth",
+             "source": "", "created_at": "2026-01-01T00:00:00+00:00",
+             "deleted": False, "superseded_by": "GONE"},
+            {"id": "O2", "entity_id": "E1", "content": "Current truth",
+             "source": "", "created_at": "2026-01-02T00:00:00+00:00",
+             "deleted": False},
+        ]
+        manifest = {
+            "format_version": 1, "source_vault": "alpha",
+            "exported_at": "2026-01-03T00:00:00+00:00",
+            "counts": {"entities": 1, "observations": 2, "relations": 0},
+        }
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
+            zf.writestr("entities.json", json.dumps(entities))
+            zf.writestr("observations.json", json.dumps(observations))
+            zf.writestr("relations.json", json.dumps([]))
+
+        tool_import_vault(str(archive), "beta")
+
+        ent = get_entity_by_name("Perception", "beta")
+        active = get_observations(ent.id)
+        self.assertEqual([o.content for o in active], ["Current truth"])
+        self.assertEqual(len(get_observations(ent.id, include_superseded=True)), 2)
+
+    def _write_archive(self, name, entities, observations, relations=()):
+        archive = Path(self.tmpdir) / name
+        manifest = {
+            "format_version": 1, "source_vault": "alpha",
+            "exported_at": "2026-01-03T00:00:00+00:00",
+            "counts": {"entities": len(entities),
+                       "observations": len(observations),
+                       "relations": len(relations)},
+        }
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
+            zf.writestr("entities.json", json.dumps(entities))
+            zf.writestr("observations.json", json.dumps(observations))
+            zf.writestr("relations.json", json.dumps(list(relations)))
+        return archive
+
+    def test_import_never_supersedes_a_preexisting_active_observation(self):
+        """Import is ADDITIVE — an archive's superseded row must not retire a
+        fact the target vault already holds as current."""
+        from src.tools.portability import tool_import_vault
+        from src.indexer.store import (
+            create_entity, get_entity_by_name, get_observations,
+        )
+        import src.config as config_mod
+
+        config_mod.VAULTS["beta"] = config_mod.VaultConfig(
+            name="beta", collection_name="memory_beta")
+        create_entity("Steven", "person", "beta",
+                      observations=["Steven works at Augmentus"])
+
+        archive = self._write_archive(
+            "history.zip",
+            [{"id": "E1", "name": "Steven", "entity_type": "person",
+              "vault": "alpha", "deleted": False,
+              "created_at": "2026-01-01T00:00:00+00:00",
+              "updated_at": "2026-01-01T00:00:00+00:00"}],
+            [
+                {"id": "OLD1", "entity_id": "E1",
+                 "content": "Steven works at Augmentus", "source": "",
+                 "created_at": "2026-01-01T00:00:00+00:00",
+                 "deleted": False, "superseded_by": "OLD2"},
+                {"id": "OLD2", "entity_id": "E1",
+                 "content": "Steven works at Anthropic", "source": "",
+                 "created_at": "2026-02-01T00:00:00+00:00", "deleted": False},
+            ],
+        )
+
+        tool_import_vault(str(archive), "beta")
+
+        ent = get_entity_by_name("Steven", "beta")
+        active = {o.content for o in get_observations(ent.id)}
+        # The pre-existing fact is untouched; the imported one is added.
+        self.assertIn("Steven works at Augmentus", active)
+        self.assertIn("Steven works at Anthropic", active)
+
+    def test_import_keeps_row_active_when_an_active_archive_row_shares_it(self):
+        """Two archive rows with identical content — one active, one
+        superseded — dedupe onto one local row, which must stay active."""
+        from src.tools.portability import tool_import_vault
+        from src.indexer.store import get_entity_by_name, get_observations
+
+        archive = self._write_archive(
+            "dupes.zip",
+            [{"id": "E1", "name": "Thing", "entity_type": "concept",
+              "vault": "alpha", "deleted": False,
+              "created_at": "2026-01-01T00:00:00+00:00",
+              "updated_at": "2026-01-01T00:00:00+00:00"}],
+            [
+                # Superseded row first, so it is the one actually created.
+                {"id": "A", "entity_id": "E1", "content": "Same fact",
+                 "source": "", "created_at": "2026-01-01T00:00:00+00:00",
+                 "deleted": False, "superseded_by": "C"},
+                {"id": "B", "entity_id": "E1", "content": "Same fact",
+                 "source": "", "created_at": "2026-01-02T00:00:00+00:00",
+                 "deleted": False},
+                {"id": "C", "entity_id": "E1", "content": "Other fact",
+                 "source": "", "created_at": "2026-01-03T00:00:00+00:00",
+                 "deleted": False},
+            ],
+        )
+
+        tool_import_vault(str(archive), "beta")
+
+        ent = get_entity_by_name("Thing", "beta")
+        active = {o.content for o in get_observations(ent.id)}
+        self.assertEqual(active, {"Same fact", "Other fact"})
+
+    def test_import_skips_soft_deleted_observations(self):
+        """Deleted rows are still dropped — only superseded ones now survive."""
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import (
+            create_entity, add_observation, delete_observation,
+            get_entity_by_name, get_observations,
+        )
+
+        ent = create_entity("Thing", "concept", "alpha")
+        add_observation(ent.id, "Kept")
+        gone = add_observation(ent.id, "Removed")
+        delete_observation(gone.id)
+
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+        result = tool_import_vault(str(export_path), "beta")
+        self.assertIn("skipped (deleted)", result)
+
+        beta = get_entity_by_name("Thing", "beta")
+        contents = {o.content
+                    for o in get_observations(beta.id, include_superseded=True)}
+        self.assertEqual(contents, {"Kept"})
+
+    def test_history_roundtrip_is_idempotent(self):
+        """Re-importing the same archive must not duplicate history."""
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import get_entity_by_name, get_observations
+
+        self._seed_alpha_with_history()
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+
+        tool_import_vault(str(export_path), "beta")
+        result2 = tool_import_vault(str(export_path), "beta")
+        self.assertIn("0 added", result2)
+
+        ent = get_entity_by_name("Perception", "beta")
+        self.assertEqual(len(get_observations(ent.id, include_superseded=True)), 3)
+        self.assertEqual(len(get_observations(ent.id)), 1)
+
+    # ----- occurred_at -----
+
+    def test_occurred_at_roundtrips(self):
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import (
+            create_entity, add_observation, get_entity_by_name, get_observations,
+        )
+
+        ent = create_entity("Python", "technology", "alpha")
+        add_observation(ent.id, "Created by Guido", occurred_at="1991-02-20")
+        add_observation(ent.id, "No known event time")
+
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+
+        with zipfile.ZipFile(export_path) as zf:
+            raw = json.loads(zf.read("observations.json"))
+        by_content = {o["content"]: o for o in raw}
+        self.assertEqual(by_content["Created by Guido"]["occurred_at"], "1991-02-20")
+        # Unset stays absent from the archive, not serialized as null.
+        self.assertNotIn("occurred_at", by_content["No known event time"])
+
+        tool_import_vault(str(export_path), "beta")
+
+        beta = get_entity_by_name("Python", "beta")
+        imported = {o.content: o for o in get_observations(beta.id)}
+        self.assertEqual(imported["Created by Guido"].occurred_at, "1991-02-20")
+        self.assertIsNone(imported["No known event time"].occurred_at)
+
+    # ----- concurrency -----
+
+    def test_export_scan_survives_a_write_landing_mid_scan(self):
+        """_collect_vault_data must read a snapshot, not the live dicts.
+
+        Deterministic stand-in for the real race: a write is injected from
+        inside the scan itself. Iterating the live dict raises
+        "dictionary changed size during iteration"; iterating a snapshot
+        taken under STORE_LOCK cannot.
+        """
+        from src.tools.portability import _collect_vault_data
+        from src.indexer.store import create_entity
+        from src.models.observation import Observation
+        import src.indexer.store as store_mod
+
+        ent = create_entity("Python", "technology", "alpha",
+                            observations=[f"fact {i}" for i in range(20)])
+
+        fired = []
+        victim = next(iter(store_mod._observations.values()))
+        original_to_dict = victim.to_dict
+
+        def to_dict_that_writes():
+            if not fired:
+                fired.append(True)
+                # Simulate a concurrent add_observation landing mid-scan.
+                for i in range(5):
+                    extra = Observation(id=f"injected{i}", entity_id=ent.id,
+                                        content=f"injected {i}")
+                    store_mod._observations[extra.id] = extra
+            return original_to_dict()
+
+        victim.to_dict = to_dict_that_writes
+
+        data = _collect_vault_data("alpha")  # must not raise
+
+        self.assertTrue(fired)
+        self.assertGreaterEqual(len(data["observations"]), 20)
+
+    def test_pipe_in_content_survives_roundtrip(self):
+        """Contents are never delimiter-split anywhere in the pipeline."""
+        from src.tools.portability import tool_export_vault, tool_import_vault
+        from src.indexer.store import (
+            create_entity, add_observation, get_entity_by_name, get_observations,
+        )
+
+        fact = "Runs `cat x | grep y | wc -l` in the harness"
+        ent = create_entity("Shell", "concept", "alpha")
+        add_observation(ent.id, fact)
+
+        export_path = Path(self.tmpdir) / "alpha.zip"
+        tool_export_vault("alpha", str(export_path))
+        tool_import_vault(str(export_path), "beta")
+
+        beta = get_entity_by_name("Shell", "beta")
+        obs = get_observations(beta.id)
+        self.assertEqual([o.content for o in obs], [fact])
+
 
 if __name__ == "__main__":
     unittest.main()

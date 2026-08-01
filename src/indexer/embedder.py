@@ -8,9 +8,8 @@ the session outputs a finished `sentence_embedding` tensor directly.
 
 import logging
 import os
-import pathlib
-import sys
 import gc
+import threading
 
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
@@ -66,6 +65,17 @@ class _FastTokenizerWrapper:
 _client: chromadb.ClientAPI | None = None
 _embedding_fn: "GemmaEmbedder | None" = None
 _active_backend: str = "not initialized"
+
+# The embedder and the Chroma client are process-wide singletons whose
+# construction is expensive (a full EmbeddingGemma-300m ONNX session, ~hundreds
+# of MB resident). Every one of store.add_observation(s),
+# store._reembed_entity_observations, calibration.calibrate_collection, the
+# background auto-librarian thread and search all call get_embedding_function()
+# directly, and FastMCP's HTTP transport serves those concurrently — an
+# unsynchronized check-then-set let two callers each build a session, with one
+# leaked and unreferenced. These locks make construction happen exactly once.
+_embedder_lock = threading.Lock()
+_client_lock = threading.Lock()
 
 
 class GemmaEmbedder(EmbeddingFunction[Documents]):
@@ -209,39 +219,54 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         self.backend = "released"
 
 
-def get_embedding_function(role: str = "index", mode: str | None = None) -> GemmaEmbedder:
-    """Get or create the singleton GemmaEmbedder (CPU-only, one instance)."""
+def get_embedding_function() -> GemmaEmbedder:
+    """Get or create the singleton GemmaEmbedder (CPU-only, one instance).
+
+    Thread-safe: the double-checked lock means concurrent first-callers (a
+    search racing a write, say) block on one construction instead of each
+    building — and leaking — their own ONNX session.
+    """
     global _embedding_fn, _active_backend
-    if _embedding_fn is None:
-        _embedding_fn = GemmaEmbedder()
-        _active_backend = _embedding_fn.backend
-    return _embedding_fn
+    fn = _embedding_fn
+    if fn is not None:
+        return fn
+    with _embedder_lock:
+        if _embedding_fn is None:
+            built = GemmaEmbedder()
+            _active_backend = built.backend
+            _embedding_fn = built
+        return _embedding_fn
 
 
-def release_embedding_function(role: str = "index", mode: str | None = None) -> None:
+def release_embedding_function() -> None:
     """Release the embedding singleton."""
     global _embedding_fn, _active_backend
-    if _embedding_fn is not None:
-        try:
-            _embedding_fn.close()
-        finally:
-            _embedding_fn = None
-            _active_backend = "not initialized"
-            gc.collect()
+    with _embedder_lock:
+        if _embedding_fn is not None:
+            try:
+                _embedding_fn.close()
+            finally:
+                _embedding_fn = None
+                _active_backend = "not initialized"
+                gc.collect()
 
 
-def get_active_backend(role: str = "index", mode: str | None = None) -> str:
+def get_active_backend() -> str:
     """Return active backend if initialized, else 'not initialized'."""
     return _active_backend
 
 
 def get_chroma_client() -> chromadb.ClientAPI:
-    """Get or create the singleton ChromaDB PersistentClient."""
+    """Get or create the singleton ChromaDB PersistentClient (thread-safe)."""
     global _client
-    if _client is None:
-        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return _client
+    client = _client
+    if client is not None:
+        return client
+    with _client_lock:
+        if _client is None:
+            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        return _client
 
 
 def get_collection(collection_name: str) -> chromadb.Collection:

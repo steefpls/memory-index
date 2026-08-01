@@ -18,10 +18,11 @@ def _make_entity(eid, name, etype="concept", vault="test"):
 
 
 def _make_obs(oid, entity_id, content, created_at, source="",
-              superseded_by=""):
+              superseded_by="", occurred_at=None):
     obs = Observation(
         id=oid, entity_id=entity_id, content=content,
         source=source, created_at=created_at, superseded_by=superseded_by,
+        occurred_at=occurred_at,
     )
     return obs
 
@@ -258,6 +259,327 @@ class TestPointInTime(unittest.TestCase):
         from src.tools.temporal import tool_point_in_time
         result = tool_point_in_time("Python", "2020-01-01")
         self.assertIn("No observations existed", result)
+
+
+class TestOccurredAt(unittest.TestCase):
+    """Temporal tools order/window on event time when it is known."""
+
+    def setUp(self):
+        self.entities = {
+            "e1": _make_entity("e1", "Python", "technology"),
+            "e2": _make_entity("e2", "Alice", "person"),
+        }
+        # All three were RECORDED on the same late day, but happened years
+        # apart. Only occurred_at can tell them apart.
+        self.observations = {
+            "o1": _make_obs("o1", "e1", "Created in 1991",
+                            "2026-08-01T10:00:00+00:00",
+                            occurred_at="1991-02-20"),
+            "o2": _make_obs("o2", "e1", "Version 3.0 released",
+                            "2026-08-01T10:00:01+00:00",
+                            occurred_at="2008-12-03"),
+            "o3": _make_obs("o3", "e2", "Joined the team",
+                            "2026-08-01T10:00:02+00:00"),
+        }
+
+    def test_effective_at_helper(self):
+        from src.tools.temporal import _obs_effective_at
+        self.assertEqual(_obs_effective_at(self.observations["o1"]), "1991-02-20")
+        self.assertEqual(_obs_effective_at(self.observations["o3"]),
+                         "2026-08-01T10:00:02+00:00")
+
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_orders_by_occurred_at(self, mock_entities, mock_obs, mock_load):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        from src.tools.temporal import tool_query_timeline
+        result = tool_query_timeline(vault="test")
+
+        # Event order (1991, 2008, 2026) — NOT ingestion order, which is
+        # o1, o2, o3 by microseconds but would put them all on 2026-08-01.
+        self.assertLess(result.find("Created in 1991"),
+                        result.find("Version 3.0 released"))
+        self.assertLess(result.find("Version 3.0 released"),
+                        result.find("Joined the team"))
+        # Date grouping uses the event date, not the ingestion date.
+        self.assertIn("[1991-02-20]", result)
+        self.assertIn("[2008-12-03]", result)
+
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_window_uses_occurred_at(self, mock_entities, mock_obs, mock_load):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        from src.tools.temporal import tool_query_timeline
+        result = tool_query_timeline(vault="test", start="1990-01-01",
+                                     end="2000-01-01")
+
+        self.assertIn("Created in 1991", result)
+        self.assertNotIn("Version 3.0 released", result)
+        self.assertNotIn("Joined the team", result)
+
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_falls_back_to_created_at(self, mock_entities, mock_obs, mock_load):
+        """An observation with no occurred_at is windowed on created_at."""
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        from src.tools.temporal import tool_query_timeline
+        result = tool_query_timeline(vault="test", start="2026-01-01")
+
+        self.assertIn("Joined the team", result)
+        self.assertNotIn("Created in 1991", result)
+
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_json_exposes_both_times(self, mock_entities, mock_obs, mock_load):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        from src.tools.temporal import tool_query_timeline
+        data = json.loads(tool_query_timeline(vault="test", output_format="json"))
+        by_content = {i["content"]: i for i in data["timeline"]}
+
+        first = by_content["Created in 1991"]
+        self.assertEqual(first["occurred_at"], "1991-02-20")
+        self.assertEqual(first["created_at"], "2026-08-01T10:00:00+00:00")
+        self.assertEqual(first["effective_at"], "1991-02-20")
+
+        plain = by_content["Joined the team"]
+        self.assertIsNone(plain["occurred_at"])
+        self.assertEqual(plain["effective_at"], plain["created_at"])
+
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_is_an_as_of_knowledge_snapshot(self, mock_entities,
+                                                          mock_obs, mock_load,
+                                                          mock_resolve):
+        """point_in_time answers "what did we KNOW then", so existence is
+        judged on created_at. A fact about 1991 first recorded in 2026 was not
+        knowledge in 1995 and must not appear in a 1995 snapshot."""
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+        mock_resolve.return_value = self.entities["e1"]
+
+        from src.tools.temporal import tool_point_in_time
+        result = tool_point_in_time("Python", "1995-01-01")
+
+        self.assertIn("No observations existed", result)
+
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_shows_occurred_at_facts_once_recorded(
+        self, mock_entities, mock_obs, mock_load, mock_resolve,
+    ):
+        """Once recorded, an occurred_at fact is part of the snapshot — and it
+        is ordered by event time, not ingestion time."""
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+        mock_resolve.return_value = self.entities["e1"]
+
+        from src.tools.temporal import tool_point_in_time
+        result = tool_point_in_time("Python", "2026-08-02")
+
+        self.assertLess(result.find("Created in 1991"),
+                        result.find("Version 3.0 released"))
+
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_supersession_uses_created_at(
+        self, mock_entities, mock_obs, mock_load, mock_resolve,
+    ):
+        """A replacement written AFTER as_of cannot retire its predecessor,
+        even when the replacement's occurred_at is far in the past."""
+        from src.tools.temporal import tool_point_in_time
+
+        mock_entities.update(self.entities)
+        mock_obs.update({
+            "v1": _make_obs("v1", "e1", "Runs on .NET Framework",
+                            "2026-01-05T00:00:00+00:00", superseded_by="v2"),
+            "v2": _make_obs("v2", "e1", "Runs on .NET 8",
+                            "2026-02-05T00:00:00+00:00",
+                            occurred_at="2019-01-01"),
+        })
+        mock_resolve.return_value = self.entities["e1"]
+
+        result = tool_point_in_time("Python", "2026-01-15")
+
+        # As of 2026-01-15 only v1 had been written down.
+        self.assertIn("Runs on .NET Framework", result)
+        self.assertNotIn("Runs on .NET 8", result)
+
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_point_in_time_json_exposes_both_times(self, mock_entities, mock_obs,
+                                                   mock_load, mock_resolve):
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+        mock_resolve.return_value = self.entities["e1"]
+
+        from src.tools.temporal import tool_point_in_time
+        data = json.loads(tool_point_in_time("Python", "2026-12-31",
+                                             output_format="json"))
+        by_content = {o["content"]: o for o in data["observations"]}
+        self.assertEqual(by_content["Created in 1991"]["occurred_at"], "1991-02-20")
+        self.assertEqual(by_content["Created in 1991"]["effective_at"], "1991-02-20")
+
+    @patch("src.tools.temporal.get_neighbors")
+    @patch("src.tools.temporal.get_observations")
+    @patch("src.tools.temporal.get_entity")
+    @patch("src.tools.temporal.resolve_entity")
+    @patch("src.tools.temporal._load_store")
+    def test_temporal_neighbors_anchor_on_occurred_at(
+        self, mock_load, mock_resolve, mock_get_entity, mock_get_obs, mock_neighbors,
+    ):
+        """The anchor and neighbor positions come from event time, so a
+        neighbor recorded LATER but which happened EARLIER counts as 'before'."""
+        target = self.entities["e1"]
+        neighbor = self.entities["e2"]
+        mock_resolve.return_value = target
+        mock_get_entity.return_value = neighbor
+        mock_neighbors.return_value = [{
+            "entity_id": "e2", "relation_type": "knows",
+            "direction": "outgoing", "depth": 1,
+        }]
+
+        # Target happened in 2008; neighbor happened in 1999 but was recorded
+        # first. Ingestion time alone would call the neighbor 'after'.
+        target_obs = [_make_obs("t1", "e1", "Target fact",
+                                "2026-08-01T00:00:00+00:00",
+                                occurred_at="2008-12-03")]
+        neighbor_obs = [_make_obs("n1", "e2", "Neighbor fact",
+                                  "2026-08-02T00:00:00+00:00",
+                                  occurred_at="1999-05-05")]
+
+        def obs_for(eid, *a, **kw):
+            return target_obs if eid == "e1" else neighbor_obs
+        mock_get_obs.side_effect = obs_for
+
+        from src.tools.temporal import tool_get_temporal_neighbors
+        data = json.loads(tool_get_temporal_neighbors(
+            "Python", direction="before", output_format="json"))
+
+        self.assertEqual(data["anchor_time"][:10], "2008-12-03")
+        self.assertEqual(len(data["neighbors"]), 1)
+        self.assertEqual(data["neighbors"][0]["earliest_observation"][:10],
+                         "1999-05-05")
+
+
+class TestTemporalReadsAreSnapshotted(unittest.TestCase):
+    """query_timeline / point_in_time scan a snapshot taken under STORE_LOCK.
+
+    Iterating the live store dicts raced concurrent writes (the auto-librarian
+    thread, concurrent HTTP requests) with "dictionary changed size during
+    iteration". Probed deterministically by injecting a write mid-scan.
+    """
+
+    def setUp(self):
+        self.entities = {"e1": _make_entity("e1", "Python", "technology")}
+        self.observations = {
+            f"o{i}": _make_obs(f"o{i}", "e1", f"fact {i}",
+                               f"2026-03-{10 + i:02d}T00:00:00+00:00")
+            for i in range(10)
+        }
+
+    def _injecting(self, target_dict, real_fn):
+        fired = []
+
+        def probe(obs):
+            if not fired:
+                fired.append(True)
+                for i in range(5):
+                    target_dict[f"injected{i}"] = _make_obs(
+                        f"injected{i}", "e1", f"injected {i}",
+                        "2026-04-01T00:00:00+00:00")
+            return real_fn(obs)
+
+        return probe, fired
+
+    @patch("src.tools.temporal._load_store")
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_timeline_survives_a_write_landing_mid_scan(self, mock_entities,
+                                                        mock_obs, mock_load):
+        import src.tools.temporal as temporal
+
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        probe, fired = self._injecting(mock_obs, temporal._obs_effective_dt)
+        with patch.object(temporal, "_obs_effective_dt", probe):
+            result = temporal.tool_query_timeline(vault="test")  # must not raise
+
+        self.assertTrue(fired)
+        self.assertIn("Timeline", result)
+
+    @patch("src.tools.temporal._observations", new_callable=dict)
+    @patch("src.tools.temporal._entities", new_callable=dict)
+    def test_snapshot_store_returns_copies_taken_under_the_lock(
+        self, mock_entities, mock_obs,
+    ):
+        """Every full-dict scan in this module goes through _snapshot_store."""
+        import threading
+
+        import src.indexer.store as store_mod
+        import src.tools.temporal as temporal
+
+        mock_entities.update(self.entities)
+        mock_obs.update(self.observations)
+
+        self.assertIs(temporal.STORE_LOCK, store_mod.STORE_LOCK)
+
+        # Holding STORE_LOCK from another thread must block the snapshot.
+        result = {}
+        finished = threading.Event()
+        holder_ready = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with store_mod.STORE_LOCK:
+                holder_ready.set()
+                release.wait(5)
+
+        def snapshotter():
+            result["value"] = temporal._snapshot_store()
+            finished.set()
+
+        h = threading.Thread(target=holder)
+        h.start()
+        holder_ready.wait(5)
+
+        s = threading.Thread(target=snapshotter)
+        s.start()
+        self.assertFalse(finished.wait(0.3),
+                         "snapshot was taken without holding STORE_LOCK")
+        release.set()
+        self.assertTrue(finished.wait(5))
+        h.join(5)
+        s.join(5)
+
+        ents, obs = result["value"]
+
+        # Copies, not aliases: later writes cannot mutate a scan in flight.
+        self.assertIsNot(ents, mock_entities)
+        self.assertIsNot(obs, mock_obs)
+        mock_obs["late"] = _make_obs("late", "e1", "late fact",
+                                     "2026-05-01T00:00:00+00:00")
+        self.assertNotIn("late", obs)
 
 
 class TestRRFMerge(unittest.TestCase):

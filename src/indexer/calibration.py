@@ -52,20 +52,38 @@ def _sample_knowledge_queries(collection, n: int = 30) -> list[str]:
 
     Uses the actual stored documents so calibration reflects what's in the vault,
     not a hardcoded assumption about content domain.
+
+    Sampling is uniform across the *whole* collection. `collection.peek(limit=n)`
+    returns the n oldest rows in insertion order, which anchored every threshold
+    to the vault's earliest facts and never moved as the vault grew. Instead we
+    pull the full id list (ids only — cheap, no documents/embeddings) and
+    `random.sample` from it, so calibration tracks the vault's current content.
     """
     total = collection.count()
     if total < _MIN_SAMPLES:
         return _FALLBACK_KNOWLEDGE_QUERIES
 
-    # Peek returns up to `limit` documents from the collection
-    sample_size = min(n, total)
-    results = collection.peek(limit=sample_size)
+    docs: list[str] = []
+    try:
+        all_ids = (collection.get(include=[]) or {}).get("ids") or []
+        if len(all_ids) >= _MIN_SAMPLES:
+            sample_size = min(n, len(all_ids))
+            chosen = random.sample(list(all_ids), sample_size)
+            fetched = collection.get(ids=chosen, include=["documents"]) or {}
+            docs = [d for d in (fetched.get("documents") or []) if d]
+    except Exception as e:
+        logger.warning("Random calibration sampling failed (%s); falling back to peek", e)
+        docs = []
 
-    docs = results.get("documents") or []
+    if len(docs) < _MIN_SAMPLES:
+        # Last resort before hardcoded probes: peek is biased toward the oldest
+        # rows, but real vault content still beats generic queries.
+        results = collection.peek(limit=min(n, total)) or {}
+        docs = [d for d in (results.get("documents") or []) if d]
+
     if len(docs) < _MIN_SAMPLES:
         return _FALLBACK_KNOWLEDGE_QUERIES
 
-    # Shuffle so we don't always get the same subset if vault grows
     random.shuffle(docs)
     return docs[:n]
 
@@ -82,7 +100,7 @@ def calibrate_collection(collection, vault_name: str) -> dict:
     queries read as LOW. Gibberish probes establish the noise floor;
     MEDIUM sits midway between perfect-match and noise.
     """
-    ef = get_embedding_function(role="index")
+    ef = get_embedding_function()
 
     knowledge_queries = _sample_knowledge_queries(collection)
     all_queries = knowledge_queries + _NONSENSE_QUERIES

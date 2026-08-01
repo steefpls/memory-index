@@ -67,7 +67,7 @@ def main() -> int:
             print(f"  {v.name}: {get_collection(v.collection_name).count()} vectors")
         return 0
 
-    ef = get_embedding_function(role="index")
+    ef = get_embedding_function()
     print(f"Embedder backend: {ef.backend}\n")
 
     t0 = time.time()

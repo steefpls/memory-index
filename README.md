@@ -12,26 +12,53 @@ setup.bat
 
 This creates a venv, installs deps, exports the ONNX model (~274MB download on first run), and registers the MCP server.
 
-## Tools (16)
+## Tools (26)
+
+### Entities & observations
 
 | Tool | Purpose |
 |------|---------|
-| `create_entity` | Create entity + optional initial observations |
-| `get_entity` | Entity + observations + relations (shows superseded history) |
-| `update_entity` | Update name/type |
-| `delete_entity` | Soft delete |
-| `list_entities` | Paginated list, filter by vault/type |
-| `add_observation` | Add + embed observation to entity (supports `supersedes` to replace old facts) |
-| `delete_observation` | Remove observation |
-| `create_relation` | Add directed edge in graph |
-| `delete_relation` | Remove edge |
-| `search_memory` | Hybrid vector + graph-boosted search with temporal and superseded filters |
-| `get_neighbors` | Graph traversal from entity |
-| `get_graph_summary` | Stats: counts, components, type distribution |
-| `memory_status` | Health check (backend, counts) |
-| `list_vaults` | Show vaults |
-| `create_vault` | Add new vault |
-| `delete_vault` | Remove vault + all data |
+| `create_entity` | Create a named entity with optional initial observations (`observations` is a list of strings) |
+| `get_entity` | Entity details with observations and relations (current and superseded shown separately) |
+| `update_entity` | Update an entity's name or type |
+| `delete_entity` | Soft delete an entity and its observations |
+| `list_entities` | Paginated list, filter by vault / type |
+| `add_observation` | Add one observation to an entity (supports `supersedes` and `occurred_at`) |
+| `add_observations` | Add multiple observations to one entity in a single call — one embed pass, one write |
+| `delete_observation` | Remove an observation by ID |
+
+### Relations & graph
+
+| Tool | Purpose |
+|------|---------|
+| `create_relation` | Create a directed relation between two entities |
+| `delete_relation` | Remove a relation by ID |
+| `get_neighbors` | Entities connected to a given entity, up to `max_depth` hops |
+| `analyze_graph` | PageRank centrality, Louvain community detection, under-documented entity (knowledge gap) identification |
+| `run_librarian` | Discover knowledge clusters and structural gaps |
+| `visualize_graph` | Generate an interactive graph visualization and open it in a browser |
+| `get_graph_summary` | Node/edge counts, connected components, relation type distribution |
+
+### Search & time
+
+| Tool | Purpose |
+|------|---------|
+| `search_memory` | Observation-level semantic search with calibrated confidence, temporal / type / superseded filters, opt-in graph expansion |
+| `query_timeline` | Observations across a time range, ordered chronologically |
+| `point_in_time` | What was known about an entity as of a given timestamp |
+| `get_temporal_neighbors` | Entities whose observations sit temporally adjacent to a given entity's |
+
+### Vaults, status & portability
+
+| Tool | Purpose |
+|------|---------|
+| `memory_status` | Health check: backend, entity/observation/relation counts per vault |
+| `list_vaults` | List vaults with entity and observation counts |
+| `create_vault` | Create a new vault for isolating a knowledge domain |
+| `delete_vault` | Delete a vault and all its entities, observations, relations, and vectors |
+| `export_vault` | Export a vault to a portable zip archive |
+| `import_vault` | Import a vault export zip into a target vault (additive, lossless — supersede history is preserved) |
+| `vacuum_store` | Hard-remove stale rows left behind by soft-delete semantics |
 
 ## Data Model
 
@@ -53,6 +80,13 @@ add_observation("Perception", "Migrated to .NET 8", supersedes="<old_obs_id>")
 - Use `include_superseded=True` to search historical data
 - `get_entity` shows both current and superseded observations separately
 - Supports supersede chains (v1 -> v2 -> v3)
+- `export_vault` / `import_vault` round-trip superseded rows and remap their pointers, so history survives a migration
+
+### Event time vs write time
+
+Every observation records `created_at` (when it was written). An observation may also carry `occurred_at` — when the fact was actually true — set explicitly at write time. Temporal tools order and window on the *effective* timestamp (`occurred_at` when present, else `created_at`), so backfilled history sorts where it belongs rather than clustering at the import date.
+
+`scripts/backfill_occurred_at.py` infers `occurred_at` for existing observations that contain exactly one unambiguous ISO date in their text. It is dry-run by default; pass `--apply` to write.
 
 ### Temporal Queries
 
@@ -127,7 +161,7 @@ Never duplicate facts. If fact X already lives on entity Y, link via relation �
 
 Observations are embedded individually. A packed observation ("Likes X, works at Y, based in Z") produces one embedding that represents none of those facts well, and semantic search degrades at the fact level.
 
-- One fact per `add_observation` call. Five facts → five calls.
+- One fact per `add_observation` call. Five facts → five calls (or one `add_observations` call with five list items — same granularity, one round trip).
 - No JSON arrays, comma-packed lists, or "consolidated" mega-observations.
 - Self-contained facts may rely on parent entity context — on entity `Alice`, the observation "Based in Singapore" is fine.
 - Cleanup happens via per-observation supersession (`supersedes=<old_id>`), never via bundling.
@@ -158,6 +192,12 @@ Skip writing observations that are:
 - Conversation transcripts or "we discussed X today" notes — record the *outcome*, not the discussion
 - Stale project snapshots ("Project P has N modules as of March") — these rot fast; `git log` is authoritative
 
+### Memory is testimony, not ground truth
+
+A stored observation is a claim someone made at a time, not a verified fact about the present. An observation naming a file, function, config flag, or version number asserts that it existed when the observation was written — nothing more. Before acting on such a memory, verify it: check the path exists, grep for the symbol, read the current config. When a recalled memory conflicts with what you can observe right now, **what you observe wins**, and the stale memory should be superseded rather than left to mislead the next session.
+
+The confidence labels search returns are calibrated distances, not truth values. `HIGH` means "this text is close to your query in embedding space" — it says nothing about whether the claim is still correct.
+
 ### Entity type conventions
 
 Suggested types (free-form strings — no enum enforced):
@@ -170,21 +210,46 @@ Unless the agent is explicitly told otherwise, all operations should target a si
 
 ## Search
 
-1. Embed query with EmbeddingGemma-300m (CPU, ONNX q8)
-2. ChromaDB similarity search across vault(s), with optional temporal + entity type filters
-3. Filter superseded observations (unless `include_superseded=True`)
-4. Deduplicate by entity, merge observations
-5. Graph-boost: expand 1-hop neighbors with lower weight
-6. Score normalization via per-vault calibration thresholds
-7. Return entities + matched observations + confidence
+**The unit of retrieval is the observation, not the entity.** A result is one fact, rendered with its entity as context — not an entity with a sample of its facts attached. Two facts from the same entity are two results and compete on their own merit; a fact from a sparsely-connected entity is not penalized for its neighbourhood.
+
+Pipeline:
+
+1. Embed the query with EmbeddingGemma-300m (CPU, ONNX q8), using the retrieval-query prefix
+2. Query each in-scope vault's ChromaDB collection, applying `entity_type`, `since`, `before`, and superseded filters in the vector store's `where` clause
+3. Flatten every matching observation into one list across vaults and rank it by calibrated relevance score (a strictly decreasing function of distance within a vault, and the only key that compares fairly across vaults when searching all of them)
+4. Gate on the vault's calibrated noise floor — an observation is *above threshold* when its band is anything other than `NO MATCH`
+5. Select results (below)
+6. Optionally expand via the graph (below)
+7. Render as ranked facts grouped under one line of entity context (`text`), or a flat ranked list of observation objects including observation IDs (`json`)
+
+### Top-5 / min-3 selection rule
+
+- If **3 or more** observations clear the threshold, return the top `n_results` of them (default 5). An explicitly smaller `n_results` is honoured.
+- If **fewer than 3** clear it, return the best 3 overall anyway, with their real `LOW` / `NO MATCH` labels intact and a note that the fallback fired.
+
+The floor exists so a search never returns a bare "no results" when the vault does hold something adjacent — the caller sees the near-misses and judges them, rather than being told nothing exists. It is a floor for the threshold-shortfall case, not an override of a caller who asked for fewer results.
+
+### Strategies
+
+- **`semantic`** (default) — vector search only. No graph traversal happens at all.
+- **`associative`** (opt-in) — spreading activation over the relation graph *nominates* candidate entities from the semantic hits' neighbourhood. Nomination is not a score: each nominated entity's observations are then queried with the real query embedding and admitted only if they clear the same threshold as a direct hit. Nothing invents a distance, so a well-connected entity cannot outrank a genuine match, and when no neighbour earns its place `associative` degrades silently to `semantic`.
+
+Reciprocal Rank Fusion is no longer used for merging. RRF is rank-only and therefore has no notion of match quality — a popularity-ranked graph neighbour could outrank a real semantic hit. Scoring graph candidates against the actual query replaced it.
 
 ### Calibration
 
-Confidence thresholds are derived per-vault by sampling real observations as "should match" probes and gibberish as "should not match" probes. This makes scores meaningful regardless of vault content domain.
+Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` reading as `NO MATCH`) are derived per vault: real observations sampled from the vault act as "should match" probes and gibberish strings as "should not match" probes, and the bands are fitted to the gap between the two distributions. This keeps scores meaningful regardless of the vault's content domain.
 
-- Auto-recalibrates every 10 observations per vault (~480ms)
-- Uses second-nearest neighbor distances (sampled observations match themselves at ~0)
-- Falls back to generic probes if vault has < 10 observations
+- Probes are sampled **uniformly at random across the whole collection**, so thresholds track current content instead of anchoring to whatever was written first
+- Auto-recalibrates every 10 observations per vault (~480ms), off the write lock
+- Falls back to generic probes if the vault holds fewer than 10 observations
+- `scripts/recalibrate.py` forces a recalibration pass
+
+## Storage & concurrency
+
+- Entity/observation JSON and the graph JSON are written **atomically** — write to a sibling temp file, `fsync`, then `os.replace` — so a crash mid-write can never truncate the store.
+- All store mutations and reads are guarded by a process-wide `RLock`, so concurrent MCP calls cannot interleave into a lost update. Expensive work (embedding, calibration, clustering) runs *outside* the lock so it never stalls readers.
+- ChromaDB I/O sits outside the lock; only metadata preparation is inside it.
 
 ## Architecture
 
@@ -192,29 +257,51 @@ Forked from [code-index](https://github.com/you/code-index). Same embedding pipe
 
 ```
 src/
-├── server.py              # FastMCP, 16 tool registrations
+├── server.py              # FastMCP, 26 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
-├── hardware.py            # CPU thread detection
 ├── indexer/
-│   ├── embedder.py        # ONNX CPU embedder + ChromaDB client
-│   ├── calibration.py     # Per-vault distance thresholds (sampled probes)
-│   └── store.py           # Entity/observation CRUD + ChromaDB storage + auto-recalibrate
+│   ├── embedder.py        # ONNX CPU embedder singleton + ChromaDB client
+│   ├── calibration.py     # Per-vault distance thresholds (randomly sampled probes)
+│   └── store.py           # Entity/observation CRUD, atomic writes, RLock, auto-recalibrate
 ├── graph/
-│   ├── manager.py         # NetworkX MultiDiGraph, JSON persistence
-│   └── traversal.py       # Neighbors, graph-boost scoring
+│   ├── manager.py         # NetworkX MultiDiGraph, atomic JSON persistence
+│   └── traversal.py       # Neighbors, spreading activation (nomination only)
 ├── models/
-│   ├── entity.py, observation.py, relation.py
+│   ├── entity.py
+│   ├── observation.py     # content, source, created_at, occurred_at, superseded_by
+│   └── relation.py
 └── tools/
-    ├── search.py           # Hybrid vector + graph search + temporal + superseded filters
-    ├── entities.py         # Entity/observation tool impls
-    ├── relations.py        # Relation tool impls
-    └── status.py           # Health check, vault management
+    ├── search.py          # Observation-level ranked search + threshold gate
+    ├── entities.py        # Entity/observation tool impls
+    ├── relations.py       # Relation tool impls
+    ├── temporal.py        # Timeline, point-in-time, temporal neighbors
+    ├── graph_analysis.py  # PageRank, Louvain communities, knowledge gaps
+    ├── librarian.py       # Cluster + gap discovery
+    ├── portability.py     # Vault export/import (lossless supersede history)
+    ├── maintenance.py     # vacuum_store
+    ├── visualize.py       # Interactive HTML graph
+    └── status.py          # Health check, vault management
+
+scripts/
+├── download_model.py         # Fetch/export the EmbeddingGemma ONNX model
+├── recalibrate.py            # Force per-vault threshold recalibration
+├── reembed_all.py            # Re-embed every observation (model change)
+├── backfill_occurred_at.py   # Infer occurred_at from ISO dates in text (dry-run default)
+└── backup_to_drive.py        # Vault backup
 ```
 
 ## Tests
 
+No pytest — the suites are plain `unittest` scripts:
+
 ```bash
-PYTHONPATH=. python -m pytest tests/ -v
+PYTHONPATH=. python tests/test_search.py
 ```
 
-54 tests covering entity CRUD, observation superseding, graph traversal, scoring/calibration, and tool layer.
+Run them all:
+
+```bash
+for f in tests/test_*.py; do PYTHONPATH=. python "$f"; done
+```
+
+194 tests across 9 files, covering entity CRUD and superseding, batched observation writes, atomic-write and concurrency behaviour, observation-level search ranking and threshold selection, graph traversal and analysis, the librarian, temporal queries with event time, vault export/import round-trips, maintenance, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.
