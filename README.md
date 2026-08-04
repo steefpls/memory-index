@@ -12,20 +12,21 @@ setup.bat
 
 This creates a venv, installs deps, exports the ONNX model (~274MB download on first run), and registers the MCP server.
 
-## Tools (26)
+## Tools (27)
 
 ### Entities & observations
 
 | Tool | Purpose |
 |------|---------|
 | `create_entity` | Create a named entity with optional initial observations (`observations` is a list of strings) |
-| `get_entity` | Entity details with observations and relations (current and superseded shown separately) |
+| `get_entity` | Entity details with observations and relations (current and superseded shown separately). `output_format="json"` returns the same data with observation AND relation IDs, for callers that intend to act on individual rows |
 | `update_entity` | Update an entity's name or type |
 | `delete_entity` | Soft delete an entity and its observations |
 | `list_entities` | Paginated list, filter by vault / type |
 | `add_observation` | Add one observation to an entity (supports `supersedes` and `occurred_at`) |
 | `add_observations` | Add multiple observations to one entity in a single call — one embed pass, one write |
-| `delete_observation` | Remove an observation by ID |
+| `delete_observation` | Soft-delete an observation by ID; revives anything it superseded |
+| `undelete_observation` | Restore a soft-deleted observation (re-embeds it; supersession state preserved) |
 
 ### Relations & graph
 

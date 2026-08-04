@@ -96,7 +96,8 @@ def get_entity(name_or_id: str, vault: str = "",
                offset: int = 0, limit: int = 10,
                full: bool = False,
                include_superseded: bool = False,
-               show_ids: bool = False) -> str:
+               show_ids: bool = False,
+               output_format: str = "text") -> str:
     """Get entity details with observations and relations.
 
     Returns header + counts + all relations + the `limit` most recent
@@ -114,11 +115,14 @@ def get_entity(name_or_id: str, vault: str = "",
         full: If True, return every active observation in one call.
         include_superseded: If True, also list superseded observations.
         show_ids: If True, append observation IDs inline (for supersede/delete).
+        output_format: "text" (default) or "json". JSON always carries
+                       observation IDs and relation IDs — use it when you
+                       intend to act on individual rows.
     """
     from src.tools.entities import tool_get_entity
     return tool_get_entity(name_or_id, vault, offset=offset, limit=limit,
                            full=full, include_superseded=include_superseded,
-                           show_ids=show_ids)
+                           show_ids=show_ids, output_format=output_format)
 
 
 @mcp.tool()
@@ -217,11 +221,29 @@ def add_observations(name_or_id: str, contents: list[str],
 def delete_observation(observation_id: str) -> str:
     """Remove an observation by ID.
 
+    Soft delete — undelete_observation restores it. Anything this observation
+    superseded is revived, so deleting a correction reinstates the fact it
+    corrected.
+
     Args:
         observation_id: The observation ID to delete.
     """
     from src.tools.entities import tool_delete_observation
     return tool_delete_observation(observation_id)
+
+
+@mcp.tool()
+def undelete_observation(observation_id: str) -> str:
+    """Restore a deleted observation by ID.
+
+    Supersession state is preserved: undeleting a superseded row restores it
+    as superseded, not as an active fact.
+
+    Args:
+        observation_id: The observation ID to restore.
+    """
+    from src.tools.entities import tool_undelete_observation
+    return tool_undelete_observation(observation_id)
 
 
 # ========== Relation Tools ==========

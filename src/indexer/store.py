@@ -649,17 +649,40 @@ def get_observations(entity_id: str, include_superseded: bool = False) -> list[O
 
 
 def delete_observation(observation_id: str) -> bool:
-    """Soft delete an observation and remove from ChromaDB."""
+    """Soft delete an observation and remove from ChromaDB.
+
+    Anything this row superseded is revived: a supersede chain whose head is
+    deleted would otherwise leave the predecessor hidden forever, pointing at
+    a row that no longer exists. Reviving is the truthful undo — deleting the
+    replacement means the replacement never happened, so the fact it displaced
+    is current again. Revived rows need no re-embed: supersession never removed
+    their vectors, only the store-row join hid them from search.
+    """
+    return delete_observation_detailed(observation_id)[0]
+
+
+def delete_observation_detailed(observation_id: str) -> tuple[bool, list[str]]:
+    """delete_observation, also reporting which observations it revived."""
     _load_store()
     with STORE_LOCK:
         obs = _observations.get(observation_id)
         if obs is None or obs.deleted:
-            return False
+            return False, []
 
         obs.deleted = True
         ent = _entities.get(obs.entity_id)
         vault = ent.vault if ent else None
-        db.upsert_observations([obs])
+
+        touched = [obs]
+        revived: list[str] = []
+        for other in _observations.values():
+            if other.superseded_by == observation_id and not other.deleted:
+                other.superseded_by = ""
+                other.superseded_at = None
+                touched.append(other)
+                revived.append(other.id)
+
+        db.upsert_observations(touched)
 
     # Remove from ChromaDB
     if vault is not None:
@@ -669,7 +692,49 @@ def delete_observation(observation_id: str) -> bool:
         except Exception as e:
             logger.warning("Failed to remove observation from ChromaDB: %s", e)
 
-    return True
+    return True, revived
+
+
+def undelete_observation(observation_id: str) -> Observation | None:
+    """Restore a soft-deleted observation and re-embed it.
+
+    The counterpart to delete_observation, and what makes a delete button in a
+    UI safe: the row was never destroyed, only flagged, so undo is a flag flip
+    plus one embed pass to put the vector back in Chroma. Supersession state is
+    left exactly as it was — undeleting a superseded row restores a superseded
+    row, not an active fact.
+
+    Returns None if the ID is unknown, the row is not deleted, or its entity is
+    gone (an observation cannot outlive its entity).
+    """
+    _load_store()
+    with STORE_LOCK:
+        obs = _observations.get(observation_id)
+        if obs is None or not obs.deleted:
+            return None
+        ent = _entities.get(obs.entity_id)
+        if ent is None or ent.deleted:
+            return None
+
+        obs.deleted = False
+        db.upsert_observations([obs])
+        vault = ent.vault
+        embed_text = _make_embedding_text(ent, obs.content)
+        meta = _obs_metadata(ent, obs)
+
+    try:
+        collection = _get_collection_for_vault(vault)
+        ef = get_embedding_function()
+        collection.upsert(
+            ids=[obs.id],
+            embeddings=ef([embed_text]),
+            documents=[embed_text],
+            metadatas=[meta],
+        )
+    except Exception as e:
+        logger.error("Failed to re-embed undeleted observation: %s", e)
+
+    return obs
 
 
 def _reembed_entity_observations(entity: Entity) -> None:

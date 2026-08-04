@@ -8,6 +8,7 @@ from src.indexer.store import (
     create_entity, get_entity, get_entity_by_name, update_entity,
     delete_entity, list_entities, resolve_entity,
     add_observation, add_observations, get_observations, delete_observation,
+    delete_observation_detailed, undelete_observation,
 )
 from src.graph.manager import get_relations_for_entity, remove_entity_relations
 from src.models.entity import ENTITY_TYPES
@@ -85,11 +86,26 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
             f"  Observations: {obs_count}")
 
 
+def _obs_json(obs) -> dict:
+    """Serialize an observation for output_format='json'."""
+    return {
+        "id": obs.id,
+        "content": obs.content,
+        "source": obs.source or None,
+        "created_at": obs.created_at,
+        "occurred_at": obs.occurred_at,
+        "superseded": obs.is_superseded,
+        "superseded_by": obs.superseded_by or None,
+        "superseded_at": obs.superseded_at,
+    }
+
+
 def tool_get_entity(name_or_id: str, vault: str = "",
                     offset: int = 0, limit: int = 10,
                     full: bool = False,
                     include_superseded: bool = False,
-                    show_ids: bool = False) -> str:
+                    show_ids: bool = False,
+                    output_format: str = "text") -> str:
     """Get entity details with observations and relations.
 
     By default returns header + counts + all relations + the `limit` most
@@ -99,6 +115,11 @@ def tool_get_entity(name_or_id: str, vault: str = "",
     default; pass include_superseded=True to also list them (for full history
     use the temporal tools).
 
+    output_format='json' returns the same data as a machine-readable object —
+    every observation carries its ID (regardless of show_ids) and every
+    relation carries its relation ID, which the text form never prints. Use it
+    when the caller intends to act on individual rows.
+
     Args:
         name_or_id: Entity name or ID.
         vault: Vault name (helps disambiguate names across vaults).
@@ -107,12 +128,19 @@ def tool_get_entity(name_or_id: str, vault: str = "",
         full: If True, return every active observation, ignoring offset/limit.
         include_superseded: If True, also list superseded observations.
         show_ids: If True, append observation IDs inline (for supersede/delete).
+        output_format: "text" (default) or "json".
 
     Returns:
         Entity details with observations and relations.
     """
+    as_json = output_format.strip().lower() == "json"
     entity = resolve_entity(name_or_id, vault or None)
     if entity is None:
+        if as_json:
+            return json.dumps({
+                "error": "not_found",
+                "message": f"Entity not found: '{name_or_id}'",
+            })
         return f"Entity not found: '{name_or_id}'"
 
     obs_active = get_observations(entity.id)
@@ -134,6 +162,38 @@ def tool_get_entity(name_or_id: str, vault: str = "",
         offset_used = max(0, offset)
         limit_used = max(1, limit)
         shown_obs = obs_active[offset_used:offset_used + limit_used]
+
+    if as_json:
+        from src.indexer.store import get_entity as _store_get_entity
+        rel_json = []
+        for rel in relations:
+            outgoing = rel.from_entity == entity.id
+            other_id = rel.to_entity if outgoing else rel.from_entity
+            other_ent = _store_get_entity(other_id)
+            rel_json.append({
+                "id": rel.id,
+                "direction": "out" if outgoing else "in",
+                "other_id": other_id,
+                "other_name": other_ent.name if other_ent else other_id,
+                "type": rel.relation_type,
+                "context": rel.context or None,
+                "weight": rel.weight,
+            })
+        return json.dumps({
+            "entity": {
+                "id": entity.id,
+                "name": entity.name,
+                "type": entity.entity_type,
+                "vault": entity.vault,
+                "created_at": entity.created_at,
+                "updated_at": entity.updated_at,
+            },
+            "observations": [_obs_json(o) for o in shown_obs],
+            "observations_total": obs_total,
+            "observations_offset": offset_used,
+            "superseded": [_obs_json(o) for o in superseded_only],
+            "relations": rel_json,
+        })
 
     obs_summary = f"{obs_total} active obs"
     if superseded_only:
@@ -383,12 +443,37 @@ def tool_add_observations(name_or_id: str, contents: list[str],
 def tool_delete_observation(observation_id: str) -> str:
     """Remove an observation by ID.
 
+    The delete is soft — undelete_observation restores it. Anything this
+    observation superseded is revived, so deleting a correction puts the fact
+    it corrected back in play.
+
     Args:
         observation_id: The observation ID to delete.
 
     Returns:
         Confirmation or error.
     """
-    if delete_observation(observation_id):
-        return f"Observation deleted: {observation_id}"
-    return f"Observation not found: '{observation_id}'"
+    ok, revived = delete_observation_detailed(observation_id)
+    if not ok:
+        return f"Observation not found: '{observation_id}'"
+    msg = f"Observation deleted: {observation_id}"
+    if revived:
+        msg += f", revived {len(revived)} superseded: {', '.join(revived)}"
+    return msg
+
+
+def tool_undelete_observation(observation_id: str) -> str:
+    """Restore a deleted observation by ID.
+
+    Args:
+        observation_id: The observation ID to restore.
+
+    Returns:
+        Confirmation or error.
+    """
+    obs = undelete_observation(observation_id)
+    if obs is None:
+        return (f"Cannot undelete '{observation_id}': unknown ID, not "
+                f"deleted, or its entity is gone.")
+    state = " (still superseded)" if obs.is_superseded else ""
+    return f"Observation restored: {observation_id}{state}"

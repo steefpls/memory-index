@@ -180,6 +180,67 @@ class TestEntityStore(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(len(get_observations(entity.id)), 0)
 
+    def test_undelete_observation_restores_and_reembeds(self):
+        from src.indexer.store import (create_entity, add_observation,
+                                       delete_observation, undelete_observation,
+                                       get_observations)
+
+        entity = create_entity("Python", "technology", "test")
+        obs = add_observation(entity.id, "A fact")
+        delete_observation(obs.id)
+        self.assertEqual(len(get_observations(entity.id)), 0)
+
+        restored = undelete_observation(obs.id)
+        self.assertIsNotNone(restored)
+        self.assertEqual(len(get_observations(entity.id)), 1)
+        # The vector was dropped on delete, so it must go back in.
+        self.assertTrue(self.mock_collection.upsert.called)
+        self.assertIn(obs.id, self.mock_collection.upsert.call_args[1]["ids"])
+
+    def test_undelete_observation_rejects_live_or_unknown(self):
+        from src.indexer.store import (create_entity, add_observation,
+                                       undelete_observation)
+
+        entity = create_entity("Python", "technology", "test")
+        obs = add_observation(entity.id, "A fact")
+        self.assertIsNone(undelete_observation(obs.id))  # not deleted
+        self.assertIsNone(undelete_observation("nope"))
+
+    def test_deleting_a_replacement_revives_what_it_superseded(self):
+        from src.indexer.store import (create_entity, add_observation,
+                                       delete_observation_detailed,
+                                       get_observations)
+
+        entity = create_entity("Project", "project", "test")
+        old = add_observation(entity.id, "Runs on .NET 6")
+        new = add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        ok, revived = delete_observation_detailed(new.id)
+        self.assertTrue(ok)
+        self.assertEqual(revived, [old.id])
+
+        active = get_observations(entity.id)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].id, old.id)
+        self.assertFalse(active[0].is_superseded)
+        self.assertIsNone(active[0].superseded_at)
+
+    def test_undelete_keeps_superseded_rows_superseded(self):
+        from src.indexer.store import (create_entity, add_observation,
+                                       delete_observation, undelete_observation,
+                                       get_observations)
+
+        entity = create_entity("Project", "project", "test")
+        old = add_observation(entity.id, "Runs on .NET 6")
+        add_observation(entity.id, "Migrated to .NET 8", supersedes=old.id)
+
+        delete_observation(old.id)
+        restored = undelete_observation(old.id)
+        self.assertIsNotNone(restored)
+        self.assertTrue(restored.is_superseded)
+        # Restoring history must not resurrect a stale fact as current.
+        self.assertEqual(len(get_observations(entity.id)), 1)
+
     def test_resolve_entity_by_id(self):
         from src.indexer.store import create_entity, resolve_entity
 

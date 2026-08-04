@@ -125,6 +125,91 @@ class TestEntityTools(unittest.TestCase):
         result = tool_delete_entity("Python", vault="test")
         self.assertIn("Deleted", result)
 
+    def test_get_entity_json_carries_ids(self):
+        """JSON output must expose observation AND relation IDs — the text
+        form prints neither reliably, so it can't drive an edit surface."""
+        import json as _json
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_get_entity)
+        from src.tools.relations import tool_create_relation
+
+        tool_create_entity("Python", "technology", "test")
+        tool_create_entity("Django", "technology", "test")
+        tool_add_observation("Python", "Used in ML", vault="test",
+                             source="chat 2026-08-04")
+        tool_create_relation("Django", "Python", "uses", vault="test")
+
+        payload = _json.loads(tool_get_entity("Python", "test",
+                                              output_format="json"))
+        self.assertEqual(payload["entity"]["name"], "Python")
+        self.assertEqual(payload["entity"]["type"], "technology")
+        self.assertEqual(payload["observations_total"], 1)
+        obs = payload["observations"][0]
+        self.assertTrue(obs["id"])
+        self.assertEqual(obs["content"], "Used in ML")
+        self.assertEqual(obs["source"], "chat 2026-08-04")
+        self.assertFalse(obs["superseded"])
+        rel = payload["relations"][0]
+        self.assertTrue(rel["id"])
+        self.assertEqual(rel["direction"], "in")
+        self.assertEqual(rel["type"], "uses")
+        self.assertEqual(rel["other_name"], "Django")
+
+    def test_get_entity_json_separates_superseded(self):
+        import json as _json
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_get_entity)
+
+        tool_create_entity("Python", "technology", "test")
+        first = tool_add_observation("Python", "Old fact", vault="test")
+        old_id = first.split("id=", 1)[1].split(",", 1)[0].strip()
+        tool_add_observation("Python", "New fact", vault="test",
+                             supersedes=old_id)
+
+        payload = _json.loads(tool_get_entity(
+            "Python", "test", include_superseded=True, output_format="json"))
+        self.assertEqual([o["content"] for o in payload["observations"]],
+                         ["New fact"])
+        old = payload["superseded"][0]
+        self.assertEqual(old["id"], old_id)
+        self.assertTrue(old["superseded"])
+        self.assertEqual(old["superseded_by"], payload["observations"][0]["id"])
+        self.assertTrue(old["superseded_at"])
+
+    def test_get_entity_json_not_found(self):
+        import json as _json
+        from src.tools.entities import tool_get_entity
+        payload = _json.loads(tool_get_entity("NonExistent",
+                                              output_format="json"))
+        self.assertEqual(payload["error"], "not_found")
+
+    def test_undelete_observation_tool(self):
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_delete_observation,
+                                        tool_undelete_observation)
+        tool_create_entity("Python", "technology", "test")
+        added = tool_add_observation("Python", "Used in ML", vault="test")
+        obs_id = added.split("id=", 1)[1].split(",", 1)[0].strip()
+
+        self.assertIn("deleted", tool_delete_observation(obs_id))
+        self.assertIn("restored", tool_undelete_observation(obs_id).lower())
+        # Second undelete is a no-op, not a lie.
+        self.assertIn("Cannot undelete", tool_undelete_observation(obs_id))
+
+    def test_delete_observation_tool_reports_revivals(self):
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_delete_observation)
+        tool_create_entity("Python", "technology", "test")
+        first = tool_add_observation("Python", "Old fact", vault="test")
+        old_id = first.split("id=", 1)[1].split(",", 1)[0].strip()
+        second = tool_add_observation("Python", "New fact", vault="test",
+                                      supersedes=old_id)
+        new_id = second.split("id=", 1)[1].split(",", 1)[0].strip()
+
+        result = tool_delete_observation(new_id)
+        self.assertIn("revived 1 superseded", result)
+        self.assertIn(old_id, result)
+
 
 class TestRelationTools(unittest.TestCase):
     """Test relation tool functions."""
