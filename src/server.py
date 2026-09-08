@@ -259,6 +259,11 @@ def create_relation(from_entity: str, to_entity: str,
     else is rejected with the valid list. If nothing fits, use related_to
     and put the nuance in context.
 
+    context is a disambiguator ("the 2024 contract", "which Steven"), not a
+    fact store. It never appears in search results and cannot be superseded,
+    so a fact written here rots where nothing can see or correct it. Facts
+    belong on the entity they are about, as observations.
+
     Canonical types: related_to; part_of, uses, depends_on, involves,
     applies_to, builds_on, replaces, created, maintains; works_at, worked_at,
     works_on, reports_to, leads, founded, funds, friend_of,
@@ -275,6 +280,29 @@ def create_relation(from_entity: str, to_entity: str,
     """
     from src.tools.relations import tool_create_relation
     return tool_create_relation(from_entity, to_entity, relation_type, vault, weight, context)
+
+
+@mcp.tool()
+def update_relation(relation_id: str, context: str | None = None,
+                    weight: float | None = None) -> str:
+    """Edit an existing relation's context or weight in place.
+
+    The relation keeps its ID, endpoints, type and creation date — use this
+    to correct a stale context rather than deleting and recreating the edge,
+    which loses both. Pass context="" to clear it.
+
+    Relation context is a disambiguator, not a fact store: it never appears
+    in search results and cannot be superseded. When you find a fact stored
+    in a context, record it as an observation on the entity it is about,
+    then trim the context down here.
+
+    Args:
+        relation_id: The relation ID to update.
+        context: New context, or None to leave unchanged. "" clears it.
+        weight: New weight (0.0 to 1.0), or None to leave unchanged.
+    """
+    from src.tools.relations import tool_update_relation
+    return tool_update_relation(relation_id, context, weight)
 
 
 @mcp.tool()

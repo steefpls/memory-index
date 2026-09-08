@@ -79,6 +79,36 @@ def add_relation(relation: Relation) -> None:
                 relation.from_entity, relation.relation_type, relation.to_entity)
 
 
+def update_relation(relation_id: str, context: str | None = None,
+                    weight: float | None = None) -> Relation | None:
+    """Edit a relation's context or weight in place.
+
+    The id, endpoints, type and created_at are preserved — this exists so a
+    context can be corrected without the delete-and-recreate that throws the
+    edge's identity and creation date away. Returns the updated relation, or
+    None if no such relation.
+    """
+    with GRAPH_LOCK:
+        graph = _get_graph()
+        rel = _relations.get(relation_id)
+        if rel is None:
+            return None
+
+        if context is not None:
+            rel.context = context
+        if weight is not None:
+            rel.weight = max(0.0, min(1.0, weight))
+
+        edge = graph.get_edge_data(rel.from_entity, rel.to_entity, key=relation_id)
+        if edge is not None:
+            edge["context"] = rel.context
+            edge["weight"] = rel.weight
+
+        db.upsert_relations([rel])
+    logger.info("Updated relation: %s", relation_id)
+    return rel
+
+
 def remove_relation(relation_id: str) -> bool:
     """Remove a relation from the graph."""
     with GRAPH_LOCK:

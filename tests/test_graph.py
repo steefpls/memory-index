@@ -52,6 +52,29 @@ class TestGraphManager(unittest.TestCase):
         self.assertEqual(retrieved.to_entity, "e2")
         self.assertEqual(retrieved.relation_type, "uses")
 
+    def test_update_relation_writes_through(self):
+        from src.graph.manager import add_relation, update_relation, get_relation, _get_graph
+        from src.indexer import db
+        from src.models.relation import Relation
+
+        add_relation(Relation(id="r1", from_entity="e1", to_entity="e2",
+                              relation_type="uses", context="stale claim from 2026"))
+
+        updated = update_relation("r1", context="the 2024 contract", weight=0.5)
+        self.assertEqual(updated.context, "the 2024 contract")
+
+        # In-memory relation, NetworkX edge and SQLite row must all agree.
+        self.assertEqual(get_relation("r1").weight, 0.5)
+        edge = _get_graph().get_edge_data("e1", "e2", key="r1")
+        self.assertEqual(edge["context"], "the 2024 contract")
+        row = [r for r in db.load_relations() if r["id"] == "r1"][0]
+        self.assertEqual(row["context"], "the 2024 contract")
+        self.assertEqual(len(db.load_relations()), 1)
+
+    def test_update_relation_missing_returns_none(self):
+        from src.graph.manager import update_relation
+        self.assertIsNone(update_relation("nope", context="x"))
+
     def test_remove_relation(self):
         from src.graph.manager import add_relation, remove_relation, get_relation
         from src.models.relation import Relation

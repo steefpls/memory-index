@@ -252,6 +252,49 @@ class TestRelationTools(unittest.TestCase):
         result = tool_create_relation("nonexistent", "also_nonexistent", "uses")
         self.assertIn("not found", result)
 
+    def test_dated_context_is_flagged_not_refused(self):
+        from src.tools.entities import tool_create_entity
+        from src.tools.relations import tool_create_relation
+        from src.graph.manager import get_all_relations
+
+        tool_create_entity("Steve", "person", "test")
+        tool_create_entity("Dandy", "organization", "test")
+
+        result = tool_create_relation("Steve", "Dandy", "worked_at", vault="test",
+                                      context="Senior Engineer since March 2026")
+        self.assertIn("Relation created", result)
+        self.assertIn("observation", result)
+        # The warning is advisory — the edge is still written.
+        self.assertEqual(len(get_all_relations()), 1)
+
+    def test_update_relation_preserves_identity(self):
+        from src.tools.entities import tool_create_entity
+        from src.tools.relations import tool_create_relation, tool_update_relation
+        from src.graph.manager import get_all_relations, get_relation
+
+        tool_create_entity("sleep-tracker", "project", "test")
+        tool_create_entity("daemon-hub", "project", "test")
+        tool_create_relation("sleep-tracker", "daemon-hub", "part_of", vault="test",
+                             context="7th fleet service since 2026-07-20")
+
+        rel = get_all_relations()[0]
+        original_id, created_at = rel.id, rel.created_at
+
+        result = tool_update_relation(original_id, context="")
+        self.assertIn("Relation updated", result)
+        self.assertIn("(empty)", result)
+
+        updated = get_relation(original_id)
+        self.assertEqual(updated.context, "")
+        self.assertEqual(updated.created_at, created_at)
+        self.assertEqual(updated.relation_type, "part_of")
+        self.assertEqual(len(get_all_relations()), 1)
+
+    def test_update_relation_missing(self):
+        from src.tools.relations import tool_update_relation
+        self.assertIn("not found", tool_update_relation("nope", context="x"))
+        self.assertIn("Nothing to update", tool_update_relation("nope"))
+
     def test_delete_relation_tool(self):
         from src.tools.entities import tool_create_entity
         from src.tools.relations import tool_create_relation, tool_delete_relation

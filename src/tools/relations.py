@@ -1,17 +1,37 @@
 """Relation CRUD tool implementations."""
 
 import logging
+import re
 
-from src.indexer.store import resolve_entity
-from src.graph.manager import add_relation, remove_relation, get_relation
+from src.indexer.store import get_entity, resolve_entity
+from src.graph.manager import (add_relation, remove_relation, get_relation,
+                               update_relation)
 from src.models.relation import Relation, RELATION_TYPES, canonicalize_relation_type
 
 logger = logging.getLogger(__name__)
+
+# A context carrying a year is almost always a fact rather than a
+# disambiguator. Relation context is invisible to search and has no
+# supersession path, so such claims rot silently — warn, don't refuse.
+_DATED_CONTEXT_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
 
 def _generate_id() -> str:
     import uuid
     return uuid.uuid4().hex[:12]
+
+
+def _context_warning(context: str) -> str:
+    """Flag a context that looks like a stored fact instead of a label."""
+    if not _DATED_CONTEXT_RE.search(context or ""):
+        return ""
+    return (
+        "\n  Note: this context contains a date, so it reads as a fact rather "
+        "than a disambiguator. Relation context never appears in search "
+        "results and cannot be superseded, so a dated claim here goes stale "
+        "invisibly. Record the fact as an observation on the entity it is "
+        "about, and keep the context to what distinguishes this edge."
+    )
 
 
 def tool_create_relation(from_entity: str, to_entity: str,
@@ -23,6 +43,11 @@ def tool_create_relation(from_entity: str, to_entity: str,
     auto-canonicalized (direction-flipped forms like created_by swap the
     endpoints automatically). If nothing fits, use related_to and put the
     nuance in context.
+
+    context is a disambiguator ("the 2024 contract", "which Steven"), not a
+    fact store. It never appears in search results and cannot be superseded,
+    so a fact written here rots where nothing can see or correct it. Facts
+    belong on the entity they are about, as observations.
 
     Canonical types: related_to; part_of, uses, depends_on, involves,
     applies_to, builds_on, replaces, created, maintains; works_at, worked_at,
@@ -79,7 +104,49 @@ def tool_create_relation(from_entity: str, to_entity: str,
         note = (f"\n  (canonicalized from '{normalized}'"
                 + (", direction flipped" if flip else "") + ")")
     return (f"Relation created: {from_ent.name} -[{rel.relation_type}]-> {to_ent.name}\n"
-            f"  ID: {rel.id}{note}")
+            f"  ID: {rel.id}{note}{_context_warning(context)}")
+
+
+def tool_update_relation(relation_id: str, context: str | None = None,
+                         weight: float | None = None) -> str:
+    """Edit an existing relation's context or weight in place.
+
+    The relation keeps its ID, endpoints, type and creation date — use this
+    to correct a stale context rather than deleting and recreating the edge,
+    which loses both. Pass context="" to clear it.
+
+    Args:
+        relation_id: The relation ID to update.
+        context: New context, or None to leave unchanged. "" clears it.
+        weight: New weight (0.0 to 1.0), or None to leave unchanged.
+
+    Returns:
+        Confirmation or error.
+    """
+    if context is None and weight is None:
+        return "Nothing to update: pass context and/or weight."
+
+    before = get_relation(relation_id)
+    if before is None:
+        return f"Relation not found: '{relation_id}'"
+    old_context = before.context
+
+    rel = update_relation(relation_id, context=context, weight=weight)
+    if rel is None:
+        return f"Relation not found: '{relation_id}'"
+
+    from_ent = get_entity(rel.from_entity)
+    to_ent = get_entity(rel.to_entity)
+    from_name = from_ent.name if from_ent else rel.from_entity
+    to_name = to_ent.name if to_ent else rel.to_entity
+
+    lines = [f"Relation updated: {from_name} -[{rel.relation_type}]-> {to_name}",
+             f"  ID: {rel.id}"]
+    if context is not None:
+        lines.append(f"  context: {old_context or '(empty)'} -> {rel.context or '(empty)'}")
+    if weight is not None:
+        lines.append(f"  weight: {rel.weight}")
+    return "\n".join(lines) + _context_warning(rel.context)
 
 
 def tool_delete_relation(relation_id: str) -> str:
