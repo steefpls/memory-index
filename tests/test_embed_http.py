@@ -1,4 +1,4 @@
-"""Tests for POST /embed/<key> (src/embed_http.py).
+"""Tests for POST /embed with Bearer auth (src/embed_http.py).
 
 The real model is never loaded: the endpoint takes its embedder accessor as
 an argument, and these tests hand it a fake that records what it was asked.
@@ -40,25 +40,36 @@ class FakeEmbedder:
 
 def _client(fake, key=KEY):
     handler = make_embed_endpoint(key, get_embedder=lambda: fake, get_backend=lambda: "fake")
-    app = Starlette(routes=[Route("/embed/{key}", handler, methods=["POST"])])
+    app = Starlette(routes=[Route("/embed", handler, methods=["POST"])])
     return TestClient(app)
+
+
+def _post(client, *, key=KEY, **kwargs):
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {key}"
+    return client.post("/embed", headers=headers, **kwargs)
 
 
 class TestEmbedEndpoint(unittest.TestCase):
     def test_wrong_key_is_401(self):
         fake = FakeEmbedder()
-        r = _client(fake).post("/embed/wrongkey", json={"texts": ["a"]})
+        r = _post(_client(fake), key="wrongkey", json={"texts": ["a"]})
         self.assertEqual(r.status_code, 401)
         self.assertEqual(r.json(), {"error": "unauthorized"})
         self.assertEqual(fake.calls, [])
 
     def test_empty_configured_key_never_authorises(self):
-        r = _client(FakeEmbedder(), key="").post("/embed/x", json={"texts": ["a"]})
+        r = _post(_client(FakeEmbedder(), key=""), key="x", json={"texts": ["a"]})
         self.assertEqual(r.status_code, 401)
+
+    def test_missing_or_non_bearer_auth_is_401(self):
+        c = _client(FakeEmbedder())
+        self.assertEqual(c.post("/embed", json={"texts": ["a"]}).status_code, 401)
+        self.assertEqual(c.post("/embed", headers={"Authorization": KEY}, json={"texts": ["a"]}).status_code, 401)
 
     def test_documents_by_default(self):
         fake = FakeEmbedder()
-        r = _client(fake).post(f"/embed/{KEY}", json={"texts": ["hello", "hi"]})
+        r = _post(_client(fake), json={"texts": ["hello", "hi"]})
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["kind"], "document")
@@ -71,26 +82,26 @@ class TestEmbedEndpoint(unittest.TestCase):
 
     def test_query_kind_uses_query_prefix_path(self):
         fake = FakeEmbedder()
-        r = _client(fake).post(f"/embed/{KEY}", json={"texts": ["what did I ask"], "kind": "query"})
+        r = _post(_client(fake), json={"texts": ["what did I ask"], "kind": "query"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(fake.calls, [("query", ["what did I ask"])])
 
     def test_validation(self):
         c = _client(FakeEmbedder())
-        self.assertEqual(c.post(f"/embed/{KEY}", json={"texts": "nope"}).status_code, 400)
-        self.assertEqual(c.post(f"/embed/{KEY}", json={"texts": [1]}).status_code, 400)
-        self.assertEqual(c.post(f"/embed/{KEY}", json={"texts": ["a"], "kind": "x"}).status_code, 400)
-        self.assertEqual(c.post(f"/embed/{KEY}", content=b"not json").status_code, 400)
+        self.assertEqual(_post(c, json={"texts": "nope"}).status_code, 400)
+        self.assertEqual(_post(c, json={"texts": [1]}).status_code, 400)
+        self.assertEqual(_post(c, json={"texts": ["a"], "kind": "x"}).status_code, 400)
+        self.assertEqual(_post(c, content=b"not json").status_code, 400)
         too_many = {"texts": ["a"] * (MAX_TEXTS + 1)}
-        self.assertEqual(c.post(f"/embed/{KEY}", json=too_many).status_code, 413)
+        self.assertEqual(_post(c, json=too_many).status_code, 413)
 
     def test_empty_list_and_blank_text(self):
         fake = FakeEmbedder()
         c = _client(fake)
-        r = c.post(f"/embed/{KEY}", json={"texts": []})
+        r = _post(c, json={"texts": []})
         self.assertEqual(r.json()["vectors"], [])
         self.assertEqual(fake.calls, [])
-        r = c.post(f"/embed/{KEY}", json={"texts": ["", "x" * 10000]})
+        r = _post(c, json={"texts": ["", "x" * 10000]})
         self.assertEqual(r.status_code, 200)
         sent = fake.calls[-1][1]
         self.assertEqual(sent[0], " ")
@@ -101,7 +112,7 @@ class TestEmbedEndpoint(unittest.TestCase):
             def __call__(self, texts):
                 raise RuntimeError("onnx blew up")
 
-        r = _client(Broken()).post(f"/embed/{KEY}", json={"texts": ["a"]})
+        r = _post(_client(Broken()), json={"texts": ["a"]})
         self.assertEqual(r.status_code, 500)
         self.assertIn("RuntimeError", r.json()["error"])
 
@@ -110,8 +121,8 @@ class TestEmbedEndpoint(unittest.TestCase):
             raise TimeoutError("init timed out")
 
         handler = make_embed_endpoint(KEY, get_embedder=not_ready, get_backend=lambda: "not initialized")
-        app = Starlette(routes=[Route("/embed/{key}", handler, methods=["POST"])])
-        r = TestClient(app).post(f"/embed/{KEY}", json={"texts": ["a"]})
+        app = Starlette(routes=[Route("/embed", handler, methods=["POST"])])
+        r = _post(TestClient(app), json={"texts": ["a"]})
         self.assertEqual(r.status_code, 503)
 
     def test_registers_on_fastmcp(self):
@@ -121,7 +132,7 @@ class TestEmbedEndpoint(unittest.TestCase):
         m = FastMCP("t")
         register(m, KEY)
         paths = [getattr(r, "path", None) for r in m._custom_starlette_routes]
-        self.assertIn("/embed/{key}", paths)
+        self.assertIn("/embed", paths)
 
 
 if __name__ == "__main__":

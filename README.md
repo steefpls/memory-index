@@ -282,10 +282,11 @@ An entity that already exists in the target vault is reused and its own timestam
 
 ## Embedding endpoint for other services
 
-When the daemon serves HTTP (`MCP_PORT` + `MCP_API_KEY`), it also answers `POST /embed/<MCP_API_KEY>` so other fleet services can embed text with the model this process already holds, instead of loading a second copy. orchestrator-hub's run search uses it.
+When the daemon serves HTTP (`MCP_PORT` + `MCP_API_KEY`), it also answers Bearer-authenticated `POST /embed` so other fleet services can embed text with the model this process already holds, instead of loading a second copy. orchestrator-hub's run search uses it.
 
 ```
-POST /embed/<key>   {"texts": ["...", ...], "kind": "document" | "query"}
+POST /embed          Authorization: Bearer <key>
+                     {"texts": ["...", ...], "kind": "document" | "query"}
 → 200 {"model": "embeddinggemma-300m", "backend": "ONNX + CPU", "dim": 768, "kind": "document", "vectors": [[...], ...]}
 ```
 
@@ -301,7 +302,7 @@ Forked from [code-index](https://github.com/you/code-index). Same embedding pipe
 src/
 ├── server.py              # FastMCP, 26 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
-├── embed_http.py          # POST /embed/<key> for other services (reuses the loaded model)
+├── embed_http.py          # Bearer-authenticated POST /embed (reuses the loaded model)
 ├── indexer/
 │   ├── db.py              # SQLite DAL (row-level transactions, legacy-JSON auto-migration)
 │   ├── embedder.py        # ONNX CPU embedder singleton + ChromaDB client

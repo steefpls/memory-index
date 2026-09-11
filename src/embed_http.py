@@ -1,4 +1,4 @@
-"""POST /embed/<key> — vectors from the already-loaded embedding model.
+"""POST /embed — vectors from the already-loaded embedding model.
 
 Other fleet services (orchestrator-hub's run search, first) need the same
 embeddings memory-index computes, and loading a second EmbeddingGemma
@@ -14,8 +14,9 @@ Response: {"model": ..., "backend": ..., "dim": 768, "kind": ...,
 embeds a search. Vectors are L2-normalised (the ONNX graph does it), so a
 dot product is the cosine.
 
-Auth is the MCP key as a path segment, like /mcp/<key>; a wrong key gets
-401. Embedding runs in a worker thread, one batch at a time, so a caller
+Auth is the MCP key in ``Authorization: Bearer <key>``; a wrong key gets
+401. Keeping it out of the URL prevents access logs from recording it.
+Embedding runs in a worker thread, one batch at a time, so a caller
 backfilling thousands of texts never blocks the MCP event loop or stacks
 up model runs next to a live search.
 """
@@ -60,7 +61,8 @@ def make_embed_endpoint(
     expected = api_key.encode("utf-8")
 
     async def embed(request: Request) -> JSONResponse:
-        given = str(request.path_params.get("key") or "").encode("utf-8")
+        auth = request.headers.get("authorization", "")
+        given = auth[7:].strip().encode("utf-8") if auth.lower().startswith("bearer ") else b""
         if not expected or not hmac.compare_digest(given, expected):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         body = await request.body()
@@ -114,5 +116,5 @@ def make_embed_endpoint(
 
 
 def register(mcp: Any, api_key: str) -> None:
-    """Add POST /embed/{key} to a FastMCP server's HTTP app."""
-    mcp.custom_route("/embed/{key}", methods=["POST"], name="embed")(make_embed_endpoint(api_key))
+    """Add the Bearer-authenticated POST /embed route."""
+    mcp.custom_route("/embed", methods=["POST"], name="embed")(make_embed_endpoint(api_key))
