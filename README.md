@@ -280,6 +280,19 @@ An entity that already exists in the target vault is reused and its own timestam
 
 **What an archive does not contain:** vectors, and the SQLite file itself. Restore re-embeds every observation and recalibrates the vault, so recovery is correct but slow (minutes, CPU-bound) rather than instant. `occurred_at` and all supersede chains survive; nothing about the graph or the facts is lost.
 
+## Embedding endpoint for other services
+
+When the daemon serves HTTP (`MCP_PORT` + `MCP_API_KEY`), it also answers `POST /embed/<MCP_API_KEY>` so other fleet services can embed text with the model this process already holds, instead of loading a second copy. orchestrator-hub's run search uses it.
+
+```
+POST /embed/<key>   {"texts": ["...", ...], "kind": "document" | "query"}
+→ 200 {"model": "embeddinggemma-300m", "backend": "ONNX + CPU", "dim": 768, "kind": "document", "vectors": [[...], ...]}
+```
+
+- `kind` picks the prefix the model expects: `document` (default, how observations are stored) or `query` (how searches are embedded). Vectors are L2-normalised, so a dot product is the cosine.
+- At most 64 texts per call, each clipped to 8,000 characters. A wrong key is 401, a model still loading is 503.
+- Batches run in a worker thread, one at a time, so a bulk caller never blocks the MCP event loop or piles model runs up next to a live search.
+
 ## Architecture
 
 Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline shape, simplified to CPU-only; the model was swapped from CodeRankEmbed (a code retriever) to google/embeddinggemma-300m (768-dim, ONNX q8) for natural-language memory retrieval.
@@ -288,6 +301,7 @@ Forked from [code-index](https://github.com/you/code-index). Same embedding pipe
 src/
 ├── server.py              # FastMCP, 26 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
+├── embed_http.py          # POST /embed/<key> for other services (reuses the loaded model)
 ├── indexer/
 │   ├── db.py              # SQLite DAL (row-level transactions, legacy-JSON auto-migration)
 │   ├── embedder.py        # ONNX CPU embedder singleton + ChromaDB client

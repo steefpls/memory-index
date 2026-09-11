@@ -676,6 +676,10 @@ def _configure_http_transport(port: int, api_key: str) -> None:
     mcp.settings.streamable_http_path = f"/mcp/{api_key}"
     mcp.settings.json_response = True
     mcp.settings.stateless_http = True
+    # POST /embed/<key>: lends the loaded model to other fleet services
+    # (orchestrator-hub's run search) so they don't load a second copy.
+    from src.embed_http import register as register_embed
+    register_embed(mcp, api_key)
     print(
         f"[memory-index] HTTP daemon listening on http://{mcp.settings.host}:{port}/mcp/<api_key>",
         file=sys.stderr,
