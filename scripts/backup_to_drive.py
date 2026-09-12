@@ -18,6 +18,7 @@ from Windows\\System32\\config\\systemprofile by mistake.
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,6 +33,12 @@ LOG_FILE = PROJECT_ROOT / "data" / "backup.log"
 LOCAL_RETENTION_DAYS = 7
 DRIVE_RETENTION_DAYS = 30
 DRIVE_FOLDER_NAME = "memory-index-backups"
+
+# Drive phase (auth + upload + prune) retries: a transient network/Drive
+# blip must not cost a whole day's backup — the task runs once daily with
+# no scheduler-level retry. Backoff is linear: 30s, 60s on attempts 1, 2.
+DRIVE_MAX_ATTEMPTS = 3
+DRIVE_RETRY_BASE_S = 30.0
 
 # Hardcoded — Path.home() resolves wrong under SYSTEM (points to
 # C:\Windows\System32\config\systemprofile). Server is one specific
@@ -164,20 +171,40 @@ def prune_local_exports() -> int:
     return removed
 
 
+def _drive_phase(local_path: Path) -> None:
+    """Auth + upload + Drive prune. Raises on failure; safe to retry —
+    a retried run may leave a same-name duplicate zip on Drive, which is
+    harmless (both copies are valid; 30d prune ages them out together)."""
+    service = get_drive_service()
+    folder_id = ensure_drive_folder(service)
+    upload_to_drive(service, folder_id, local_path)
+    upload_oauth_snapshot(service, folder_id)
+    prune_drive_backups(service, folder_id)
+
+
 def main() -> int:
     try:
         local_path = export_vault_local()
-        service = get_drive_service()
-        folder_id = ensure_drive_folder(service)
-        upload_to_drive(service, folder_id, local_path)
-        upload_oauth_snapshot(service, folder_id)
-        prune_drive_backups(service, folder_id)
-        prune_local_exports()
-        log.info("Daily backup complete.")
-        return 0
     except Exception:
         log.exception("Backup failed")
         return 1
+    for attempt in range(1, DRIVE_MAX_ATTEMPTS + 1):
+        try:
+            _drive_phase(local_path)
+            break
+        except Exception as e:
+            if attempt >= DRIVE_MAX_ATTEMPTS:
+                log.exception("Backup failed")
+                return 1
+            delay = DRIVE_RETRY_BASE_S * attempt
+            log.warning(
+                "Drive phase failed (attempt %d/%d): %s — retrying in %.0fs",
+                attempt, DRIVE_MAX_ATTEMPTS, e, delay,
+            )
+            time.sleep(delay)
+    prune_local_exports()
+    log.info("Daily backup complete.")
+    return 0
 
 
 if __name__ == "__main__":
