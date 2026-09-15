@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 # on their own side too.
 EMBED_BATCH_SIZE = 32
 
+# Upper bound on rows*cols per ONNX session run. Padding expands every row
+# to the longest in its chunk, so one 2000-token observation inside a
+# 32-row batch means 32x2048 cells through a 300M model — that OOM-killed
+# the daemon a second time (batch 8/29, again with no traceback) after
+# count-only batching was already in place. Chunking by cells bounds
+# attention memory no matter how long individual texts are.
+_EMBED_CELL_BUDGET = 8192
+
 
 class _FastTokenizerWrapper:
     """Lightweight tokenizer using the `tokenizers` library directly.
@@ -172,20 +180,53 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
     def _onnx_embed(self, texts: list[str]) -> list[list[float]]:
         """Embed texts via ONNX Runtime CPU. The graph pools and normalizes.
 
-        Large inputs run as sequential EMBED_BATCH_SIZE chunks: one giant
-        batch (hundreds of rows) blows CPU RAM inside a single session run
-        and has OOM-killed the daemon with no traceback. Small callers take
-        the single-batch fast path unchanged.
+        Large inputs run as sequential bounded chunks: one giant batch
+        (hundreds of rows, or a few rows padded out by one monster text)
+        blows CPU RAM inside a single session run and has twice OOM-killed
+        the daemon with no traceback. Small callers take the single-batch
+        fast path unchanged. Returned embeddings align with the input order.
         """
         if not texts:
             return []
 
-        if len(texts) > EMBED_BATCH_SIZE:
-            results: list[list[float]] = []
-            for start in range(0, len(texts), EMBED_BATCH_SIZE):
-                results.extend(self._onnx_embed_batch(texts[start:start + EMBED_BATCH_SIZE]))
-            return results
-        return self._onnx_embed_batch(texts)
+        lengths = self._embed_lengths(texts)
+        # Greedy pack, input order preserved: a chunk closes when adding the
+        # next row would breach the row cap or the cell budget.
+        chunks: list[list[int]] = []
+        cur: list[int] = []
+        cur_max = 0
+        for idx, ln in enumerate(lengths):
+            ln = max(int(ln), 1)
+            if cur and (len(cur) + 1 > EMBED_BATCH_SIZE
+                        or (len(cur) + 1) * max(cur_max, ln) > _EMBED_CELL_BUDGET):
+                chunks.append(cur)
+                cur = []
+                cur_max = 0
+            cur.append(idx)
+            cur_max = max(cur_max, ln)
+        if cur:
+            chunks.append(cur)
+
+        if len(chunks) == 1 and len(chunks[0]) == len(texts):
+            return self._onnx_embed_batch(list(texts))
+
+        out: list[list[float] | None] = [None] * len(texts)
+        for chunk in chunks:
+            embs = self._onnx_embed_batch([texts[i] for i in chunk])
+            for pos, emb in zip(chunk, embs):
+                out[pos] = emb
+        return [e for e in out if e is not None]
+
+    def _embed_lengths(self, texts: list[str]) -> list[int]:
+        """Truncated token length per text (no padding, no inference)."""
+        tok = self._tokenizer
+        if isinstance(tok, _FastTokenizerWrapper):
+            tok._tok.enable_truncation(max_length=EMBED_MAX_TOKENS)
+            tok._tok.no_padding()
+            return [len(e.ids) for e in tok._tok.encode_batch(list(texts))]
+        enc = tok(list(texts), padding=False, truncation=True,
+                  max_length=EMBED_MAX_TOKENS)["input_ids"]
+        return [len(row) for row in enc]
 
     def _onnx_embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Run one bounded inference batch through the ONNX session."""

@@ -176,6 +176,33 @@ class TestOnnxBatching(unittest.TestCase):
         self.assertEqual(e._onnx_embed([]), [])
         self.assertEqual(seen, [])
 
+    def test_cell_budget_isolates_long_texts_and_preserves_order(self):
+        """One monster text must not drag its whole chunk down with it
+        (padding expands every row to the longest): it gets a small chunk,
+        and returned embeddings still align with input order."""
+        import src.indexer.embedder as emb_mod
+        e, _ = self._embedder_with_fake_session()
+
+        lengths = [50] * 5 + [2000] + [50] * 64
+        e._embed_lengths = lambda texts: lengths[:len(texts)]
+
+        batch_rows = []
+
+        def fake_batch(chunk):
+            batch_rows.append(len(chunk))
+            return [[float(t[1:])] for t in chunk]
+
+        e._onnx_embed_batch = fake_batch
+        out = e._onnx_embed([f"t{i}" for i in range(70)])
+
+        # Order preserved: out[i] is the embedding of input i.
+        self.assertEqual([row[0] for row in out], [float(i) for i in range(70)])
+        # The 2000-token row sits in a small chunk, not a 32-row one.
+        for b, chunk_size in enumerate(batch_rows):
+            self.assertLessEqual(chunk_size, 32, f"chunk {b} too big")
+        long_chunk = [n for n in batch_rows if n <= 4]
+        self.assertTrue(long_chunk, f"no small chunk isolated the long text: {batch_rows}")
+
 
 if __name__ == "__main__":
     unittest.main()
