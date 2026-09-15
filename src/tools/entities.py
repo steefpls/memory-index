@@ -6,7 +6,8 @@ import logging
 from src.config import VAULTS, get_vault, create_vault as config_create_vault
 from src.indexer.store import (
     create_entity, get_entity, get_entity_by_name, update_entity,
-    reembed_entity, delete_entity, list_entities, resolve_entity,
+    reembed_entity, start_reembed, get_reembed_status, REEMBED_BG_THRESHOLD,
+    delete_entity, list_entities, resolve_entity,
     add_observation, add_observations, get_observations, delete_observation,
     delete_observation_detailed, undelete_observation,
 )
@@ -272,10 +273,32 @@ def tool_update_entity(name_or_id: str, new_name: str = "",
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
+    new_name_clean = new_name.strip() if new_name else None
+    new_type_clean = new_type.strip().lower() if new_type else None
+
+    # Big entities re-embed in the background: the vector refresh takes
+    # minutes of CPU, and holding the caller that long hangs clients and
+    # starves health checks. The rename itself still applies synchronously.
+    if new_name_clean is not None or new_type_clean is not None:
+        if len(get_observations(entity.id)) > REEMBED_BG_THRESHOLD:
+            updated, _ = update_entity(
+                entity.id, name=new_name_clean, entity_type=new_type_clean,
+                reembed=False,
+            )
+            if updated is None:
+                return "Error: update failed."
+            accepted, detail = start_reembed(entity.id)
+            base = (f"Entity updated: {updated.name} ({updated.entity_type}), "
+                    f"ID: {updated.id}")
+            if accepted:
+                return f"{base} — {detail}"
+            return (f"{base} — rename applied, but {detail}. "
+                    f"Run reembed_entity for '{updated.name}' when it finishes.")
+
     updated, (reembedded, failed) = update_entity(
         entity.id,
-        name=new_name.strip() if new_name else None,
-        entity_type=new_type.strip().lower() if new_type else None,
+        name=new_name_clean,
+        entity_type=new_type_clean,
     )
     if updated is None:
         return "Error: update failed."
@@ -293,8 +316,9 @@ def tool_reembed_entity(name_or_id: str, vault: str = "") -> str:
     """Re-embed all active observations of an entity without changing it.
 
     Repair path for vectors left stale by a re-embed that died midway, or
-    for retrying batches a previous run logged as failed. Progress is logged
-    per batch in the daemon log.
+    for retrying batches a previous run logged as failed. Big entities run
+    in the background (see reembed_status()); progress is logged per batch
+    in the daemon log either way.
 
     Args:
         name_or_id: Entity name or ID.
@@ -304,6 +328,13 @@ def tool_reembed_entity(name_or_id: str, vault: str = "") -> str:
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
+    if len(get_observations(entity.id)) > REEMBED_BG_THRESHOLD:
+        accepted, detail = start_reembed(entity.id)
+        if accepted:
+            return detail
+        return (f"{detail}. Run reembed_entity for '{entity.name}' "
+                f"when it finishes.")
+
     _, (reembedded, failed) = reembed_entity(entity.id)
     result = (f"Re-embedded {reembedded} observations for '{entity.name}' "
               f"(ID: {entity.id})")
@@ -311,6 +342,26 @@ def tool_reembed_entity(name_or_id: str, vault: str = "") -> str:
         result += (f" — {failed} failed, see daemon log for the batch; "
                    f"re-run reembed_entity to retry")
     return result
+
+
+def tool_reembed_status() -> str:
+    """Report the background re-embed job: running progress or last result."""
+    st = get_reembed_status()
+    if st["running"]:
+        return (f"Re-embed running for '{st['entity_name']}': batch "
+                f"{st['batch']}/{st['batches']} "
+                f"({st['done']}/{st['total']} obs, {st['failed']} failed, "
+                f"{st['elapsed_s']}s elapsed). Per-batch progress is also in "
+                f"the daemon log.")
+    if st["started_at"] is None:
+        return "No re-embed has run since startup."
+    out = (f"Last re-embed for '{st['entity_name']}': {st['done']} ok, "
+           f"{st['failed']} failed, {st['total']} total in {st['elapsed_s']}s.")
+    if st["error"]:
+        out += f" It died midway: {st['error']} — re-run reembed_entity."
+    elif st["failed"]:
+        out += " Re-run reembed_entity to retry the failed batches."
+    return out
 
 
 def tool_delete_entity(name_or_id: str, vault: str = "") -> str:

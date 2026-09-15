@@ -35,6 +35,18 @@ _LIBRARIAN_EVERY = 10    # auto-run librarian after every N observations per vau
 # completed batch instead of losing the whole re-embed.
 _REEMBED_BATCH_SIZE = 32
 
+# Entities with more active observations than this re-embed in a background
+# worker instead of the calling request: ~64 obs is ~25s of CPU-bound ONNX,
+# past which the caller hangs and — worse — the saturated event loop stops
+# answering health checks (a 923-obs inline re-embed paged the watchdog for
+# ~5 min). Small entities stay synchronous so callers get exact counts back.
+REEMBED_BG_THRESHOLD = 64
+
+# Breather between batches (not after the last): yields CPU so the event
+# loop keeps answering the watchdog during long re-embeds, foreground or
+# background.
+_REEMBED_BREATHER_S = 1.5
+
 logger = logging.getLogger(__name__)
 
 # In-memory entity and observation stores, keyed by entity ID
@@ -196,11 +208,14 @@ def get_entity_by_name(name: str, vault: str) -> Entity | None:
 
 
 def update_entity(entity_id: str, name: str | None = None,
-                  entity_type: str | None = None) -> tuple[Entity | None, tuple[int, int]]:
+                  entity_type: str | None = None, reembed: bool = True
+                  ) -> tuple[Entity | None, tuple[int, int]]:
     """Update an entity's name or type.
 
     Returns (entity or None, (re-embedded count, failed count)). The counts
-    are (0, 0) when nothing needed re-embedding.
+    are (0, 0) when nothing needed re-embedding. Pass reembed=False to apply
+    the rename without refreshing vectors — the caller takes responsibility
+    for running the re-embed (e.g. in a background job).
     """
     _load_store()
     with STORE_LOCK:
@@ -219,7 +234,7 @@ def update_entity(entity_id: str, name: str | None = None,
     # Re-embed all observations if entity name/type changed. Done outside the
     # lock — it's an embedder round-trip, not a store mutation.
     stats = (0, 0)
-    if name is not None or entity_type is not None:
+    if reembed and (name is not None or entity_type is not None):
         stats = _reembed_entity_observations(ent)
 
     return ent, stats
@@ -767,8 +782,10 @@ def undelete_observation(observation_id: str) -> Observation | None:
     return obs
 
 
-def _reembed_entity_observations(entity: Entity) -> tuple[int, int]:
-    """Re-embed all active observations for an entity (after name/type change).
+def _reembed_entity_observations(entity: Entity,
+                                   obs_list: list | None = None,
+                                   on_batch=None) -> tuple[int, int]:
+    """Re-embed an entity's active observations (after name/type change).
 
     Works in small _REEMBED_BATCH_SIZE batches, each embedded and upserted on
     its own: a rename of a big entity no longer feeds ~1000 texts to the ONNX
@@ -776,12 +793,18 @@ def _reembed_entity_observations(entity: Entity) -> tuple[int, int]:
     traceback), and a midway crash keeps every batch upserted so far.
 
     Progress is logged per batch, so a rename is visible in the daemon log
-    instead of silent for minutes. One bad batch is logged and skipped rather
-    than aborting the batches after it.
+    instead of silent for minutes. A short breather between batches yields
+    CPU so health checks keep getting answered. One bad batch is logged and
+    skipped rather than aborting the batches after it.
+
+    `obs_list` overrides the live fetch (background jobs pass a frozen
+    snapshot); `on_batch(done, failed, batch_idx, n_batches)` reports
+    progress to the background-job tracker.
 
     Returns (re-embedded count, failed count).
     """
-    obs_list = get_observations(entity.id)
+    if obs_list is None:
+        obs_list = get_observations(entity.id)
     total = len(obs_list)
     if not total:
         return 0, 0
@@ -817,13 +840,122 @@ def _reembed_entity_observations(entity: Entity) -> tuple[int, int]:
             logger.error("Re-embed '%s': batch %d/%d failed (%d obs skipped): %s",
                          entity.name, i + 1, n_batches, len(chunk), e)
             continue
+        finally:
+            if on_batch is not None:
+                on_batch(ok, failed, i + 1, n_batches)
         logger.info("Re-embed '%s': batch %d/%d done (%d/%d obs, %.1fs elapsed)",
                     entity.name, i + 1, n_batches, ok + failed, total,
                     time.perf_counter() - t0)
+        if i + 1 < n_batches:
+            time.sleep(_REEMBED_BREATHER_S)
 
     logger.info("Re-embed '%s' complete: %d ok, %d failed, %d total in %.1fs",
                 entity.name, ok, failed, total, time.perf_counter() - t0)
     return ok, failed
+
+
+# --- Background re-embed jobs ---
+#
+# Big entities re-embed in a worker thread so the calling request returns at
+# once instead of hanging for minutes. One job at a time: a second request
+# while one runs is refused (the rename itself still applies — only the
+# vector refresh waits). State is in-memory; a restart mid-job loses the
+# tracker but keeps every upserted batch, and re-running reembed_entity
+# finishes the rest.
+
+_REEMBED_LOCK = threading.Lock()
+_REEMBED_STATUS: dict = {
+    "running": False,
+    "entity_id": None,
+    "entity_name": None,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "batch": 0,
+    "batches": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+
+def get_reembed_status() -> dict:
+    """Snapshot of the background re-embed tracker (a copy)."""
+    with _REEMBED_LOCK:
+        st = dict(_REEMBED_STATUS)
+    if st["started_at"] is not None:
+        end = st["finished_at"] or time.time()
+        st["elapsed_s"] = round(end - st["started_at"], 1)
+    else:
+        st["elapsed_s"] = 0.0
+    return st
+
+
+def start_reembed(entity_id: str) -> tuple[bool, str]:
+    """Start a background re-embed of an entity's active observations.
+
+    Returns (accepted, message). When refused, the message says what is
+    already running — the caller (rename) has already applied, only the
+    vector refresh is pending.
+    """
+    _load_store()
+    with STORE_LOCK:
+        ent = _entities.get(entity_id)
+        if ent is None or ent.deleted:
+            return False, f"Entity not found: '{entity_id}'"
+        # Frozen snapshot: the job must not see a later rename halfway.
+        snap = {"id": ent.id, "name": ent.name,
+                "entity_type": ent.entity_type, "vault": ent.vault}
+        obs = [o for o in _observations.values()
+               if o.entity_id == entity_id and not o.deleted
+               and not o.is_superseded]
+
+    with _REEMBED_LOCK:
+        if _REEMBED_STATUS["running"]:
+            cur = _REEMBED_STATUS["entity_name"]
+            return False, (f"Re-embed for '{cur}' is already running "
+                           f"({_REEMBED_STATUS['done']}/{_REEMBED_STATUS['total']} obs) — "
+                           f"check reembed_status() and retry when it finishes")
+        _REEMBED_STATUS.update(
+            running=True, entity_id=snap["id"], entity_name=snap["name"],
+            total=len(obs), done=0, failed=0, batch=0,
+            batches=(len(obs) + _REEMBED_BATCH_SIZE - 1) // _REEMBED_BATCH_SIZE,
+            started_at=time.time(), finished_at=None, error=None,
+        )
+
+    if not obs:
+        with _REEMBED_LOCK:
+            _REEMBED_STATUS.update(running=False, finished_at=time.time())
+        return True, f"No active observations to re-embed for '{snap['name']}'"
+
+    import types
+    frozen = types.SimpleNamespace(**snap)
+    threading.Thread(
+        target=_reembed_worker, args=(frozen, obs),
+        daemon=True, name=f"memory-index-reembed-{snap['id'][:8]}",
+    ).start()
+    return True, (f"Re-embed started in background for '{snap['name']}': "
+                  f"{len(obs)} observations in {_REEMBED_STATUS['batches']} batches — "
+                  f"watch progress with reembed_status()")
+
+
+def _reembed_worker(entity, obs_list: list) -> None:
+    """Thread body for a background re-embed. Never raises."""
+    try:
+        def on_batch(ok: int, failed: int, batch: int, batches: int) -> None:
+            with _REEMBED_LOCK:
+                _REEMBED_STATUS.update(done=ok, failed=failed,
+                                       batch=batch, batches=batches)
+
+        _reembed_entity_observations(entity, obs_list=obs_list, on_batch=on_batch)
+    except Exception as e:  # noqa: BLE001 — must not kill the thread silently
+        logger.error("Background re-embed for entity %s died: %s",
+                     getattr(entity, "id", "?"), e)
+        with _REEMBED_LOCK:
+            _REEMBED_STATUS["error"] = str(e)[:300]
+    finally:
+        with _REEMBED_LOCK:
+            _REEMBED_STATUS.update(running=False, finished_at=time.time())
 
 
 # --- Stats ---

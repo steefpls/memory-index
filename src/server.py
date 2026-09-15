@@ -157,6 +157,17 @@ def reembed_entity(name_or_id: str, vault: str = "") -> str:
 
 
 @mcp.tool()
+def reembed_status() -> str:
+    """Report the background re-embed job: running progress or last result.
+
+    Big renames and re-embeds run in a worker thread so the caller returns
+    at once; poll this to follow progress instead of holding the request.
+    """
+    from src.tools.entities import tool_reembed_status
+    return tool_reembed_status()
+
+
+@mcp.tool()
 def delete_entity(name_or_id: str, vault: str = "") -> str:
     """Soft delete an entity and its observations.
 

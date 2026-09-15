@@ -40,6 +40,11 @@ class TestEntityStore(unittest.TestCase):
         store_mod._entities = {}
         store_mod._observations = {}
         store_mod._loaded = True  # skip file load
+        store_mod._REEMBED_STATUS.update(
+            running=False, entity_id=None, entity_name=None,
+            total=0, done=0, failed=0, batch=0, batches=0,
+            started_at=None, finished_at=None, error=None,
+        )
 
         # Create a test vault
         import src.config as config_mod
@@ -206,6 +211,70 @@ class TestEntityStore(unittest.TestCase):
         ent, stats = reembed_entity("nope")
         self.assertIsNone(ent)
         self.assertEqual(stats, (0, 0))
+
+    def test_start_reembed_runs_in_background_with_guard(self):
+        """start_reembed returns at once while the job runs; a second job
+        is refused until the first finishes; status tracks progress."""
+        import threading
+        import time as time_mod
+        from src.indexer.store import (
+            create_entity, start_reembed, get_reembed_status)
+
+        entity = create_entity("Big", "project", "test",
+                               observations=[f"fact {i}" for i in range(5)])
+
+        gate = threading.Event()
+
+        def slow_ef(texts):
+            self.assertTrue(gate.wait(15), "worker never started")
+            return [[0.1] * 768 for _ in texts]
+
+        self.mock_ef.side_effect = slow_ef
+
+        accepted, msg = start_reembed(entity.id)
+        self.assertTrue(accepted)
+        self.assertIn("background", msg)
+
+        st = get_reembed_status()
+        self.assertTrue(st["running"])
+        self.assertEqual(st["entity_id"], entity.id)
+        self.assertEqual(st["total"], 5)
+
+        refused, reason = start_reembed(entity.id)
+        self.assertFalse(refused)
+        self.assertIn("already running", reason)
+
+        gate.set()
+        deadline = time_mod.time() + 15
+        while get_reembed_status()["running"] and time_mod.time() < deadline:
+            time_mod.sleep(0.05)
+        final = get_reembed_status()
+        self.assertFalse(final["running"])
+        self.assertEqual(final["done"], 5)
+        self.assertEqual(final["failed"], 0)
+        self.assertIsNone(final["error"])
+
+    def test_start_reembed_unknown_id(self):
+        from src.indexer.store import start_reembed
+
+        accepted, msg = start_reembed("nope")
+        self.assertFalse(accepted)
+        self.assertIn("not found", msg)
+
+    def test_reembed_breather_sleeps_between_batches_only(self):
+        """The CPU breather fires between batches, never after the last."""
+        from unittest.mock import patch
+        from src.indexer.store import create_entity, update_entity
+
+        entity = create_entity("Big", "project", "test",
+                               observations=[f"fact {i}" for i in range(70)])
+        self.mock_ef.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+
+        with patch("time.sleep") as mock_sleep:
+            updated, (ok, failed) = update_entity(entity.id, name="Bigger")
+        self.assertEqual((ok, failed), (70, 0))
+        # 3 batches -> 2 breathers.
+        self.assertEqual(mock_sleep.call_count, 2)
 
     def test_delete_entity(self):
         from src.indexer.store import create_entity, delete_entity, get_entity

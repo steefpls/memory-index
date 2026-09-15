@@ -28,6 +28,11 @@ def _reset_state():
     store_mod._entities = {}
     store_mod._observations = {}
     store_mod._loaded = True
+    store_mod._REEMBED_STATUS.update(
+        running=False, entity_id=None, entity_name=None,
+        total=0, done=0, failed=0, batch=0, batches=0,
+        started_at=None, finished_at=None, error=None,
+    )
 
     import src.graph.manager as gm
     gm._graph = None
@@ -497,6 +502,38 @@ class TestOntologyEnforcement(unittest.TestCase):
         from src.tools.entities import tool_reembed_entity
         result = tool_reembed_entity("Nobody", vault="test")
         self.assertIn("not found", result)
+
+    def test_reembed_status_idle(self):
+        from src.tools.entities import tool_reembed_status
+        self.assertIn("No re-embed", tool_reembed_status())
+
+    def test_update_entity_big_goes_background(self):
+        """A rename past the bg threshold returns at once with a background
+        message; the job completes and status reports exact counts."""
+        import time as time_mod
+        import src.config as config_mod
+        from src.tools.entities import (
+            tool_create_entity, tool_update_entity, tool_reembed_status)
+        config_mod.VAULTS["test"] = config_mod.VaultConfig(
+            name="test", collection_name="memory_test")
+        tool_create_entity("Huge", "project", "test",
+                           observations=[f"fact {i}" for i in range(70)])
+
+        result = tool_update_entity("Huge", new_name="Huger", vault="test")
+        self.assertIn("Entity updated", result)
+        self.assertIn("Huger", result)
+        self.assertIn("background", result)
+        # Caller was not held for the whole job: no synchronous counts.
+        self.assertNotIn("re-embedded 70 observations", result)
+
+        deadline = time_mod.time() + 30
+        last = ""
+        while time_mod.time() < deadline:
+            last = tool_reembed_status()
+            if "Last re-embed" in last:
+                break
+            time_mod.sleep(0.1)
+        self.assertIn("70 ok, 0 failed", last)
 
     # ---- relation types ----
 
