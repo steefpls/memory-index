@@ -14,6 +14,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,12 @@ from src.models.observation import Observation
 
 _RECALIBRATE_EVERY = 10  # auto-recalibrate after every N observations per vault
 _LIBRARIAN_EVERY = 10    # auto-run librarian after every N observations per vault
+
+# Observations embedded + upserted per step when re-embedding a whole entity
+# (rename / type change / repair). Small enough that one ONNX batch can't OOM
+# the daemon; each batch is upserted on its own so a midway crash keeps every
+# completed batch instead of losing the whole re-embed.
+_REEMBED_BATCH_SIZE = 32
 
 logger = logging.getLogger(__name__)
 
@@ -189,13 +196,17 @@ def get_entity_by_name(name: str, vault: str) -> Entity | None:
 
 
 def update_entity(entity_id: str, name: str | None = None,
-                  entity_type: str | None = None) -> Entity | None:
-    """Update an entity's name or type."""
+                  entity_type: str | None = None) -> tuple[Entity | None, tuple[int, int]]:
+    """Update an entity's name or type.
+
+    Returns (entity or None, (re-embedded count, failed count)). The counts
+    are (0, 0) when nothing needed re-embedding.
+    """
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
         if ent is None or ent.deleted:
-            return None
+            return None, (0, 0)
 
         if name is not None:
             ent.name = name
@@ -207,10 +218,29 @@ def update_entity(entity_id: str, name: str | None = None,
 
     # Re-embed all observations if entity name/type changed. Done outside the
     # lock — it's an embedder round-trip, not a store mutation.
+    stats = (0, 0)
     if name is not None or entity_type is not None:
-        _reembed_entity_observations(ent)
+        stats = _reembed_entity_observations(ent)
 
-    return ent
+    return ent, stats
+
+
+def reembed_entity(entity_id: str) -> tuple[Entity | None, tuple[int, int]]:
+    """Re-embed all active observations of an entity without changing it.
+
+    Repair path for vectors left stale by a re-embed that died midway (the
+    SQLite rename persisted but the Chroma vectors didn't), or for retrying
+    batches a previous run logged as failed. Progress is logged per batch.
+
+    Returns (entity or None, (re-embedded count, failed count)).
+    """
+    _load_store()
+    with STORE_LOCK:
+        ent = _entities.get(entity_id)
+        if ent is None or ent.deleted:
+            return None, (0, 0)
+
+    return ent, _reembed_entity_observations(ent)
 
 
 def delete_entity(entity_id: str) -> bool:
@@ -737,34 +767,63 @@ def undelete_observation(observation_id: str) -> Observation | None:
     return obs
 
 
-def _reembed_entity_observations(entity: Entity) -> None:
-    """Re-embed all observations for an entity (after name/type change)."""
+def _reembed_entity_observations(entity: Entity) -> tuple[int, int]:
+    """Re-embed all active observations for an entity (after name/type change).
+
+    Works in small _REEMBED_BATCH_SIZE batches, each embedded and upserted on
+    its own: a rename of a big entity no longer feeds ~1000 texts to the ONNX
+    session in one call (which OOM-killed the daemon mid-request with no
+    traceback), and a midway crash keeps every batch upserted so far.
+
+    Progress is logged per batch, so a rename is visible in the daemon log
+    instead of silent for minutes. One bad batch is logged and skipped rather
+    than aborting the batches after it.
+
+    Returns (re-embedded count, failed count).
+    """
     obs_list = get_observations(entity.id)
-    if not obs_list:
-        return
+    total = len(obs_list)
+    if not total:
+        return 0, 0
+
+    t0 = time.perf_counter()
+    n_batches = (total + _REEMBED_BATCH_SIZE - 1) // _REEMBED_BATCH_SIZE
+    logger.info("Re-embedding %d observations for entity '%s' (%s): %d batches of up to %d",
+                total, entity.name, entity.id, n_batches, _REEMBED_BATCH_SIZE)
 
     try:
         collection = _get_collection_for_vault(entity.vault)
         ef = get_embedding_function()
-
-        ids = []
-        texts = []
-        metadatas = []
-        for obs in obs_list:
-            embed_text = _make_embedding_text(entity, obs.content)
-            ids.append(obs.id)
-            texts.append(embed_text)
-            metadatas.append(_obs_metadata(entity, obs))
-
-        embeddings = ef(texts)
-        collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            documents=texts,
-            metadatas=metadatas,
-        )
     except Exception as e:
-        logger.error("Failed to re-embed observations for entity %s: %s", entity.id, e)
+        logger.error("Re-embed for entity %s aborted before batch 1: %s", entity.id, e)
+        return 0, total
+
+    ok = 0
+    failed = 0
+    for i in range(n_batches):
+        chunk = obs_list[i * _REEMBED_BATCH_SIZE:(i + 1) * _REEMBED_BATCH_SIZE]
+        try:
+            texts = [_make_embedding_text(entity, obs.content) for obs in chunk]
+            embeddings = ef(texts)
+            collection.upsert(
+                ids=[obs.id for obs in chunk],
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=[_obs_metadata(entity, obs) for obs in chunk],
+            )
+            ok += len(chunk)
+        except Exception as e:
+            failed += len(chunk)
+            logger.error("Re-embed '%s': batch %d/%d failed (%d obs skipped): %s",
+                         entity.name, i + 1, n_batches, len(chunk), e)
+            continue
+        logger.info("Re-embed '%s': batch %d/%d done (%d/%d obs, %.1fs elapsed)",
+                    entity.name, i + 1, n_batches, ok + failed, total,
+                    time.perf_counter() - t0)
+
+    logger.info("Re-embed '%s' complete: %d ok, %d failed, %d total in %.1fs",
+                entity.name, ok, failed, total, time.perf_counter() - t0)
+    return ok, failed
 
 
 # --- Stats ---

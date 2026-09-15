@@ -141,6 +141,22 @@ def update_entity(name_or_id: str, new_name: str = "",
 
 
 @mcp.tool()
+def reembed_entity(name_or_id: str, vault: str = "") -> str:
+    """Re-embed all active observations of an entity without changing it.
+
+    Repair path for vectors left stale by a re-embed that died midway, or
+    for retrying batches a previous run logged as failed. Progress is logged
+    per batch in the daemon log.
+
+    Args:
+        name_or_id: Entity name or ID.
+        vault: Vault name (helps disambiguate names).
+    """
+    from src.tools.entities import tool_reembed_entity
+    return tool_reembed_entity(name_or_id, vault)
+
+
+@mcp.tool()
 def delete_entity(name_or_id: str, vault: str = "") -> str:
     """Soft delete an entity and its observations.
 

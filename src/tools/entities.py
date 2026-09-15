@@ -6,7 +6,7 @@ import logging
 from src.config import VAULTS, get_vault, create_vault as config_create_vault
 from src.indexer.store import (
     create_entity, get_entity, get_entity_by_name, update_entity,
-    delete_entity, list_entities, resolve_entity,
+    reembed_entity, delete_entity, list_entities, resolve_entity,
     add_observation, add_observations, get_observations, delete_observation,
     delete_observation_detailed, undelete_observation,
 )
@@ -272,7 +272,7 @@ def tool_update_entity(name_or_id: str, new_name: str = "",
     if entity is None:
         return f"Entity not found: '{name_or_id}'"
 
-    updated = update_entity(
+    updated, (reembedded, failed) = update_entity(
         entity.id,
         name=new_name.strip() if new_name else None,
         entity_type=new_type.strip().lower() if new_type else None,
@@ -280,7 +280,37 @@ def tool_update_entity(name_or_id: str, new_name: str = "",
     if updated is None:
         return "Error: update failed."
 
-    return f"Entity updated: {updated.name} ({updated.entity_type}), ID: {updated.id}"
+    result = f"Entity updated: {updated.name} ({updated.entity_type}), ID: {updated.id}"
+    if reembedded or failed:
+        result += f" — re-embedded {reembedded} observations"
+        if failed:
+            result += (f" ({failed} failed — see daemon log for the batch, "
+                       f"then re-run reembed_entity to retry)")
+    return result
+
+
+def tool_reembed_entity(name_or_id: str, vault: str = "") -> str:
+    """Re-embed all active observations of an entity without changing it.
+
+    Repair path for vectors left stale by a re-embed that died midway, or
+    for retrying batches a previous run logged as failed. Progress is logged
+    per batch in the daemon log.
+
+    Args:
+        name_or_id: Entity name or ID.
+        vault: Vault name (helps disambiguate names).
+    """
+    entity = resolve_entity(name_or_id, vault or None)
+    if entity is None:
+        return f"Entity not found: '{name_or_id}'"
+
+    _, (reembedded, failed) = reembed_entity(entity.id)
+    result = (f"Re-embedded {reembedded} observations for '{entity.name}' "
+              f"(ID: {entity.id})")
+    if failed:
+        result += (f" — {failed} failed, see daemon log for the batch; "
+                   f"re-run reembed_entity to retry")
+    return result
 
 
 def tool_delete_entity(name_or_id: str, vault: str = "") -> str:

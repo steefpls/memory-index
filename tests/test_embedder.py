@@ -127,5 +127,55 @@ class TestChromaClientSingleton(unittest.TestCase):
         self.assertEqual(len({id(r) for r in results}), 1)
 
 
+class TestOnnxBatching(unittest.TestCase):
+    """Large inputs must be split into bounded ONNX batches.
+
+    Regression: a rename re-embed passed ~900 texts in one session run and
+    OOM-killed the daemon with no traceback.
+    """
+
+    def _embedder_with_fake_session(self):
+        import numpy as np
+        import src.indexer.embedder as emb_mod
+        e = emb_mod.GemmaEmbedder.__new__(emb_mod.GemmaEmbedder)
+        seen = []
+
+        class FakeSession:
+            def run(self, names, feed):
+                n = feed["input_ids"].shape[0]
+                seen.append(n)
+                return [np.zeros((n, 768), dtype=np.float32)]
+
+        class FakeTok:
+            def __call__(self, texts, **kw):
+                n = len(texts)
+                return {"input_ids": np.zeros((n, 8), dtype=np.int64),
+                        "attention_mask": np.ones((n, 8), dtype=np.int64)}
+
+        e._ort_session = FakeSession()
+        e._tokenizer = FakeTok()
+        e._pt_model = None
+        return e, seen
+
+    def test_large_input_is_split_into_bounded_batches(self):
+        e, seen = self._embedder_with_fake_session()
+        out = e._onnx_embed([f"text {i}" for i in range(70)])
+        self.assertEqual(len(out), 70)
+        self.assertTrue(seen, "session was never called")
+        self.assertTrue(all(n <= 32 for n in seen), seen)
+        self.assertEqual(sum(seen), 70)
+
+    def test_small_input_takes_single_batch(self):
+        e, seen = self._embedder_with_fake_session()
+        out = e._onnx_embed(["a", "b", "c"])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(seen, [3])
+
+    def test_empty_input(self):
+        e, seen = self._embedder_with_fake_session()
+        self.assertEqual(e._onnx_embed([]), [])
+        self.assertEqual(seen, [])
+
+
 if __name__ == "__main__":
     unittest.main()

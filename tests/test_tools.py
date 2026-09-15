@@ -477,6 +477,27 @@ class TestOntologyEnforcement(unittest.TestCase):
         self.assertIn("Error", result)
         self.assertIn("wizard", result)
 
+    def test_update_entity_reports_reembed_counts(self):
+        import src.config as config_mod
+        from src.tools.entities import (
+            tool_create_entity, tool_update_entity, tool_reembed_entity)
+        config_mod.VAULTS["test"] = config_mod.VaultConfig(
+            name="test", collection_name="memory_test")
+        tool_create_entity("Big", "project", "test",
+                           observations=["fact one", "fact two"])
+        result = tool_update_entity("Big", new_name="Bigger", vault="test")
+        self.assertIn("Entity updated", result)
+        self.assertIn("Bigger", result)
+        self.assertIn("re-embedded 2 observations", result)
+
+        repair = tool_reembed_entity("Bigger", vault="test")
+        self.assertIn("Re-embedded 2 observations", repair)
+
+    def test_reembed_entity_unknown(self):
+        from src.tools.entities import tool_reembed_entity
+        result = tool_reembed_entity("Nobody", vault="test")
+        self.assertIn("not found", result)
+
     # ---- relation types ----
 
     def _two_entities(self):

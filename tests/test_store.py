@@ -120,8 +120,92 @@ class TestEntityStore(unittest.TestCase):
         from src.indexer.store import create_entity, update_entity
 
         entity = create_entity("Pytohn", "technology", "test")
-        updated = update_entity(entity.id, name="Python")
+        updated, stats = update_entity(entity.id, name="Python")
         self.assertEqual(updated.name, "Python")
+        self.assertEqual(stats, (0, 0))  # no observations: nothing to re-embed
+
+    def test_rename_reembeds_in_small_batches(self):
+        """Regression: a rename once fed ALL observations to the embedder in
+        one call (~900 texts -> OOM-killed daemon, no traceback). Now the
+        re-embed runs in small batches with one Chroma upsert per batch."""
+        from src.indexer.store import create_entity, update_entity
+
+        entity = create_entity("Big", "project", "test",
+                               observations=[f"fact {i}" for i in range(70)])
+
+        batch_sizes = []
+
+        def fake_ef(texts):
+            batch_sizes.append(len(texts))
+            return [[0.1] * 768 for _ in texts]
+
+        self.mock_ef.side_effect = fake_ef
+        self.mock_collection.reset_mock()
+
+        updated, (ok, failed) = update_entity(entity.id, name="Bigger")
+        self.assertEqual(updated.name, "Bigger")
+        self.assertEqual((ok, failed), (70, 0))
+
+        # 70 obs must arrive as small batches, never one giant call.
+        self.assertTrue(batch_sizes)
+        self.assertTrue(all(n <= 32 for n in batch_sizes), batch_sizes)
+        self.assertEqual(sum(batch_sizes), 70)
+
+        # One Chroma upsert per batch, every id covered exactly once.
+        self.assertEqual(self.mock_collection.upsert.call_count, len(batch_sizes))
+        seen = []
+        for call in self.mock_collection.upsert.call_args_list:
+            seen.extend(call[1]["ids"])
+        self.assertEqual(len(seen), 70)
+        self.assertEqual(len(set(seen)), 70)
+
+    def test_rename_reembed_survives_failed_batch(self):
+        """One bad batch is skipped and reported — the batches after it still
+        run, so a midway failure can't silently drop the rest of the entity."""
+        from src.indexer.store import create_entity, update_entity
+
+        entity = create_entity("Big", "project", "test",
+                               observations=[f"fact {i}" for i in range(70)])
+
+        calls = []
+
+        def flaky_ef(texts):
+            calls.append(len(texts))
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return [[0.1] * 768 for _ in texts]
+
+        self.mock_ef.side_effect = flaky_ef
+        self.mock_collection.reset_mock()
+
+        updated, (ok, failed) = update_entity(entity.id, name="Bigger")
+        self.assertEqual(updated.name, "Bigger")
+        self.assertEqual(ok, 70 - 32)   # batches 1 and 3 landed
+        self.assertEqual(failed, 32)    # batch 2 skipped, not fatal
+        self.assertEqual(self.mock_collection.upsert.call_count, 2)
+
+    def test_reembed_entity_repairs_without_rename(self):
+        """The repair path re-embeds current observations with no name change
+        (for vectors left stale by a re-embed that died midway)."""
+        from src.indexer.store import (
+            create_entity, reembed_entity, get_observations)
+
+        entity = create_entity("Big", "project", "test",
+                               observations=["fact one", "fact two"])
+        self.mock_collection.reset_mock()
+
+        ent, (ok, failed) = reembed_entity(entity.id)
+        self.assertIsNotNone(ent)
+        self.assertEqual((ok, failed), (2, 0))
+        self.assertTrue(self.mock_collection.upsert.called)
+        self.assertEqual(len(get_observations(entity.id)), 2)
+
+    def test_reembed_entity_unknown_id(self):
+        from src.indexer.store import reembed_entity
+
+        ent, stats = reembed_entity("nope")
+        self.assertIsNone(ent)
+        self.assertEqual(stats, (0, 0))
 
     def test_delete_entity(self):
         from src.indexer.store import create_entity, delete_entity, get_entity

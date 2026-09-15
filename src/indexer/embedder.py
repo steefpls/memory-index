@@ -26,6 +26,13 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
+# Largest single ONNX inference batch. A rename re-embed once passed ~900
+# texts in one call and OOM-killed the daemon mid-request (no traceback —
+# the process died inside the session run). Batching here is the last line
+# of defence; callers with progress reporting (e.g. store re-embed) batch
+# on their own side too.
+EMBED_BATCH_SIZE = 32
+
 
 class _FastTokenizerWrapper:
     """Lightweight tokenizer using the `tokenizers` library directly.
@@ -163,13 +170,27 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
             logger.info("EmbeddingGemma warmup complete")
 
     def _onnx_embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed texts via ONNX Runtime CPU. The graph pools and normalizes."""
-        import numpy as np
+        """Embed texts via ONNX Runtime CPU. The graph pools and normalizes.
 
+        Large inputs run as sequential EMBED_BATCH_SIZE chunks: one giant
+        batch (hundreds of rows) blows CPU RAM inside a single session run
+        and has OOM-killed the daemon with no traceback. Small callers take
+        the single-batch fast path unchanged.
+        """
         if not texts:
             return []
 
-        # For memory-index, texts are typically 1-5 items. No adaptive batching needed.
+        if len(texts) > EMBED_BATCH_SIZE:
+            results: list[list[float]] = []
+            for start in range(0, len(texts), EMBED_BATCH_SIZE):
+                results.extend(self._onnx_embed_batch(texts[start:start + EMBED_BATCH_SIZE]))
+            return results
+        return self._onnx_embed_batch(texts)
+
+    def _onnx_embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Run one bounded inference batch through the ONNX session."""
+        import numpy as np
+
         inp = self._tokenizer(list(texts), return_tensors="np",
                               padding=True, truncation=True,
                               max_length=EMBED_MAX_TOKENS)
