@@ -81,6 +81,13 @@ _client: chromadb.ClientAPI | None = None
 _embedding_fn: "GemmaEmbedder | None" = None
 _active_backend: str = "not initialized"
 
+# Separate tokenizer instance for length checks (never truncated). It must NOT
+# be the embedder's own tokenizer: _FastTokenizerWrapper mutates truncation
+# settings on the shared instance per call, so sharing it would race.
+_counter_tok = None
+_counter_tok_failed = False
+_counter_lock = threading.Lock()
+
 # The embedder and the Chroma client are process-wide singletons whose
 # construction is expensive (a full EmbeddingGemma-300m ONNX session, ~hundreds
 # of MB resident). Every one of store.add_observation(s),
@@ -316,6 +323,43 @@ def release_embedding_function() -> None:
 def get_active_backend() -> str:
     """Return active backend if initialized, else 'not initialized'."""
     return _active_backend
+
+
+def count_tokens(texts: list[str]) -> list[int] | None:
+    """Count tokens per text with the model's tokenizer, WITHOUT truncation.
+
+    Used by the long-text guard: anything over EMBED_MAX_TOKENS is silently
+    cut by the embedder while SQLite keeps the full text, so callers must be
+    told to split. Returns None when the tokenizer is unavailable (model not
+    downloaded) — callers then skip the check rather than guessing from
+    character counts, which do not predict wordpiece lengths.
+    """
+    global _counter_tok, _counter_tok_failed
+    if _counter_tok is None and not _counter_tok_failed:
+        with _counter_lock:
+            if _counter_tok is None and not _counter_tok_failed:
+                try:
+                    from tokenizers import Tokenizer
+                    tok_path = EMBED_ONNX_DIR / "tokenizer.json"
+                    if not tok_path.exists():
+                        _counter_tok_failed = True
+                    else:
+                        _counter_tok = Tokenizer.from_file(str(tok_path))
+                except Exception as e:
+                    logger.warning("Token counter unavailable: %s", e)
+                    _counter_tok_failed = True
+    tok = _counter_tok
+    if tok is None:
+        return None
+    try:
+        with _counter_lock:
+            tok.no_truncation()
+            tok.no_padding()
+            enc = tok.encode_batch(list(texts))
+        return [len(e.ids) for e in enc]
+    except Exception as e:
+        logger.warning("Token counting failed: %s", e)
+        return None
 
 
 def get_chroma_client() -> chromadb.ClientAPI:

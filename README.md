@@ -12,7 +12,7 @@ setup.bat
 
 This creates a venv, installs deps, exports the ONNX model (~274MB download on first run), and registers the MCP server.
 
-## Tools (27)
+## Tools (29)
 
 ### Entities & observations
 
@@ -22,6 +22,7 @@ This creates a venv, installs deps, exports the ONNX model (~274MB download on f
 | `get_entity` | Entity details with observations and relations (current and superseded shown separately). `output_format="json"` returns the same data with observation AND relation IDs, for callers that intend to act on individual rows |
 | `update_entity` | Update an entity's name or type |
 | `delete_entity` | Soft delete an entity and its observations |
+| `merge_entities` | Merge one entity into another: move observations (IDs stable, timestamps kept) + re-point relations deduped by (from, to, type), re-embed under the target's name, soft-delete the source. Export/import preserves the merged state |
 | `list_entities` | Paginated list, filter by vault / type |
 | `add_observation` | Add one observation to an entity (supports `supersedes` and `occurred_at`) |
 | `add_observations` | Add multiple observations to one entity in a single call — one embed pass, one write |
@@ -82,6 +83,10 @@ add_observation("Perception", "Migrated to .NET 8", supersedes="<old_obs_id>")
 - `get_entity` shows both current and superseded observations separately
 - Supports supersede chains (v1 -> v2 -> v3)
 - `export_vault` / `import_vault` round-trip superseded rows and remap their pointers, so history survives a migration
+
+### Long-text guard
+
+The embedding window is `EMBED_MAX_TOKENS` (2048). A longer observation is silently cut in the vector while SQLite keeps the full text — search degrades with no signal. `add_observation` / `add_observations` / `create_entity(observations=...)` therefore measure input with the model's tokenizer (never a character count) and warn when it overflows: "truncated for search, split into smaller atomic facts". The full text is still stored; the warning tells the caller to split.
 
 ### Event time vs write time
 
@@ -161,7 +166,6 @@ Never duplicate facts. If fact X already lives on entity Y, link via relation �
 ### Atomicity — one observation = one atomic fact
 
 Observations are embedded individually. A packed observation ("Likes X, works at Y, based in Z") produces one embedding that represents none of those facts well, and semantic search degrades at the fact level.
-
 - One fact per `add_observation` call. Five facts → five calls (or one `add_observations` call with five list items — same granularity, one round trip).
 - No JSON arrays, comma-packed lists, or "consolidated" mega-observations.
 - Self-contained facts may rely on parent entity context — on entity `Alice`, the observation "Based in Singapore" is fine.
@@ -248,6 +252,10 @@ The floor exists so a search never returns a bare "no results" when the vault do
 
 Reciprocal Rank Fusion is no longer used for merging. RRF is rank-only and therefore has no notion of match quality — a popularity-ranked graph neighbour could outrank a real semantic hit. Scoring graph candidates against the actual query replaced it.
 
+### Keyword fallback
+
+Embeddings systematically miss exact strings — file paths (`prod.pem`, `C:\keys\...`), code identifiers, numbers (`5.8k`). When the vector results are all weak (no `HIGH`/`MEDIUM`) **or** the query itself looks like an exact string, search additionally runs a case-insensitive substring scan over SQLite content + entity names (same vault / type / supersession / date filters as the vector pass). Vector search stays primary and ranked first; keyword hits are merged in clearly labelled — `keyword_match=true` with `confidence="KEYWORD"` and null distance/score in `json`, a `keyword` tag instead of a score in `text`. A vector hit that also substring-matches is labelled `keyword` in place (its real score is kept — nothing is fabricated).
+
 ### Calibration
 
 Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` reading as `NO MATCH`) are derived per vault: real observations sampled from the vault act as "should match" probes and gibberish strings as "should not match" probes, and the bands are fitted to the gap between the two distributions. This keeps scores meaningful regardless of the vault's content domain.
@@ -300,7 +308,7 @@ Forked from [code-index](https://github.com/you/code-index). Same embedding pipe
 
 ```
 src/
-├── server.py              # FastMCP, 26 tool registrations
+├── server.py              # FastMCP, 29 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
 ├── embed_http.py          # Bearer-authenticated POST /embed (reuses the loaded model)
 ├── indexer/
@@ -351,4 +359,4 @@ Run them all:
 for f in tests/test_*.py; do PYTHONPATH=. python "$f"; done
 ```
 
-278 tests across 12 files, covering entity CRUD and superseding, batched observation writes, SQLite persistence and the legacy-JSON migration, concurrency behaviour, ontology enforcement, observation-level search ranking and threshold selection, graph traversal and analysis, the librarian, temporal queries on both time axes, vault export/import round-trips, maintenance, the eval harness, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.
+330 tests across 16 files, covering entity CRUD and superseding, entity merge, batched observation writes, SQLite persistence and the legacy-JSON migration, concurrency behaviour, ontology enforcement, observation-level search ranking and threshold selection, keyword fallback, long-text guard, graph traversal and analysis, the librarian, temporal queries on both time axes, vault export/import round-trips, maintenance, the eval harness, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.

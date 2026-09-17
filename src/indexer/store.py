@@ -307,6 +307,106 @@ def delete_entity(entity_id: str) -> bool:
     return True
 
 
+def merge_entities(source_id: str, target_id: str) -> dict:
+    """Merge `source_id` into `target_id`: move observations + relations.
+
+    - Every observation row on the source (active, superseded, deleted) is
+      re-pointed at the target with its ID, content, source, created_at,
+      occurred_at and supersede pointers untouched — IDs stay stable so
+      supersede chains never break.
+    - Relations touching the source are re-pointed at the target, deduped by
+      (from, to, type); duplicates are removed.
+    - The source entity is then soft-deleted (empty — nothing left to sweep).
+    - Moved live vectors are re-embedded in ONE batch with the target's
+      "type: name" prefix, the same upsert path `_reembed_entity_observations`
+      uses. Export/import afterwards sees only the merged state, so a
+      restore preserves the merge (the deleted source is skipped on import).
+
+    Both entities must exist, be live, and live in the SAME vault (vectors
+    are per-vault collections — a cross-vault move would strand them).
+
+    Returns a result dict with ok=True/False plus counts, or ok=False with
+    an error string.
+    """
+    _load_store()
+    with STORE_LOCK:
+        src = _entities.get(source_id)
+        if src is None or src.deleted:
+            return {"ok": False, "error": f"Source entity not found: '{source_id}'"}
+        tgt = _entities.get(target_id)
+        if tgt is None or tgt.deleted:
+            return {"ok": False, "error": f"Target entity not found: '{target_id}'"}
+        if source_id == target_id:
+            return {"ok": False, "error": "Cannot merge an entity into itself."}
+        if src.vault != tgt.vault:
+            return {"ok": False,
+                    "error": f"Cannot merge across vaults ('{src.vault}' vs '{tgt.vault}')."}
+
+        to_move = [o for o in _observations.values() if o.entity_id == source_id]
+        moved_active = sum(1 for o in to_move if not o.deleted and not o.is_superseded)
+        for obs in to_move:
+            obs.entity_id = target_id
+        if to_move:
+            db.upsert_observations(to_move)
+
+        tgt.updated_at = _now_iso()
+        db.upsert_entities([tgt])
+
+        vault = tgt.vault
+        tgt_id = tgt.id
+        tgt_type = tgt.entity_type
+        tgt_name = tgt.name
+        src_name = src.name
+        reembed_ids = [o.id for o in to_move if not o.deleted]
+        reembed_contents = [o.content for o in to_move if not o.deleted]
+
+    # Relations move under GRAPH_LOCK (never hold STORE_LOCK + GRAPH_LOCK
+    # together — same ordering as delete_entity).
+    try:
+        from src.graph.manager import repoint_entity_relations
+        rels_moved, rels_deduped = repoint_entity_relations(source_id, target_id)
+    except Exception as e:
+        logger.warning("Failed to re-point relations for merge %s -> %s: %s",
+                       source_id, target_id, e)
+        rels_moved, rels_deduped = 0, 0
+
+    # Source is empty now — soft-delete only flags the entity row.
+    delete_entity(source_id)
+
+    # One batched re-embed with the target's prefix (same upsert shape as
+    # _reembed_entity_observations). Deleted rows have no vectors — skip them.
+    if reembed_ids:
+        try:
+            collection = _get_collection_for_vault(vault)
+            ef = get_embedding_function()
+            texts = [f"{tgt_type}: {tgt_name}\n{c}" for c in reembed_contents]
+            metadatas = [
+                {"entity_id": tgt_id, "entity_type": tgt_type}
+                for _ in reembed_ids
+            ]
+            embeddings = ef(texts)
+            collection.upsert(
+                ids=reembed_ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+            )
+        except Exception as e:
+            logger.error("Failed to re-embed merged observations for %s: %s",
+                         target_id, e)
+
+    return {
+        "ok": True,
+        "source_name": src_name,
+        "target_name": tgt_name,
+        "vault": vault,
+        "moved_obs": len(to_move),
+        "moved_active": moved_active,
+        "rels_moved": rels_moved,
+        "rels_deduped": rels_deduped,
+    }
+
+
 def list_entities(vault: str | None = None, entity_type: str | None = None,
                   offset: int = 0, limit: int = 50) -> tuple[list[Entity], int]:
     """List entities with optional filters. Returns (entities, total_count)."""

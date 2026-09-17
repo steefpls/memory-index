@@ -10,6 +10,7 @@ on their own merit against the query — no fabricated distances.
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 
@@ -140,6 +141,16 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
         ))
 
     if not all_items:
+        # No vector hits at all — an exact-substring scan is the only chance.
+        keyword_only = _keyword_search(
+            query, vault_names, entity_type, include_superseded,
+            date_bounds, exclude_ids=set(), limit=n_results,
+        )
+        if keyword_only:
+            if output_format == "json":
+                return _format_json(keyword_only, query, strategy=strategy,
+                                    above_threshold_count=0)
+            return _format_text(keyword_only, query, above_threshold_count=0)
         return f"No results found for '{query}'."
 
     ranked = _rank(all_items)
@@ -171,10 +182,38 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
         # the best few anyway rather than an empty result, labels intact.
         selected = ranked[:MIN_RESULTS]
 
+    # Keyword fallback: vector search is primary, but embeddings systematically
+    # miss exact strings (file paths, identifiers, numbers — "prod.pem" is far
+    # from everything in vector space). Run an exact-substring scan over the
+    # SQLite store when the vector results are all weak (no HIGH/MEDIUM) or
+    # the query itself looks like an exact string.
+    #
+    # keyword_match is a property of the (query, observation) pair, not of the
+    # retrieval path: a vector hit that also substring-matches is upgraded in
+    # place (real score kept, keyword tag added), and matches the vector pass
+    # missed are appended as keyword-only hits with NO fabricated distance.
+    keyword_hits: list[dict] = []
+    weak = not any(item.get("confidence") in ("HIGH", "MEDIUM")
+                   for item in ranked)
+    if weak or _looks_like_exact_query(query):
+        keyword_hits = _keyword_search(
+            query, vault_names, entity_type, include_superseded,
+            date_bounds, exclude_ids=set(),
+            limit=len(selected) + n_results,
+        )
+    kw_by_id = {h["observation_id"]: h for h in keyword_hits}
+    for item in selected:
+        if item["observation_id"] in kw_by_id:
+            item["keyword_match"] = True
+    selected_ids = {item["observation_id"] for item in selected}
+    appended = [h for h in keyword_hits
+                if h["observation_id"] not in selected_ids][:n_results]
+    combined = selected + appended
+
     if output_format == "json":
-        return _format_json(selected, query, strategy=strategy,
+        return _format_json(combined, query, strategy=strategy,
                             above_threshold_count=len(above))
-    return _format_text(selected, query, above_threshold_count=len(above))
+    return _format_text(combined, query, above_threshold_count=len(above))
 
 
 def _build_where_conditions(entity_type: str) -> list[dict]:
@@ -307,6 +346,7 @@ def _query_vault(vault_name: str, query_embeddings, fetch_count: int,
             "distance": distances[i],
             "graph_boosted": graph_boosted,
             "superseded": obs.is_superseded,
+            "keyword_match": False,
         })
     return items
 
@@ -373,6 +413,83 @@ def _score_graph_candidates(seed_items: list[dict], query_embeddings,
 
     return [item for item in scored
             if _confidence_label(item["distance"], item["vault"]) != "NO MATCH"]
+
+
+def _looks_like_exact_query(query: str) -> bool:
+    """True when the query reads as an exact string, not a question.
+
+    Vector search systematically misses these: file names (prod.pem),
+    paths (C:\\keys\\, /etc/ssl/), code identifiers (snake_case), version
+    numbers and amounts (5.8k). Any hit is a cheap heuristic — a keyword hit
+    is only ever APPENDED and labelled, never ranked as a vector result.
+    """
+    q = query or ""
+    if "\\" in q or "/" in q:
+        return True
+    if re.search(r"\d", q):
+        return True
+    if re.search(r"\w\.\w", q):
+        return True
+    if "_" in q:
+        return True
+    return False
+
+
+def _keyword_search(query: str, vault_names: list[str], entity_type: str,
+                    include_superseded: bool, date_bounds: tuple,
+                    exclude_ids: set[str], limit: int) -> list[dict]:
+    """Case-insensitive substring match over SQLite content + entity names.
+
+    Same filters as the vector pass (vault scope, entity_type, supersession,
+    date window) so a keyword hit is directly comparable. Returns items with
+    keyword_match=True and NO distance/score — callers must render them with
+    the 'keyword' tag, never with a fabricated relevance number.
+    """
+    needle = (query or "").strip().lower()
+    if not needle or limit <= 0:
+        return []
+    try:
+        from src.indexer.store import snapshot_store
+        entities, observations = snapshot_store()
+    except Exception as e:
+        logger.warning("Keyword search unavailable (store snapshot failed): %s", e)
+        return []
+
+    vault_set = set(vault_names)
+    hits: list[dict] = []
+    for obs in observations.values():
+        if obs.id in exclude_ids:
+            continue
+        if obs.deleted:
+            continue
+        if obs.is_superseded and not include_superseded:
+            continue
+        ent = entities.get(obs.entity_id)
+        if ent is None or ent.deleted:
+            continue
+        if ent.vault not in vault_set:
+            continue
+        if entity_type and ent.entity_type != entity_type:
+            continue
+        if not _in_date_range(obs, date_bounds):
+            continue
+        if needle in (obs.content or "").lower() or needle in (ent.name or "").lower():
+            hits.append({
+                "observation_id": obs.id,
+                "entity_id": ent.id,
+                "entity_name": ent.name,
+                "entity_type": ent.entity_type,
+                "content": obs.content,
+                "source": obs.source,
+                "vault": ent.vault,
+                "distance": None,
+                "graph_boosted": False,
+                "superseded": obs.is_superseded,
+                "keyword_match": True,
+            })
+            if len(hits) >= limit:
+                break
+    return hits
 
 
 def start_search_init() -> None:
@@ -486,13 +603,23 @@ def _format_text(results: list[dict], query: str,
 
     Ranking stays per-observation; the entity header is purely a token-saving
     device so a run of facts about one entity doesn't repeat its context line.
+    Keyword (exact-substring) hits carry no distance — they render with a
+    'keyword' tag instead of a score, so they can never be mistaken for a
+    calibrated vector result.
     """
     lines: list[str] = []
 
-    if above_threshold_count is not None and above_threshold_count < len(results):
+    n_semantic = sum(1 for r in results if not r.get("keyword_match"))
+    n_keyword = len(results) - n_semantic
+    if above_threshold_count is not None and above_threshold_count < n_semantic:
         lines.append(
             f"note: {above_threshold_count} result(s) cleared the relevance "
-            f"threshold — showing the best {len(results)} overall."
+            f"threshold — showing the best {n_semantic} overall."
+        )
+    if n_keyword:
+        lines.append(
+            f"note: {n_keyword} keyword (exact-substring) match(es) appended "
+            f"below, tagged 'keyword' — no vector score applies."
         )
 
     last_key = None
@@ -506,15 +633,23 @@ def _format_text(results: list[dict], query: str,
             )
             last_key = key
 
+        src = f" [src: {item['source']}]" if item.get("source") else ""
+        old = " [superseded]" if item.get("superseded") else ""
+        if item.get("keyword_match") and item.get("distance") is None:
+            lines.append(
+                f"  [{i + 1}] KEYWORD keyword · "
+                f"{item.get('content', '')}{src}{old}"
+            )
+            continue
+
         confidence = _confidence_label(item["distance"], vault)
         conf_short = _CONFIDENCE_SHORT.get(confidence, confidence)
         score = _normalized_score(item["distance"], vault)
         boosted = " +graph" if item.get("graph_boosted") else ""
-        src = f" [src: {item['source']}]" if item.get("source") else ""
-        old = " [superseded]" if item.get("superseded") else ""
+        kw = " keyword" if item.get("keyword_match") else ""
 
         lines.append(
-            f"  [{i + 1}] {score}% {conf_short}{boosted} · "
+            f"  [{i + 1}] {score}% {conf_short}{boosted}{kw} · "
             f"{item.get('content', '')}{src}{old}"
         )
 
@@ -523,16 +658,40 @@ def _format_text(results: list[dict], query: str,
 
 def _format_json(results: list[dict], query: str, strategy: str = "semantic",
                  above_threshold_count: int | None = None) -> str:
-    """Flat ranked list of observation objects — no entity nesting."""
+    """Flat ranked list of observation objects — no entity nesting.
+
+    Keyword hits set keyword_match=true with confidence "KEYWORD" and null
+    distance/relevance_pct: no score is fabricated for them.
+    """
     payload = {
         "query": query,
         "strategy": strategy,
         "returned": len(results),
         "above_threshold": above_threshold_count,
+        "keyword_matches": sum(1 for r in results if r.get("keyword_match")),
         "results": [],
     }
     for i, item in enumerate(results):
         vault = item["vault"]
+        if item.get("keyword_match") and item.get("distance") is None:
+            payload["results"].append({
+                "rank": i + 1,
+                "observation_id": item.get("observation_id", ""),
+                "content": item.get("content", ""),
+                "source": item.get("source", ""),
+                "entity_id": item.get("entity_id", ""),
+                "entity_name": item.get("entity_name", ""),
+                "entity_type": item.get("entity_type", ""),
+                "vault": vault,
+                "distance": None,
+                "relevance_pct": None,
+                "confidence": "KEYWORD",
+                "above_threshold": True,
+                "graph_boosted": False,
+                "superseded": bool(item.get("superseded")),
+                "keyword_match": True,
+            })
+            continue
         confidence = _confidence_label(item["distance"], vault)
         payload["results"].append({
             "rank": i + 1,
@@ -549,5 +708,6 @@ def _format_json(results: list[dict], query: str, strategy: str = "semantic",
             "above_threshold": confidence != "NO MATCH",
             "graph_boosted": bool(item.get("graph_boosted")),
             "superseded": bool(item.get("superseded")),
+            "keyword_match": bool(item.get("keyword_match")),
         })
     return json.dumps(payload, indent=2)

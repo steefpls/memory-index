@@ -1,7 +1,7 @@
 """Memory Index MCP server — persistent entity/observation/relation memory.
 
-Provides 26 MCP tools for knowledge management via FastMCP:
-- 5 entity tools, 3 observation tools, 2 relation tools
+Provides 29 MCP tools for knowledge management via FastMCP:
+- 6 entity tools, 3 observation tools, 2 relation tools
 - 2 search/graph tools (calibrated observation-level semantic search with an
   opt-in associative strategy, plus neighbor traversal)
 - 3 temporal tools (timeline, point-in-time, temporal neighbors)
@@ -177,6 +177,24 @@ def delete_entity(name_or_id: str, vault: str = "") -> str:
     """
     from src.tools.entities import tool_delete_entity
     return tool_delete_entity(name_or_id, vault)
+
+
+@mcp.tool()
+def merge_entities(source: str, target: str, vault: str = "") -> str:
+    """Merge one entity into another: move observations + relations.
+
+    Every observation on the source (IDs stable, timestamps/source kept) is
+    re-pointed at the target and re-embedded under the target's name; every
+    relation touching the source is re-pointed at the target, deduped by
+    (from, to, type). The source is then soft-deleted.
+
+    Args:
+        source: Source entity name or ID (emptied, then soft-deleted).
+        target: Target entity name or ID (receives everything).
+        vault: Vault name (helps disambiguate names).
+    """
+    from src.tools.entities import tool_merge_entities
+    return tool_merge_entities(source, target, vault)
 
 
 @mcp.tool()

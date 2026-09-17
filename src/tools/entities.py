@@ -41,6 +41,38 @@ def _validate_entity_type(entity_type: str) -> str | None:
     return None
 
 
+def _truncation_note(entity_type: str, entity_name: str,
+                     contents: list[str]) -> str:
+    """Warn when input exceeds the embedding window (tokenizer-checked).
+
+    Long observations are silently cut in the vector while SQLite keeps the
+    full text — search then degrades without anyone noticing. The check uses
+    the model's tokenizer on the exact string the embedder sees (document
+    prefix + "type: name" prefix + content), never a character-count guess.
+    Returns "" when everything fits or the tokenizer is unavailable.
+    """
+    if not contents:
+        return ""
+    try:
+        from src.config import EMBED_DOC_PREFIX, EMBED_MAX_TOKENS
+        from src.indexer.embedder import count_tokens
+        texts = [f"{EMBED_DOC_PREFIX}{entity_type}: {entity_name}\n{c}"
+                 for c in contents]
+        counts = count_tokens(texts)
+    except Exception:
+        return ""
+    if not counts:
+        return ""
+    over = sum(1 for n in counts if n > EMBED_MAX_TOKENS)
+    if not over:
+        return ""
+    return (
+        f"\n  Warning: {over} observation(s) exceed EMBED_MAX_TOKENS "
+        f"({EMBED_MAX_TOKENS}) and will be truncated for search, split into smaller "
+        f"atomic facts. Full text is still stored."
+    )
+
+
 def tool_create_entity(name: str, entity_type: str, vault: str,
                        observations: list[str] | None = None,
                        source: str = "") -> str:
@@ -78,13 +110,16 @@ def tool_create_entity(name: str, entity_type: str, vault: str,
     obs_list = _coerce_str_list(observations) or None
 
     entity = create_entity(name.strip(), entity_type.strip().lower(), vault.strip(),
-                          observations=obs_list, source=source)
+                           observations=obs_list, source=source)
 
     obs_count = len(get_observations(entity.id))
-    return (f"Entity created: {entity.name} ({entity.entity_type})\n"
-            f"  ID: {entity.id}\n"
-            f"  Vault: {entity.vault}\n"
-            f"  Observations: {obs_count}")
+    msg = (f"Entity created: {entity.name} ({entity.entity_type})\n"
+           f"  ID: {entity.id}\n"
+           f"  Vault: {entity.vault}\n"
+           f"  Observations: {obs_count}")
+    if obs_list:
+        msg += _truncation_note(entity.entity_type, entity.name, obs_list)
+    return msg
 
 
 def _obs_json(obs) -> dict:
@@ -387,6 +422,49 @@ def tool_delete_entity(name_or_id: str, vault: str = "") -> str:
     return f"Deleted entity '{entity.name}' (ID: {entity.id}), removed {rel_count} relations."
 
 
+def tool_merge_entities(source: str, target: str, vault: str = "") -> str:
+    """Merge one entity into another: move observations + relations.
+
+    Every observation on the source (IDs stable, timestamps/source kept) is
+    re-pointed at the target and re-embedded under the target's name; every
+    relation touching the source is re-pointed at the target, deduped by
+    (from, to, type). The source is then soft-deleted. Export/import after
+    a merge sees only the merged state, so restores preserve it.
+
+    Args:
+        source: Source entity name or ID (emptied, then soft-deleted).
+        target: Target entity name or ID (receives everything).
+        vault: Vault name (helps disambiguate names; both must be in the
+               same vault).
+
+    Returns:
+        Summary of what moved, or an error.
+    """
+    from src.indexer import store as store_mod
+
+    src_ent = resolve_entity(source, vault or None)
+    if src_ent is None:
+        return f"Source entity not found: '{source}'"
+    tgt_ent = resolve_entity(target, vault or None)
+    if tgt_ent is None:
+        return f"Target entity not found: '{target}'"
+
+    result = store_mod.merge_entities(src_ent.id, tgt_ent.id)
+    if not result.get("ok"):
+        return f"Error: {result.get('error', 'merge failed.')}"
+    lines = [
+        f"Merged '{result['source_name']}' into '{result['target_name']}' "
+        f"(vault: {result['vault']}):",
+        f"  Observations moved: {result['moved_obs']} "
+        f"({result['moved_active']} active)",
+        f"  Relations re-pointed: {result['rels_moved']}"
+        + (f" ({result['rels_deduped']} duplicates removed)"
+           if result["rels_deduped"] else ""),
+        "  Source entity soft-deleted.",
+    ]
+    return "\n".join(lines)
+
+
 def tool_list_entities(vault: str = "", entity_type: str = "",
                        offset: int = 0, limit: int = 20) -> str:
     """List entities with optional filters.
@@ -456,6 +534,7 @@ def tool_add_observation(name_or_id: str, content: str,
         msg += f", supersedes={supersedes}"
     if obs.occurred_at:
         msg += f", occurred_at={obs.occurred_at}"
+    msg += _truncation_note(entity.entity_type, entity.name, [content])
     return msg
 
 
@@ -518,6 +597,9 @@ def tool_add_observations(name_or_id: str, contents: list[str],
     for obs in created:
         when = f"  occurred_at={obs.occurred_at}" if obs.occurred_at else ""
         lines.append(f"  id={obs.id}{when}")
+    note = _truncation_note(entity.entity_type, entity.name, items)
+    if note:
+        lines.append(note.strip())
     return "\n".join(lines)
 
 

@@ -158,6 +158,91 @@ def remove_entity_relations(entity_id: str) -> int:
         return len(relations)
 
 
+def repoint_entity_relations(source_id: str, target_id: str) -> tuple[int, int]:
+    """Re-point every relation touching `source_id` onto `target_id`.
+
+    Used by entity merge: outgoing `source -> X` becomes `target -> X`,
+    incoming `X -> source` becomes `X -> target`, and a `source -> source`
+    self-loop becomes `target -> target`. Relation IDs, types, weights,
+    contexts and creation dates are preserved — only the endpoints move.
+
+    Dedupe is by (from, to, type): when the re-pointed signature already
+    exists (on the target or among already re-pointed edges), the duplicate
+    is hard-removed instead of creating a parallel edge.
+
+    Returns (moved, deduped).
+    """
+    with GRAPH_LOCK:
+        graph = _get_graph()  # ensure loaded
+        source_rels = [
+            r for r in _relations.values()
+            if r.from_entity == source_id or r.to_entity == source_id
+        ]
+        if not source_rels:
+            return (0, 0)
+
+        existing = {
+            (r.from_entity, r.to_entity, r.relation_type)
+            for r in _relations.values()
+            if r.from_entity != source_id and r.to_entity != source_id
+        }
+
+        moved = 0
+        deduped = 0
+        to_update: list = []
+        to_remove_ids: list[str] = []
+
+        for rel in source_rels:
+            new_from = target_id if rel.from_entity == source_id else rel.from_entity
+            new_to = target_id if rel.to_entity == source_id else rel.to_entity
+            sig = (new_from, new_to, rel.relation_type)
+            if sig in existing:
+                to_remove_ids.append(rel.id)
+                deduped += 1
+                continue
+
+            old_from, old_to = rel.from_entity, rel.to_entity
+            try:
+                graph.remove_edge(old_from, old_to, key=rel.id)
+            except nx.NetworkXError:
+                pass
+            rel.from_entity = new_from
+            rel.to_entity = new_to
+            graph.add_edge(
+                new_from, new_to,
+                key=rel.id,
+                relation_type=rel.relation_type,
+                weight=rel.weight,
+                context=rel.context,
+                created_at=rel.created_at,
+            )
+            to_update.append(rel)
+            existing.add(sig)
+            moved += 1
+
+        for rid in to_remove_ids:
+            rel = _relations.pop(rid, None)
+            if rel is None:
+                continue
+            try:
+                graph.remove_edge(rel.from_entity, rel.to_entity, key=rid)
+            except nx.NetworkXError:
+                pass
+            for node_id in (rel.from_entity, rel.to_entity):
+                if graph.has_node(node_id) and graph.degree(node_id) == 0:
+                    graph.remove_node(node_id)
+
+        if to_update:
+            db.upsert_relations(to_update)
+        for rid in to_remove_ids:
+            db.delete_relation_row(rid)
+
+        if graph.has_node(source_id) and graph.degree(source_id) == 0:
+            graph.remove_node(source_id)
+
+        return (moved, deduped)
+
+
 def get_graph() -> nx.MultiDiGraph:
     """Get the graph instance (read-only access).
 
