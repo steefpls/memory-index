@@ -8,11 +8,18 @@ dependencies = [
     "chromadb",
     "sentence-transformers",
     "transformers",
-    "onnxruntime",
     "networkx",
     "scikit-learn",
 ]
 
+# ONNX Runtime comes from exactly one of these two extras. `cpu` is what every
+# machine gets by default (the `cpu` dependency group below carries it, and
+# default-groups turns it on); the server with the GTX 1070 runs
+#   uv sync --no-group cpu --extra cuda
+# and starts with the same flags. onnxruntime-gpu 1.29 is the last line built
+# for CUDA 12 (1.30 moved to CUDA 13, which dropped Pascal), and it only
+# exists on Microsoft's onnxruntime-cuda-12 index. cuDNN is pinned to 9.1.1:
+# 9.26 loads on that card and fails at run time (CUDNN_STATUS_EXECUTION_FAILED).
 [project.optional-dependencies]
 backup = [
     "google-api-python-client",
@@ -20,6 +27,40 @@ backup = [
     "google-auth-oauthlib",
 ]
 dev = ["pytest"]
+cpu = ["onnxruntime"]
+cuda = [
+    "onnxruntime-gpu>=1.29,<1.30",
+    "nvidia-cudnn-cu12==9.1.1.17",
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+]
+
+[dependency-groups]
+cpu = ["memory-index[cpu]"]
+
+[tool.uv]
+default-groups = ["cpu"]
+# No `conflicts` entry on purpose: the two extras resolve together fine (they
+# are different distributions), and declaring them exclusive would mark the
+# self-referencing `cpu` group with the extra's own conflict marker, which
+# makes default-groups unable to turn it on. The server MUST pass
+# --no-group cpu next to --extra cuda: both installed at once would write the
+# same onnxruntime/ directory twice and whichever landed last would win.
+# chromadb declares onnxruntime for its own default embedding function, which
+# memory-index never uses. Rewriting that edge as "only under our cpu extra"
+# is what lets the cuda extra replace it with onnxruntime-gpu (same import
+# name, superset of providers) without the two fighting over one directory.
+override-dependencies = ["onnxruntime; extra == 'cpu'"]
+
+[[tool.uv.index]]
+name = "onnxruntime-cuda-12"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+explicit = true
+
+[tool.uv.sources]
+onnxruntime-gpu = { index = "onnxruntime-cuda-12" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

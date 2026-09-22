@@ -1,9 +1,17 @@
-"""ChromaDB + EmbeddingGemma-300m embedding setup (CPU-only).
+"""ChromaDB + EmbeddingGemma-300m embedding setup.
 
-Memory operations embed one observation at a time, so GPU acceleration
-adds complexity with no practical benefit. Uses the onnx-community q8 export,
-whose graph bakes in mean pooling, the dense projections, and L2 normalization —
-the session outputs a finished `sentence_embedding` tensor directly.
+Uses the onnx-community q8 export, whose graph bakes in mean pooling, the
+dense projections, and L2 normalization — the session outputs a finished
+`sentence_embedding` tensor directly.
+
+CPU by default. MEMORY_INDEX_EMBED_DEVICE picks the ONNX execution provider:
+"auto" (default) takes CUDA when this venv's onnxruntime build offers it (the
+`cuda` dependency group in pyproject) and CPU otherwise; "cuda" insists, and
+a fallback to CPU is then reported as an error through get_embed_device() and
+the /health route so a broken GPU stack never hides as a slow one; "cpu"
+never touches the card. On steef-server's GTX 1070 a query embed drops from
+~120 ms to ~20 ms and a full re-embed of the vault from tens of minutes to
+under one, with vectors identical to CPU within 1e-4.
 """
 
 import logging
@@ -40,6 +48,31 @@ EMBED_BATCH_SIZE = 32
 # count-only batching was already in place. Chunking by cells bounds
 # attention memory no matter how long individual texts are.
 _EMBED_CELL_BUDGET = 8192
+
+EMBED_DEVICE = (os.environ.get("MEMORY_INDEX_EMBED_DEVICE", "auto").strip().lower()
+                or "auto")
+_CUDA = "CUDAExecutionProvider"
+_CPU = "CPUExecutionProvider"
+
+
+def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
+    """The ONNX providers to ask for, and an error when `cuda` was demanded
+    but this build cannot give it. Pure, so it is testable without a GPU.
+
+    The CUDA arena grows by exactly what a run needs rather than doubling:
+    the card is shared with Whisper, and a re-embed batch must not reserve
+    gigabytes it will never touch again.
+    """
+    if device not in ("auto", "cuda", "cpu"):
+        return [_CPU], f"MEMORY_INDEX_EMBED_DEVICE={device!r} is not one of auto, cuda, cpu"
+    if device == "cpu":
+        return [_CPU], None
+    if _CUDA in available:
+        return [(_CUDA, {"arena_extend_strategy": "kSameAsRequested"}), _CPU], None
+    if device == "cuda":
+        return [_CPU], ("this onnxruntime build has no CUDA provider (available: "
+                        + ", ".join(available) + "); install the `cuda` dependency group")
+    return [_CPU], None
 
 
 class _FastTokenizerWrapper:
@@ -101,7 +134,7 @@ _client_lock = threading.Lock()
 
 
 class GemmaEmbedder(EmbeddingFunction[Documents]):
-    """EmbeddingGemma-300m embeddings (308M params, 768-dim), CPU-only ONNX q8.
+    """EmbeddingGemma-300m embeddings (308M params, 768-dim), ONNX q8.
 
     The ONNX graph outputs L2-normalized sentence embeddings directly.
     Falls back to PyTorch CPU if the ONNX model is not found.
@@ -112,6 +145,10 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         self._tokenizer = None
         self._pt_model = None
         self.backend = "not initialized"
+        # "cuda" or "cpu" once loaded; device_error says why a wanted CUDA
+        # session is not the one running.
+        self.device: str | None = None
+        self.device_error: str | None = None
 
         onnx_path = EMBED_ONNX_DIR / EMBED_ONNX_FILENAME
         if onnx_path.exists():
@@ -120,26 +157,30 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
             self._init_pytorch()
 
     def _init_onnx(self, onnx_path: str):
-        """Load ONNX model with CPU execution provider."""
-        logger.info("ONNX init: importing onnxruntime (CPU-only)")
+        """Load the ONNX model on the provider MEMORY_INDEX_EMBED_DEVICE asks for."""
+        logger.info("ONNX init: importing onnxruntime (device=%s)", EMBED_DEVICE)
         import onnxruntime as ort
+
+        # onnxruntime-gpu finds the CUDA/cuDNN DLLs from the nvidia-* wheels
+        # only when told to look; a plain CPU build has nothing to preload.
+        if hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception as e:  # pragma: no cover - depends on the venv
+                logger.debug("preload_dlls: %s", e)
 
         sess_opts = ort.SessionOptions()
         # No persist-optimized-graph flow here: the q8 model uses external
         # weight data, and session creation is only a few seconds.
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # CPU thread tuning
+        # CPU thread tuning (the CPU provider also runs whatever CUDA leaves)
         cores = os.cpu_count() or 4
         usable = max(2, int(cores * 0.5))
         sess_opts.intra_op_num_threads = usable
         sess_opts.inter_op_num_threads = max(1, usable // 4)
 
-        self._ort_session = ort.InferenceSession(
-            onnx_path, sess_opts, providers=["CPUExecutionProvider"]
-        )
-
-        # Tokenizer
+        # Tokenizer first: the CUDA smoke test below needs it.
         tokenizer_json = EMBED_ONNX_DIR / "tokenizer.json"
         if tokenizer_json.exists():
             self._tokenizer = _FastTokenizerWrapper(str(tokenizer_json))
@@ -147,8 +188,38 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
             from transformers import AutoTokenizer
             self._tokenizer = AutoTokenizer.from_pretrained(str(EMBED_ONNX_DIR))
 
-        self.backend = "ONNX + CPU"
+        providers, err = providers_for(EMBED_DEVICE, list(ort.get_available_providers()))
+        session = ort.InferenceSession(onnx_path, sess_opts, providers=providers)
+        want_cuda = providers[0] != _CPU
+        if want_cuda:
+            # A CUDA session can be created and still die on its first run
+            # (cuDNN 9.26 on Pascal: CUDNN_STATUS_EXECUTION_FAILED), so prove
+            # it here rather than on the first search of the day.
+            try:
+                if session.get_providers()[0] != _CUDA:
+                    raise RuntimeError("the session came up on " + session.get_providers()[0])
+                self._smoke(session)
+            except Exception as e:
+                err = f"CUDA session failed, using CPU: {str(e)[:300]}"
+                logger.error("EmbeddingGemma: %s", err)
+                session = ort.InferenceSession(onnx_path, sess_opts, providers=[_CPU])
+        self._ort_session = session
+        self.device = "cuda" if session.get_providers()[0] == _CUDA else "cpu"
+        self.device_error = err
+        if err and not want_cuda:
+            logger.warning("EmbeddingGemma: %s", err)
+
+        self.backend = "ONNX + " + self.device.upper()
         logger.info("EmbeddingGemma loaded: %s (%d threads)", self.backend, usable)
+
+    def _smoke(self, session) -> None:
+        """One tiny inference through `session`; raises when the provider is broken."""
+        import numpy as np
+        dummy = self._tokenizer(["warmup"], return_tensors="np", padding=True,
+                                truncation=True, max_length=EMBED_MAX_TOKENS)
+        feed = {"input_ids": dummy["input_ids"].astype(np.int64),
+                "attention_mask": dummy["attention_mask"].astype(np.int64)}
+        session.run(["sentence_embedding"], feed)
 
     def _init_pytorch(self):
         """Fallback: load via sentence-transformers (PyTorch CPU).
@@ -323,6 +394,21 @@ def release_embedding_function() -> None:
 def get_active_backend() -> str:
     """Return active backend if initialized, else 'not initialized'."""
     return _active_backend
+
+
+def get_embed_device() -> dict:
+    """What was asked for and what is running, for memory_status and /health.
+
+    `active` is None until the first embed loads the model; `error` is set
+    when a wanted CUDA session is not the one answering, so a GPU stack that
+    broke on a package bump shows up as a fault instead of as slower searches.
+    """
+    fn = _embedding_fn
+    return {
+        "requested": EMBED_DEVICE,
+        "active": getattr(fn, "device", None) if fn is not None else None,
+        "error": getattr(fn, "device_error", None) if fn is not None else None,
+    }
 
 
 def count_tokens(texts: list[str]) -> list[int] | None:

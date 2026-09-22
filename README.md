@@ -2,7 +2,7 @@
 
 Local MCP server for persistent entity/observation/relation memory. Provides semantic search over a knowledge graph via ChromaDB vectors + NetworkX graph layer.
 
-Built for Claude Code / Codex CLI. CPU-only — single-observation embeds are ~10ms, so GPU adds overhead with no benefit.
+Built for Claude Code / Codex CLI. CPU by default; an NVIDIA card is used when the `cuda` dependency group is installed (see **GPU** below).
 
 ## Quick Start
 
@@ -296,6 +296,40 @@ When the daemon serves HTTP (`MCP_PORT` + `MCP_API_KEY`), it also answers Bearer
 POST /embed          Authorization: Bearer <key>
                      {"texts": ["...", ...], "kind": "document" | "query"}
 → 200 {"model": "embeddinggemma-300m", "backend": "ONNX + CPU", "dim": 768, "kind": "document", "vectors": [[...], ...]}
+
+`GET /health` is open (no key) and says which device the embedder runs on —
+what the hub's watchdog reads:
+
+```
+→ 200 {"ok": true, "model": "embeddinggemma-300m", "backend": "ONNX + CUDA",
+       "embed_device": {"requested": "auto", "active": "cuda", "error": null}}
+```
+
+## GPU
+
+ONNX Runtime comes from one of two dependency groups. `cpu` is the default,
+so `uv sync` / `uv run` on a laptop change nothing. A machine with an NVIDIA
+card installs the other group instead and starts the server with the same
+flags (the two conflict, so one or the other):
+
+```
+uv sync --no-group cpu --extra cuda
+uv run --no-group cpu --extra cuda src/server.py
+```
+
+`MEMORY_INDEX_EMBED_DEVICE` picks the provider: `auto` (default) takes CUDA
+when the build offers it, `cuda` insists and reports a fallback as an error
+in `memory_status` and `/health`, `cpu` never touches the card. On
+steef-server's GTX 1070 (Pascal) a query embed goes from ~120 ms to ~20 ms
+and a full re-embed of the vault from ~25 minutes to under one; vectors match
+CPU within 1e-4, so search results do not change.
+
+The pins in the `cuda` group are not arbitrary. onnxruntime-gpu 1.29 is the
+last line built for CUDA 12 (1.30 moved to CUDA 13, which dropped Pascal)
+and only exists on Microsoft's `onnxruntime-cuda-12` package index; cuDNN
+9.26 loads on that card and fails at run time, 9.1.1 works. A session that
+comes up on CUDA is smoke-tested once at load and falls back to CPU with the
+error recorded, so a broken GPU stack shows as a fault, never as a slow day.
 ```
 
 - `kind` picks the prefix the model expects: `document` (default, how observations are stored) or `query` (how searches are embedded). Vectors are L2-normalised, so a dot product is the cosine.

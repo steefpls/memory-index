@@ -204,5 +204,74 @@ class TestOnnxBatching(unittest.TestCase):
         self.assertTrue(long_chunk, f"no small chunk isolated the long text: {batch_rows}")
 
 
+class TestProviderChoice(unittest.TestCase):
+    """providers_for is the whole device policy, pure so it runs without a GPU."""
+
+    def setUp(self):
+        from src.indexer.embedder import providers_for
+        self.pf = providers_for
+        self.cuda = "CUDAExecutionProvider"
+        self.cpu = "CPUExecutionProvider"
+
+    def _names(self, providers):
+        return [p[0] if isinstance(p, tuple) else p for p in providers]
+
+    def test_auto_takes_cuda_when_the_build_offers_it(self):
+        providers, err = self.pf("auto", [self.cuda, self.cpu])
+        self.assertEqual(self._names(providers), [self.cuda, self.cpu])
+        self.assertIsNone(err)
+        # The arena grows by what a run needs: the card is shared with Whisper.
+        self.assertEqual(providers[0][1]["arena_extend_strategy"], "kSameAsRequested")
+
+    def test_auto_is_quietly_cpu_on_a_plain_build(self):
+        providers, err = self.pf("auto", [self.cpu])
+        self.assertEqual(providers, [self.cpu])
+        self.assertIsNone(err)
+
+    def test_cuda_demanded_but_missing_is_an_error_not_a_silent_fallback(self):
+        providers, err = self.pf("cuda", ["AzureExecutionProvider", self.cpu])
+        self.assertEqual(providers, [self.cpu])
+        self.assertIn("no CUDA provider", err)
+        self.assertIn("cuda", err)  # names the dependency group to install
+
+    def test_cpu_never_touches_the_card(self):
+        providers, err = self.pf("cpu", [self.cuda, self.cpu])
+        self.assertEqual(providers, [self.cpu])
+        self.assertIsNone(err)
+
+    def test_typo_is_reported_and_runs_on_cpu(self):
+        providers, err = self.pf("gpu", [self.cuda, self.cpu])
+        self.assertEqual(providers, [self.cpu])
+        self.assertIn("gpu", err)
+
+
+class TestEmbedDeviceReport(unittest.TestCase):
+    """get_embed_device() is what memory_status and /health show."""
+
+    def setUp(self):
+        import src.indexer.embedder as emb
+        self.emb = emb
+        self._saved = emb._embedding_fn
+
+    def tearDown(self):
+        self.emb._embedding_fn = self._saved
+
+    def test_nothing_loaded_yet(self):
+        self.emb._embedding_fn = None
+        d = self.emb.get_embed_device()
+        self.assertEqual(d["requested"], self.emb.EMBED_DEVICE)
+        self.assertIsNone(d["active"])
+        self.assertIsNone(d["error"])
+
+    def test_loaded_with_a_fallback_reports_the_error(self):
+        class Fake:
+            device = "cpu"
+            device_error = "CUDA session failed, using CPU: CUDNN_STATUS_EXECUTION_FAILED"
+        self.emb._embedding_fn = Fake()
+        d = self.emb.get_embed_device()
+        self.assertEqual(d["active"], "cpu")
+        self.assertIn("CUDNN", d["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

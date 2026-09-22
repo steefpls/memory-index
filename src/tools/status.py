@@ -7,7 +7,7 @@ from src.config import (
     create_vault as config_create_vault, delete_vault as config_delete_vault,
 )
 from src.indexer.store import get_entity_count, get_observation_count
-from src.indexer.embedder import get_active_backend
+from src.indexer.embedder import get_active_backend, get_embed_device
 from src.graph.manager import get_relation_count
 from src.graph.traversal import get_graph_summary
 
@@ -37,9 +37,15 @@ def tool_memory_status() -> str:
     rel_count = get_relation_count()
     graph_summary = get_graph_summary()
 
+    dev = get_embed_device()
+    device_line = f"  Embed device: {dev['active'] or 'not loaded yet'} (requested {dev['requested']})"
+    if dev.get("error"):
+        device_line += f" -- {dev['error']}"
+
     lines = [
         "Memory Index Status",
         f"  Backend: {backend}",
+        device_line,
         f"  Vaults: {len(vaults)}",
         f"  Total entities: {total_entities}",
         f"  Total observations: {total_observations}",

@@ -15,7 +15,7 @@ from starlette.applications import Starlette  # noqa: E402
 from starlette.routing import Route  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
-from src.embed_http import MAX_TEXTS, make_embed_endpoint  # noqa: E402
+from src.embed_http import MAX_TEXTS, make_embed_endpoint, make_health_endpoint  # noqa: E402
 
 KEY = "fakekey0123456789abcdef"
 
@@ -133,6 +133,27 @@ class TestEmbedEndpoint(unittest.TestCase):
         register(m, KEY)
         paths = [getattr(r, "path", None) for r in m._custom_starlette_routes]
         self.assertIn("/embed", paths)
+
+    def test_health_is_open_and_reports_the_device(self):
+        handler = make_health_endpoint(
+            get_backend=lambda: "ONNX + CUDA",
+            get_device=lambda: {"requested": "auto", "active": "cuda", "error": None})
+        app = Starlette(routes=[Route("/health", handler, methods=["GET"])])
+        r = TestClient(app).get("/health")  # no Authorization header
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["backend"], "ONNX + CUDA")
+        self.assertEqual(body["embed_device"], {"requested": "auto", "active": "cuda", "error": None})
+
+    def test_health_registers_beside_embed(self):
+        from mcp.server.fastmcp import FastMCP
+        from src.embed_http import register
+
+        m = FastMCP("t")
+        register(m, KEY)
+        paths = [getattr(r, "path", None) for r in m._custom_starlette_routes]
+        self.assertIn("/health", paths)
 
 
 if __name__ == "__main__":

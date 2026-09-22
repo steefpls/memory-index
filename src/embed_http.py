@@ -50,6 +50,31 @@ def _default_backend() -> str:
     return get_active_backend()
 
 
+def _default_device() -> dict:
+    from src.indexer.embedder import get_embed_device
+    return get_embed_device()
+
+
+def make_health_endpoint(
+    get_backend: Callable[[], str] = _default_backend,
+    get_device: Callable[[], dict] = _default_device,
+):
+    """GET /health: unauthenticated, no secrets, what the hub's watchdog reads.
+
+    `embed_device` is {"requested", "active", "error"}: `active` is None
+    until the first embed loads the model, and `error` names why a wanted
+    CUDA session is not the one running. Nothing here is keyed because it
+    says nothing about the vault, only about the process."""
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "ok": True,
+            "model": MODEL_NAME,
+            "backend": get_backend(),
+            "embed_device": get_device(),
+        })
+    return health
+
+
 def make_embed_endpoint(
     api_key: str,
     get_embedder: Callable[[], Any] = _default_embedder,
@@ -116,5 +141,6 @@ def make_embed_endpoint(
 
 
 def register(mcp: Any, api_key: str) -> None:
-    """Add the Bearer-authenticated POST /embed route."""
+    """Add the Bearer-authenticated POST /embed route and the open GET /health."""
     mcp.custom_route("/embed", methods=["POST"], name="embed")(make_embed_endpoint(api_key))
+    mcp.custom_route("/health", methods=["GET"], name="health")(make_health_endpoint())
