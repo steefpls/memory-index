@@ -230,7 +230,7 @@ Unless the agent is explicitly told otherwise, all operations should target a si
 
 Pipeline:
 
-1. Embed the query with EmbeddingGemma-300m (CPU, ONNX q8), using the retrieval-query prefix
+1. Embed the query with EmbeddingGemma-300m (ONNX q8, on the GPU where one is configured), using the retrieval-query prefix
 2. Query each in-scope vault's ChromaDB collection for ids + distances (`entity_type` is the only filter pushed into the `where` clause), then **join every hit back to its SQLite store row** — content, source, entity context, supersession, and timestamps all come from the store, so a stray vector can never resurrect a deleted or divergent fact. Superseded and `since`/`before` filters apply on the store row; the date window tests `created_at` by default or event time with `date_axis="event"`.
 3. Flatten every matching observation into one list across vaults and rank it by calibrated relevance score (a strictly decreasing function of distance within a vault, and the only key that compares fairly across vaults when searching all of them)
 4. Gate on the vault's calibrated noise floor — an observation is *above threshold* when its band is anything other than `NO MATCH`
@@ -286,7 +286,7 @@ Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` r
 
 An entity that already exists in the target vault is reused and its own timestamps are left alone — rewriting them would falsify history the target vault legitimately owns.
 
-**What an archive does not contain:** vectors, and the SQLite file itself. Restore re-embeds every observation and recalibrates the vault, so recovery is correct but slow (minutes, CPU-bound) rather than instant. `occurred_at` and all supersede chains survive; nothing about the graph or the facts is lost.
+**What an archive does not contain:** vectors, and the SQLite file itself. Restore re-embeds every observation and recalibrates the vault, so recovery is correct but not instant (about two minutes on the GPU, tens of minutes on a CPU). `occurred_at` and all supersede chains survive; nothing about the graph or the facts is lost.
 
 ## Embedding endpoint for other services
 
@@ -338,7 +338,7 @@ error recorded, so a broken GPU stack shows as a fault, never as a slow day.
 
 ## Architecture
 
-Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline shape, simplified to CPU-only; the model was swapped from CodeRankEmbed (a code retriever) to google/embeddinggemma-300m (768-dim, ONNX q8) for natural-language memory retrieval.
+Forked from [code-index](https://github.com/you/code-index). Same embedding pipeline shape, simplified to ONNX Runtime only (CPU by default, CUDA as an extra); the model was swapped from CodeRankEmbed (a code retriever) to google/embeddinggemma-300m (768-dim, ONNX q8) for natural-language memory retrieval.
 
 ```
 src/
@@ -347,7 +347,7 @@ src/
 ├── embed_http.py          # Bearer-authenticated POST /embed (reuses the loaded model)
 ├── indexer/
 │   ├── db.py              # SQLite DAL (row-level transactions, legacy-JSON auto-migration)
-│   ├── embedder.py        # ONNX CPU embedder singleton + ChromaDB client
+│   ├── embedder.py        # ONNX embedder singleton (CPU or CUDA) + ChromaDB client
 │   ├── calibration.py     # Per-vault distance thresholds (randomly sampled probes)
 │   └── store.py           # Entity/observation CRUD, in-memory cache over SQLite, RLock
 ├── graph/

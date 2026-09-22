@@ -360,7 +360,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
 
 
 def get_embedding_function() -> GemmaEmbedder:
-    """Get or create the singleton GemmaEmbedder (CPU-only, one instance).
+    """Get or create the singleton GemmaEmbedder (one instance, whichever device).
 
     Thread-safe: the double-checked lock means concurrent first-callers (a
     search racing a write, say) block on one construction instead of each
