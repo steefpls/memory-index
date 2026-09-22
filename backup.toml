@@ -1,0 +1,24 @@
+# What memory-index needs to come back after a wipe, read by the fleet backup
+# (backup/fleet_backup.py in daemon-hub). Every file git ignores here must
+# match `files`, `sqlite` or `skip`, or the backup reports it.
+
+files = [
+    "data/*_calibration.json",  # each vault's search thresholds
+]
+sqlite = [
+    # Every vault's entities, observations and relations. The search index
+    # (data/chroma) is rebuilt from it: scripts/reembed_all.py.
+    "data/memory.db",
+]
+skip = [
+    "data/chroma/",
+    "data/embeddinggemma_onnx/",  # downloaded by setup.bat
+    "data/exports/",              # the old daily vault exports
+    "data/backup.log",
+    "data/server.log",
+    "data/memory_entities.json",  # frozen pre-SQLite store
+    "data/memory_graph.json",
+    "data/vaults.json",
+    "backfill_report.txt",
+    "daemon.log.*",
+]
