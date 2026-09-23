@@ -55,23 +55,38 @@ def _default_device() -> dict:
     return get_embed_device()
 
 
+def _default_load_error() -> str | None:
+    from src.indexer.embedder import get_load_error
+    return get_load_error()
+
+
 def make_health_endpoint(
     get_backend: Callable[[], str] = _default_backend,
     get_device: Callable[[], dict] = _default_device,
+    get_load_error: Callable[[], str | None] = _default_load_error,
 ):
     """GET /health: unauthenticated, no secrets, what the hub's watchdog reads.
 
     `embed_device` is {"requested", "active", "error"}: `active` is None
     until the first embed loads the model, and `error` names why a wanted
     CUDA session is not the one running. Nothing here is keyed because it
-    says nothing about the vault, only about the process."""
+    says nothing about the vault, only about the process.
+
+    When the model has failed to load, the answer is 503 with ok: false and
+    `error` saying why: the process is up, but every search and write needs
+    the embedder, so it is not doing its job. Before the first load attempt
+    (the seconds of warm-up after a start) it stays ok."""
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({
-            "ok": True,
+        err = get_load_error()
+        body: dict[str, Any] = {
+            "ok": err is None,
             "model": MODEL_NAME,
             "backend": get_backend(),
             "embed_device": get_device(),
-        })
+        }
+        if err:
+            body["error"] = f"the embedding model won't load, so search and writes fail ({err})"
+        return JSONResponse(body, status_code=503 if err else 200)
     return health
 
 

@@ -22,12 +22,14 @@ class TestEmbeddingSingleton(unittest.TestCase):
         self.emb = emb
         self._saved_fn = emb._embedding_fn
         self._saved_backend = emb._active_backend
+        self._saved_error = emb._load_error
         emb._embedding_fn = None
         emb._active_backend = "not initialized"
 
     def tearDown(self):
         self.emb._embedding_fn = self._saved_fn
         self.emb._active_backend = self._saved_backend
+        self.emb._load_error = self._saved_error
 
     def _slow_fake(self, counter):
         class FakeEmbedder:
@@ -86,6 +88,21 @@ class TestEmbeddingSingleton(unittest.TestCase):
             self.assertEqual(self.emb.get_active_backend(), "not initialized")
             self.emb.get_embedding_function()
         self.assertEqual(len(built), 2)
+
+
+    def test_a_failed_load_is_remembered_until_one_succeeds(self):
+        """/health reads get_load_error(): a model that won't load must show
+        there, and a later successful load must clear it."""
+        class Broken:
+            def __init__(self):
+                raise AttributeError("module 'onnxruntime' has no attribute 'SessionOptions'")
+        with patch.object(self.emb, "GemmaEmbedder", Broken):
+            with self.assertRaises(AttributeError):
+                self.emb.get_embedding_function()
+        self.assertIn("SessionOptions", self.emb.get_load_error())
+        with patch.object(self.emb, "GemmaEmbedder", self._slow_fake([])):
+            self.emb.get_embedding_function()
+        self.assertIsNone(self.emb.get_load_error())
 
 
 class TestChromaClientSingleton(unittest.TestCase):

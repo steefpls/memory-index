@@ -137,7 +137,8 @@ class TestEmbedEndpoint(unittest.TestCase):
     def test_health_is_open_and_reports_the_device(self):
         handler = make_health_endpoint(
             get_backend=lambda: "ONNX + CUDA",
-            get_device=lambda: {"requested": "auto", "active": "cuda", "error": None})
+            get_device=lambda: {"requested": "auto", "active": "cuda", "error": None},
+            get_load_error=lambda: None)
         app = Starlette(routes=[Route("/health", handler, methods=["GET"])])
         r = TestClient(app).get("/health")  # no Authorization header
         self.assertEqual(r.status_code, 200)
@@ -145,6 +146,18 @@ class TestEmbedEndpoint(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["backend"], "ONNX + CUDA")
         self.assertEqual(body["embed_device"], {"requested": "auto", "active": "cuda", "error": None})
+
+    def test_health_fails_when_the_model_wont_load(self):
+        handler = make_health_endpoint(
+            get_backend=lambda: "not initialized",
+            get_device=lambda: {"requested": "cuda", "active": None, "error": None},
+            get_load_error=lambda: "AttributeError: module 'onnxruntime' has no attribute 'SessionOptions'")
+        app = Starlette(routes=[Route("/health", handler, methods=["GET"])])
+        r = TestClient(app).get("/health")
+        self.assertEqual(r.status_code, 503)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("SessionOptions", body["error"])
 
     def test_health_registers_beside_embed(self):
         from mcp.server.fastmcp import FastMCP

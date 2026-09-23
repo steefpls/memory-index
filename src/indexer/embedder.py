@@ -113,6 +113,11 @@ class _FastTokenizerWrapper:
 _client: chromadb.ClientAPI | None = None
 _embedding_fn: "GemmaEmbedder | None" = None
 _active_backend: str = "not initialized"
+# Why the last attempt to build the embedder failed; None once one succeeds.
+# /health reports it, because a server whose model won't load still answers
+# every probe while every search and write fails (2026-09-23: a half-removed
+# onnxruntime package, "has no attribute 'SessionOptions'", for ~25 minutes).
+_load_error: str | None = None
 
 # Separate tokenizer instance for length checks (never truncated). It must NOT
 # be the embedder's own tokenizer: _FastTokenizerWrapper mutates truncation
@@ -366,13 +371,18 @@ def get_embedding_function() -> GemmaEmbedder:
     search racing a write, say) block on one construction instead of each
     building — and leaking — their own ONNX session.
     """
-    global _embedding_fn, _active_backend
+    global _embedding_fn, _active_backend, _load_error
     fn = _embedding_fn
     if fn is not None:
         return fn
     with _embedder_lock:
         if _embedding_fn is None:
-            built = GemmaEmbedder()
+            try:
+                built = GemmaEmbedder()
+            except Exception as e:
+                _load_error = f"{type(e).__name__}: {e}"
+                raise
+            _load_error = None
             _active_backend = built.backend
             _embedding_fn = built
         return _embedding_fn
@@ -394,6 +404,11 @@ def release_embedding_function() -> None:
 def get_active_backend() -> str:
     """Return active backend if initialized, else 'not initialized'."""
     return _active_backend
+
+
+def get_load_error() -> str | None:
+    """Why the embedder failed to load on its last attempt, or None."""
+    return _load_error
 
 
 def get_embed_device() -> dict:
