@@ -276,7 +276,7 @@ Confidence thresholds (`HIGH` / `MEDIUM` / `LOW`, with everything beyond `LOW` r
 
 ## Backup & restore
 
-`scripts/backup_to_drive.py` runs daily on the server: it exports the `work` vault to a date-stamped zip and uploads it to a Drive folder, keeping 7 days locally and 30 on Drive. Export is a concurrent reader — it runs as a separate process against the live WAL database while the daemon holds it open.
+`scripts/backup_to_drive.py` runs daily on the server: it exports a vault to a date-stamped zip and uploads it to a Drive folder, keeping 7 days locally and 30 on Drive. The vault, the Google account and the owner's profile (where google_workspace_mcp keeps that account's token) come from `MEMORY_BACKUP_VAULT`, `OWNER_GOOGLE_EMAIL` and `INSTANCE_PROFILE`; unset, they are the original server's (`work`, Steve's account, `C:\Users\steve`). Export is a concurrent reader — it runs as a separate process against the live WAL database while the daemon holds it open.
 
 **A restore preserves history, not just facts.** That property is easy to lose, because import replays rows through the normal write path and every write defaults its timestamps to *now*. Three things are carried across explicitly:
 

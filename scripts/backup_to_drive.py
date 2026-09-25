@@ -1,22 +1,32 @@
-"""Daily memory-index work-vault backup to Google Drive.
+"""Daily memory-index vault backup to Google Drive.
 
-Runs on steef-server via Windows Task Scheduler. Calls
-`tool_export_vault('work', ...)` to produce a date-stamped zip in
+Runs on the server via Windows Task Scheduler. Calls
+`tool_export_vault(VAULT, ...)` to produce a date-stamped zip in
 `data/exports/`, then uploads to a Drive folder named
 `memory-index-backups` using the OAuth token shared with
 google_workspace_mcp.
+
+Settings, from the environment (unset = steef-server's values):
+  MEMORY_BACKUP_VAULT  vault to back up (default "work")
+  OWNER_GOOGLE_EMAIL   Google account whose Drive gets it, and whose
+                       google_workspace_mcp token is used
+                       (default steven.koe80@gmail.com)
+  INSTANCE_PROFILE     the owner's user profile, where that token lives
+                       (default C:\\Users\\steve)
 
 Local copies are pruned to LOCAL_RETENTION_DAYS; Drive copies are
 pruned to DRIVE_RETENTION_DAYS.
 
 Designed to run as the SYSTEM account from Task Scheduler with
-USERPROFILE pointed at C:\\Users\\steve in the task action's env vars.
-The OAuth token path is hardcoded so SYSTEM-execution doesn't read
-from Windows\\System32\\config\\systemprofile by mistake.
+USERPROFILE pointed at the owner's profile in the task action's env vars.
+The OAuth token path comes from INSTANCE_PROFILE, never Path.home(), so
+SYSTEM-execution doesn't read from Windows\\System32\\config\\systemprofile
+by mistake.
 """
 
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -27,7 +37,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.tools.portability import tool_export_vault  # noqa: E402
 
-VAULT = "work"
 EXPORTS_DIR = PROJECT_ROOT / "data" / "exports"
 LOG_FILE = PROJECT_ROOT / "data" / "backup.log"
 LOCAL_RETENTION_DAYS = 7
@@ -40,23 +49,47 @@ DRIVE_FOLDER_NAME = "memory-index-backups"
 DRIVE_MAX_ATTEMPTS = 3
 DRIVE_RETRY_BASE_S = 30.0
 
-# Hardcoded — Path.home() resolves wrong under SYSTEM (points to
-# C:\Windows\System32\config\systemprofile). Server is one specific
-# host so a hardcoded path is correct here.
-OAUTH_TOKEN_PATH = Path(
-    r"C:\Users\steve\.google_workspace_mcp\credentials\steven.koe80@gmail.com.json"
-)
+DEFAULT_VAULT = "work"
+DEFAULT_OWNER_GOOGLE_EMAIL = "steven.koe80@gmail.com"
+DEFAULT_INSTANCE_PROFILE = r"C:\Users\steve"
 
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stderr),
-    ],
-)
+
+def backup_settings(env=None) -> tuple[str, Path]:
+    """(vault, OAuth token path) from the environment.
+
+    The token is google_workspace_mcp's credential file for the owner's
+    Google account, under the owner's profile. INSTANCE_PROFILE, not
+    Path.home(): under SYSTEM that resolves to the system profile.
+    """
+    env = os.environ if env is None else env
+
+    def get(key, default):
+        return (env.get(key) or "").strip() or default
+
+    vault = get("MEMORY_BACKUP_VAULT", DEFAULT_VAULT)
+    email = get("OWNER_GOOGLE_EMAIL", DEFAULT_OWNER_GOOGLE_EMAIL)
+    profile = get("INSTANCE_PROFILE", DEFAULT_INSTANCE_PROFILE)
+    token = Path(profile) / ".google_workspace_mcp" / "credentials" / f"{email}.json"
+    return vault, token
+
+
+VAULT, OAUTH_TOKEN_PATH = backup_settings()
+
 log = logging.getLogger("backup_to_drive")
+
+
+def setup_logging() -> None:
+    """File + stderr logging. Only when run, so importing this module
+    (tests) writes no log file."""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(sys.stderr),
+        ],
+    )
 
 
 def export_vault_local() -> Path:
@@ -183,6 +216,7 @@ def _drive_phase(local_path: Path) -> None:
 
 
 def main() -> int:
+    setup_logging()
     try:
         local_path = export_vault_local()
     except Exception:

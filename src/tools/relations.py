@@ -44,7 +44,7 @@ def tool_create_relation(from_entity: str, to_entity: str,
     endpoints automatically). If nothing fits, use related_to and put the
     nuance in context.
 
-    context is a disambiguator ("the 2024 contract", "which Steven"), not a
+    context is a disambiguator ("the 2024 contract", "which Alex"), not a
     fact store. It never appears in search results and cannot be superseded,
     so a fact written here rots where nothing can see or correct it. Facts
     belong on the entity they are about, as observations.
