@@ -59,9 +59,10 @@ def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
     """The ONNX providers to ask for, and an error when `cuda` was demanded
     but this build cannot give it. Pure, so it is testable without a GPU.
 
-    The CUDA arena grows by exactly what a run needs rather than doubling:
-    the card is shared with Whisper, and a re-embed batch must not reserve
-    gigabytes it will never touch again.
+    kSameAsRequested makes the CUDA arena grow by exactly what a run needs
+    rather than doubling. It does not make it give anything back: the arena
+    keeps its peak (2.9 GB live on 2026-09-25, against ~400 MiB for the
+    session and weights) until a run asks it to shrink; see run_config_for.
     """
     if device not in ("auto", "cuda", "cpu"):
         return [_CPU], f"MEMORY_INDEX_EMBED_DEVICE={device!r} is not one of auto, cuda, cpu"
@@ -73,6 +74,35 @@ def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
         return [_CPU], ("this onnxruntime build has no CUDA provider (available: "
                         + ", ".join(available) + "); install the `cuda` dependency group")
     return [_CPU], None
+
+
+def run_config_for(provider: str) -> dict[str, str]:
+    """RunOptions entries for every run of a session led by `provider`. Pure,
+    so it is testable without a GPU.
+
+    On CUDA each run hands the arena's free chunks back to the card when it
+    ends. The card is shared with Whisper and FLUX, and without this one long
+    re-embed chunk kept ~2 GB reserved for the life of the process; with it
+    the process sits at ~410 MiB after every run. The price, measured on the
+    GTX 1070 (2026-09-25): every run allocates its ~1.6 GB of working memory
+    afresh, so a single query goes from ~72 to ~138 ms and a 32-row batch
+    from ~1.6 to ~1.7 s. CPU memory is not touched.
+    """
+    if provider == _CUDA:
+        return {"memory.enable_memory_arena_shrinkage": "gpu:0"}
+    return {}
+
+
+def _run_options(session):
+    """The RunOptions for `session` (see run_config_for), or None for none."""
+    config = run_config_for(session.get_providers()[0])
+    if not config:
+        return None
+    import onnxruntime as ort
+    opts = ort.RunOptions()
+    for key, value in config.items():
+        opts.add_run_config_entry(key, value)
+    return opts
 
 
 class _FastTokenizerWrapper:
@@ -147,6 +177,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
 
     def __init__(self):
         self._ort_session = None
+        self._run_opts = None
         self._tokenizer = None
         self._pt_model = None
         self.backend = "not initialized"
@@ -209,6 +240,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                 logger.error("EmbeddingGemma: %s", err)
                 session = ort.InferenceSession(onnx_path, sess_opts, providers=[_CPU])
         self._ort_session = session
+        self._run_opts = _run_options(session)
         self.device = "cuda" if session.get_providers()[0] == _CUDA else "cpu"
         self.device_error = err
         if err and not want_cuda:
@@ -224,7 +256,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                                 truncation=True, max_length=EMBED_MAX_TOKENS)
         feed = {"input_ids": dummy["input_ids"].astype(np.int64),
                 "attention_mask": dummy["attention_mask"].astype(np.int64)}
-        session.run(["sentence_embedding"], feed)
+        session.run(["sentence_embedding"], feed, _run_options(session))
 
     def _init_pytorch(self):
         """Fallback: load via sentence-transformers (PyTorch CPU).
@@ -255,7 +287,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                 "attention_mask": dummy["attention_mask"].astype(np.int64),
             }
             try:
-                self._ort_session.run(["sentence_embedding"], feed)
+                self._ort_session.run(["sentence_embedding"], feed, self._run_opts)
             except Exception as e:
                 logger.warning("Warmup failed: %s", e)
             logger.info("EmbeddingGemma warmup complete")
@@ -323,7 +355,8 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         feed = {"input_ids": ids, "attention_mask": mask}
 
         try:
-            out = self._ort_session.run(["sentence_embedding"], feed)[0]  # (batch, 768)
+            out = self._ort_session.run(["sentence_embedding"], feed,
+                                        self._run_opts)[0]  # (batch, 768)
         except Exception as e:
             # Fallback: embed one at a time
             logger.warning("Batch embed failed, falling back to individual: %s", str(e)[:120])
@@ -336,7 +369,8 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                 mask1 = inp1["attention_mask"].astype(np.int64)
                 out1 = self._ort_session.run(
                     ["sentence_embedding"],
-                    {"input_ids": ids1, "attention_mask": mask1})[0]
+                    {"input_ids": ids1, "attention_mask": mask1},
+                    self._run_opts)[0]
                 results.append(out1[0].tolist())
             return results
 
@@ -359,6 +393,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
     def close(self) -> None:
         """Release model/session references."""
         self._ort_session = None
+        self._run_opts = None
         self._tokenizer = None
         self._pt_model = None
         self.backend = "released"

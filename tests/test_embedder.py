@@ -158,7 +158,7 @@ class TestOnnxBatching(unittest.TestCase):
         seen = []
 
         class FakeSession:
-            def run(self, names, feed):
+            def run(self, names, feed, run_options=None):
                 n = feed["input_ids"].shape[0]
                 seen.append(n)
                 return [np.zeros((n, 768), dtype=np.float32)]
@@ -170,6 +170,7 @@ class TestOnnxBatching(unittest.TestCase):
                         "attention_mask": np.ones((n, 8), dtype=np.int64)}
 
         e._ort_session = FakeSession()
+        e._run_opts = None
         e._tokenizer = FakeTok()
         e._pt_model = None
         return e, seen
@@ -260,6 +261,88 @@ class TestProviderChoice(unittest.TestCase):
         providers, err = self.pf("gpu", [self.cuda, self.cpu])
         self.assertEqual(providers, [self.cpu])
         self.assertIn("gpu", err)
+
+
+class TestArenaShrinkage(unittest.TestCase):
+    """Every CUDA run asks ORT to hand its arena back to the card.
+
+    Regression: kSameAsRequested alone let the arena keep its peak for the
+    life of the process; the live daemon held 2.9 GB of the shared GTX 1070
+    for a ~400 MiB model (2026-09-25).
+    """
+    KEY = "memory.enable_memory_arena_shrinkage"
+
+    def setUp(self):
+        import src.indexer.embedder as emb
+        self.emb = emb
+
+    def test_cuda_runs_shrink_the_gpu_arena(self):
+        self.assertEqual(self.emb.run_config_for("CUDAExecutionProvider"),
+                         {self.KEY: "gpu:0"})
+
+    def test_cpu_runs_get_no_run_options(self):
+        self.assertEqual(self.emb.run_config_for("CPUExecutionProvider"), {})
+
+    def _fake_session(self, provider, calls, fail_batches=False):
+        import numpy as np
+
+        class FakeSession:
+            def get_providers(self):
+                return [provider, "CPUExecutionProvider"]
+
+            def run(self, names, feed, run_options=None):
+                n = feed["input_ids"].shape[0]
+                calls.append((n, run_options))
+                if fail_batches and n > 1:
+                    raise RuntimeError("batch too big")
+                return [np.zeros((n, 768), dtype=np.float32)]
+
+        return FakeSession()
+
+    def _embedder(self, session):
+        import numpy as np
+        e = self.emb.GemmaEmbedder.__new__(self.emb.GemmaEmbedder)
+
+        class FakeTok:
+            def __call__(self, texts, **kw):
+                n = len(texts)
+                return {"input_ids": np.zeros((n, 8), dtype=np.int64),
+                        "attention_mask": np.ones((n, 8), dtype=np.int64)}
+
+        e._ort_session = session
+        e._run_opts = self.emb._run_options(session)
+        e._tokenizer = FakeTok()
+        e._pt_model = None
+        return e
+
+    def _shrinks(self, run_options):
+        return (run_options is not None
+                and run_options.get_run_config_entry(self.KEY) == "gpu:0")
+
+    def test_every_cuda_path_passes_the_shrink_option(self):
+        """Batch, its one-at-a-time fallback, warmup and the load-time smoke
+        test all run through the arena, so all of them must shrink it."""
+        calls = []
+        session = self._fake_session("CUDAExecutionProvider", calls,
+                                     fail_batches=True)
+        e = self._embedder(session)
+        e.warmup()
+        e._smoke(session)
+        out = e._onnx_embed_batch(["a", "b", "c"])
+        self.assertEqual(len(out), 3)
+        # warmup, smoke, the failed batch, then three single-text retries
+        self.assertEqual([n for n, _ in calls], [1, 1, 3, 1, 1, 1])
+        self.assertTrue(all(self._shrinks(ro) for _, ro in calls), calls)
+
+    def test_cpu_session_runs_without_run_options(self):
+        calls = []
+        session = self._fake_session("CPUExecutionProvider", calls,
+                                     fail_batches=True)
+        e = self._embedder(session)
+        e.warmup()
+        e._smoke(session)
+        e._onnx_embed_batch(["a", "b"])
+        self.assertEqual([ro for _, ro in calls], [None] * len(calls))
 
 
 class TestEmbedDeviceReport(unittest.TestCase):
