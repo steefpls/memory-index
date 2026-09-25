@@ -324,6 +324,13 @@ steef-server's GTX 1070 (Pascal) a query embed goes from ~120 ms to ~20 ms
 and a full re-embed of the vault from ~25 minutes to under one; vectors match
 CPU within 1e-4, so search results do not change.
 
+ONNX Runtime's CUDA arena keeps its peak (~1.2-2.6 GB after a few runs)
+until a run asks it to shrink. `MEMORY_INDEX_ARENA_RELEASE_SECONDS` (default
+30) is how long after the last embedding run a background thread makes one
+tiny run that does, taking the process back to ~410 MiB of VRAM; `0` keeps
+the arena for good. Runs inside a burst keep the arena and stay fast (~20 ms
+a query); the first query after a release takes ~130 ms while it regrows.
+
 The pins in the `cuda` group are not arbitrary. onnxruntime-gpu 1.29 is the
 last line built for CUDA 12 (1.30 moved to CUDA 13, which dropped Pascal)
 and only exists on Microsoft's `onnxruntime-cuda-12` package index; cuDNN

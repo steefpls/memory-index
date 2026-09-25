@@ -263,27 +263,36 @@ class TestProviderChoice(unittest.TestCase):
         self.assertIn("gpu", err)
 
 
-class TestArenaShrinkage(unittest.TestCase):
-    """Every CUDA run asks ORT to hand its arena back to the card.
+class TestArenaRelease(unittest.TestCase):
+    """A CUDA session gives its arena back once runs go quiet, not on every run.
 
-    Regression: kSameAsRequested alone let the arena keep its peak for the
+    Regression 1: kSameAsRequested alone let the arena keep its peak for the
     life of the process; the live daemon held 2.9 GB of the shared GTX 1070
     for a ~400 MiB model (2026-09-25).
+    Regression 2: shrinking on every run (77a664c) fixed that but doubled a
+    single query's latency, 72 -> 138 ms, because each run reallocated its
+    ~1.6 GB of working memory.
     """
     KEY = "memory.enable_memory_arena_shrinkage"
 
     def setUp(self):
         import src.indexer.embedder as emb
         self.emb = emb
+        self._saved_after = emb.ARENA_RELEASE_SECONDS
+        self._embedders = []
 
-    def test_cuda_runs_shrink_the_gpu_arena(self):
-        self.assertEqual(self.emb.run_config_for("CUDAExecutionProvider"),
+    def tearDown(self):
+        for e in self._embedders:
+            e.close()
+        self.emb.ARENA_RELEASE_SECONDS = self._saved_after
+
+    def test_only_a_shrink_run_on_cuda_gets_the_option(self):
+        self.assertEqual(self.emb.run_config_for("CUDAExecutionProvider", shrink=True),
                          {self.KEY: "gpu:0"})
+        self.assertEqual(self.emb.run_config_for("CUDAExecutionProvider"), {})
+        self.assertEqual(self.emb.run_config_for("CPUExecutionProvider", shrink=True), {})
 
-    def test_cpu_runs_get_no_run_options(self):
-        self.assertEqual(self.emb.run_config_for("CPUExecutionProvider"), {})
-
-    def _fake_session(self, provider, calls, fail_batches=False):
+    def _fake_session(self, provider, calls, fail_batches=False, on_run=None):
         import numpy as np
 
         class FakeSession:
@@ -293,14 +302,17 @@ class TestArenaShrinkage(unittest.TestCase):
             def run(self, names, feed, run_options=None):
                 n = feed["input_ids"].shape[0]
                 calls.append((n, run_options))
+                if on_run is not None:
+                    on_run(run_options)
                 if fail_batches and n > 1:
                     raise RuntimeError("batch too big")
                 return [np.zeros((n, 768), dtype=np.float32)]
 
         return FakeSession()
 
-    def _embedder(self, session):
+    def _embedder(self, session, after=30.0):
         import numpy as np
+        self.emb.ARENA_RELEASE_SECONDS = after
         e = self.emb.GemmaEmbedder.__new__(self.emb.GemmaEmbedder)
 
         class FakeTok:
@@ -311,38 +323,125 @@ class TestArenaShrinkage(unittest.TestCase):
 
         e._ort_session = session
         e._run_opts = self.emb._run_options(session)
+        e._releaser = None
         e._tokenizer = FakeTok()
         e._pt_model = None
+        e._start_releaser(session)
+        self._embedders.append(e)
         return e
 
     def _shrinks(self, run_options):
         return (run_options is not None
                 and run_options.get_run_config_entry(self.KEY) == "gpu:0")
 
-    def test_every_cuda_path_passes_the_shrink_option(self):
-        """Batch, its one-at-a-time fallback, warmup and the load-time smoke
-        test all run through the arena, so all of them must shrink it."""
+    def _wait_for(self, cond, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return cond()
+
+    def test_normal_cuda_runs_keep_the_arena(self):
+        """Batch, its one-at-a-time fallback and warmup must not shrink."""
         calls = []
         session = self._fake_session("CUDAExecutionProvider", calls,
                                      fail_batches=True)
         e = self._embedder(session)
         e.warmup()
-        e._smoke(session)
         out = e._onnx_embed_batch(["a", "b", "c"])
         self.assertEqual(len(out), 3)
-        # warmup, smoke, the failed batch, then three single-text retries
-        self.assertEqual([n for n, _ in calls], [1, 1, 3, 1, 1, 1])
-        self.assertTrue(all(self._shrinks(ro) for _, ro in calls), calls)
+        # warmup, the failed batch, then three single-text retries
+        self.assertEqual([n for n, _ in calls], [1, 3, 1, 1, 1])
+        self.assertFalse(any(self._shrinks(ro) for _, ro in calls), calls)
 
-    def test_cpu_session_runs_without_run_options(self):
+    def test_load_time_smoke_run_releases_its_arena(self):
+        calls = []
+        session = self._fake_session("CUDAExecutionProvider", calls)
+        e = self._embedder(session)
+        e._smoke(session)
+        self.assertTrue(self._shrinks(calls[-1][1]))
+
+    def test_release_fires_once_after_quiet(self):
+        calls = []
+        e = self._embedder(self._fake_session("CUDAExecutionProvider", calls),
+                           after=0.2)
+        e._onnx_embed_batch(["a"])
+        self.assertTrue(self._wait_for(lambda: e._releaser.releases == 1))
+        self.assertTrue(self._shrinks(calls[-1][1]))
+        time.sleep(0.4)  # nothing ran since, so nothing more to release
+        self.assertEqual(e._releaser.releases, 1)
+        e._onnx_embed_batch(["b"])  # a new burst arms it again
+        self.assertTrue(self._wait_for(lambda: e._releaser.releases == 2))
+
+    def test_no_release_during_a_burst(self):
+        calls = []
+        e = self._embedder(self._fake_session("CUDAExecutionProvider", calls),
+                           after=0.3)
+        end = time.monotonic() + 0.9
+        while time.monotonic() < end:
+            e._onnx_embed_batch(["q"])
+            time.sleep(0.05)
+        self.assertEqual(e._releaser.releases, 0)
+        self.assertFalse(any(self._shrinks(ro) for _, ro in calls))
+        self.assertTrue(self._wait_for(lambda: e._releaser.releases == 1))
+
+    def test_release_run_holds_the_run_lock(self):
+        held = []
+        box = {}
+
+        def on_run(run_options):
+            if self._shrinks(run_options):
+                lock = box["e"]._releaser.lock
+                probe = threading.Thread(
+                    target=lambda: held.append(not lock.acquire(timeout=0.05)))
+                probe.start()
+                probe.join()
+
+        e = self._embedder(self._fake_session("CUDAExecutionProvider", [], on_run=on_run),
+                           after=0.1)
+        box["e"] = e
+        e._onnx_embed_batch(["a"])
+        self.assertTrue(self._wait_for(lambda: e._releaser.releases == 1))
+        self.assertEqual(held, [True])
+
+    def test_cpu_session_has_no_timer_and_no_run_options(self):
         calls = []
         session = self._fake_session("CPUExecutionProvider", calls,
                                      fail_batches=True)
-        e = self._embedder(session)
+        e = self._embedder(session, after=0.1)
+        self.assertIsNone(e._releaser)
         e.warmup()
         e._smoke(session)
         e._onnx_embed_batch(["a", "b"])
+        time.sleep(0.3)
         self.assertEqual([ro for _, ro in calls], [None] * len(calls))
+        self.assertEqual(len(calls), 5)  # no release run appeared
+
+    def test_zero_seconds_disables_the_release(self):
+        e = self._embedder(self._fake_session("CUDAExecutionProvider", []), after=0)
+        self.assertIsNone(e._releaser)
+
+    def test_close_stops_the_timer_before_it_fires(self):
+        calls = []
+        e = self._embedder(self._fake_session("CUDAExecutionProvider", calls),
+                           after=0.3)
+        e._onnx_embed_batch(["a"])
+        releaser = e._releaser
+        e.close()
+        self.assertFalse(releaser._thread.is_alive())
+        self.assertIsNone(e._releaser)
+        time.sleep(0.5)
+        self.assertEqual(releaser.releases, 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_release_seconds_from_env(self):
+        with patch.dict(os.environ, {"MEMORY_INDEX_ARENA_RELEASE_SECONDS": "45"}):
+            self.assertEqual(self.emb._release_seconds(), 45.0)
+        with patch.dict(os.environ, {"MEMORY_INDEX_ARENA_RELEASE_SECONDS": "soon"}):
+            self.assertEqual(self.emb._release_seconds(), 30.0)
+        with patch.dict(os.environ, {"MEMORY_INDEX_ARENA_RELEASE_SECONDS": ""}):
+            self.assertEqual(self.emb._release_seconds(), 30.0)
 
 
 class TestEmbedDeviceReport(unittest.TestCase):

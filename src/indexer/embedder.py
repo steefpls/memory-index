@@ -18,6 +18,8 @@ import logging
 import os
 import gc
 import threading
+import time
+from contextlib import nullcontext
 
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
@@ -62,7 +64,7 @@ def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
     kSameAsRequested makes the CUDA arena grow by exactly what a run needs
     rather than doubling. It does not make it give anything back: the arena
     keeps its peak (2.9 GB live on 2026-09-25, against ~400 MiB for the
-    session and weights) until a run asks it to shrink; see run_config_for.
+    session and weights) until a run asks it to shrink; see _ArenaReleaser.
     """
     if device not in ("auto", "cuda", "cpu"):
         return [_CPU], f"MEMORY_INDEX_EMBED_DEVICE={device!r} is not one of auto, cuda, cpu"
@@ -76,26 +78,38 @@ def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
     return [_CPU], None
 
 
-def run_config_for(provider: str) -> dict[str, str]:
-    """RunOptions entries for every run of a session led by `provider`. Pure,
-    so it is testable without a GPU.
+def _release_seconds() -> float:
+    raw = os.environ.get("MEMORY_INDEX_ARENA_RELEASE_SECONDS", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else 30.0
+    except ValueError:
+        logger.warning("MEMORY_INDEX_ARENA_RELEASE_SECONDS=%r is not a number; using 30", raw)
+        return 30.0
 
-    On CUDA each run hands the arena's free chunks back to the card when it
-    ends. The card is shared with Whisper and FLUX, and without this one long
-    re-embed chunk kept ~2 GB reserved for the life of the process; with it
-    the process sits at ~410 MiB after every run. The price, measured on the
-    GTX 1070 (2026-09-25): every run allocates its ~1.6 GB of working memory
-    afresh, so a single query goes from ~72 to ~138 ms and a 32-row batch
-    from ~1.6 to ~1.7 s. CPU memory is not touched.
+
+# Seconds with no embedding run after which a CUDA session gives its arena
+# back to the card (see _ArenaReleaser); 0 never releases it.
+ARENA_RELEASE_SECONDS = _release_seconds()
+
+
+def run_config_for(provider: str, shrink: bool = False) -> dict[str, str]:
+    """RunOptions entries for a run of a session led by `provider`. Pure, so
+    it is testable without a GPU.
+
+    `shrink` asks a CUDA run to hand the arena's free chunks back to the card
+    when it ends. Only the load-time smoke run and the idle release run ask
+    for it. Shrinking on every run (2026-09-25, 77a664c) kept the process at
+    ~410 MiB but made every run allocate its ~1.6 GB of working memory afresh,
+    so a single query went from ~72 to ~138 ms. CPU memory is never touched.
     """
-    if provider == _CUDA:
+    if shrink and provider == _CUDA:
         return {"memory.enable_memory_arena_shrinkage": "gpu:0"}
     return {}
 
 
-def _run_options(session):
+def _run_options(session, shrink: bool = False):
     """The RunOptions for `session` (see run_config_for), or None for none."""
-    config = run_config_for(session.get_providers()[0])
+    config = run_config_for(session.get_providers()[0], shrink)
     if not config:
         return None
     import onnxruntime as ort
@@ -103,6 +117,61 @@ def _run_options(session):
     for key, value in config.items():
         opts.add_run_config_entry(key, value)
     return opts
+
+
+class _ArenaReleaser:
+    """Gives a CUDA session's arena back to the card once runs go quiet.
+
+    The arena keeps its peak (~2 GB after one query, 2.9 GB live after two
+    days) until a run asks it to shrink. Normal runs don't, so a burst of
+    searches stays fast; `after` seconds past the last run, a background
+    thread makes one tiny run that does, and the process drops back to
+    ~410 MiB. Every session run goes through `lock`, so the release run never
+    overlaps a real one, and a run during the wait pushes the release back.
+    """
+
+    def __init__(self, release, after: float):
+        self._release = release
+        self._after = after
+        self.lock = threading.Condition(threading.Lock())
+        self._last_run = 0.0
+        self._dirty = False
+        self._closed = False
+        self.releases = 0
+        self._thread = threading.Thread(target=self._loop, name="arena-release",
+                                        daemon=True)
+        self._thread.start()
+
+    def ran(self) -> None:
+        """Record a run; call with `lock` held."""
+        self._last_run = time.monotonic()
+        if not self._dirty:
+            self._dirty = True
+            self.lock.notify_all()
+
+    def _loop(self) -> None:
+        with self.lock:
+            while not self._closed:
+                if not self._dirty:
+                    self.lock.wait()
+                    continue
+                left = self._last_run + self._after - time.monotonic()
+                if left > 0:
+                    self.lock.wait(left)
+                    continue
+                self._dirty = False
+                try:
+                    self._release()
+                    self.releases += 1
+                except Exception as e:
+                    logger.warning("CUDA arena release failed: %s", str(e)[:200])
+
+    def close(self) -> None:
+        with self.lock:
+            self._closed = True
+            self.lock.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=5)
 
 
 class _FastTokenizerWrapper:
@@ -175,9 +244,12 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
     Falls back to PyTorch CPU if the ONNX model is not found.
     """
 
+    _releaser: "_ArenaReleaser | None" = None
+
     def __init__(self):
         self._ort_session = None
         self._run_opts = None
+        self._releaser = None
         self._tokenizer = None
         self._pt_model = None
         self.backend = "not initialized"
@@ -241,6 +313,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                 session = ort.InferenceSession(onnx_path, sess_opts, providers=[_CPU])
         self._ort_session = session
         self._run_opts = _run_options(session)
+        self._start_releaser(session)
         self.device = "cuda" if session.get_providers()[0] == _CUDA else "cpu"
         self.device_error = err
         if err and not want_cuda:
@@ -256,7 +329,31 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                                 truncation=True, max_length=EMBED_MAX_TOKENS)
         feed = {"input_ids": dummy["input_ids"].astype(np.int64),
                 "attention_mask": dummy["attention_mask"].astype(np.int64)}
-        session.run(["sentence_embedding"], feed, _run_options(session))
+        session.run(["sentence_embedding"], feed, _run_options(session, shrink=True))
+
+    def _start_releaser(self, session) -> None:
+        """Start the idle arena release for a CUDA session (see _ArenaReleaser)."""
+        release_opts = _run_options(session, shrink=True)
+        if release_opts is None or ARENA_RELEASE_SECONDS <= 0:
+            return
+        import numpy as np
+        tiny = self._tokenizer(["release"], return_tensors="np", padding=True,
+                               truncation=True, max_length=EMBED_MAX_TOKENS)
+        feed = {"input_ids": tiny["input_ids"].astype(np.int64),
+                "attention_mask": tiny["attention_mask"].astype(np.int64)}
+        self._releaser = _ArenaReleaser(
+            lambda: session.run(["sentence_embedding"], feed, release_opts),
+            ARENA_RELEASE_SECONDS)
+
+    def _run(self, feed: dict):
+        """One run of the ONNX session. Every run goes through here, so the
+        idle arena release sees it and never overlaps it."""
+        releaser = self._releaser
+        with releaser.lock if releaser is not None else nullcontext():
+            out = self._ort_session.run(["sentence_embedding"], feed, self._run_opts)
+            if releaser is not None:
+                releaser.ran()
+        return out
 
     def _init_pytorch(self):
         """Fallback: load via sentence-transformers (PyTorch CPU).
@@ -287,7 +384,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                 "attention_mask": dummy["attention_mask"].astype(np.int64),
             }
             try:
-                self._ort_session.run(["sentence_embedding"], feed, self._run_opts)
+                self._run(feed)
             except Exception as e:
                 logger.warning("Warmup failed: %s", e)
             logger.info("EmbeddingGemma warmup complete")
@@ -355,8 +452,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         feed = {"input_ids": ids, "attention_mask": mask}
 
         try:
-            out = self._ort_session.run(["sentence_embedding"], feed,
-                                        self._run_opts)[0]  # (batch, 768)
+            out = self._run(feed)[0]  # (batch, 768)
         except Exception as e:
             # Fallback: embed one at a time
             logger.warning("Batch embed failed, falling back to individual: %s", str(e)[:120])
@@ -367,10 +463,7 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
                                        max_length=EMBED_MAX_TOKENS)
                 ids1 = inp1["input_ids"].astype(np.int64)
                 mask1 = inp1["attention_mask"].astype(np.int64)
-                out1 = self._ort_session.run(
-                    ["sentence_embedding"],
-                    {"input_ids": ids1, "attention_mask": mask1},
-                    self._run_opts)[0]
+                out1 = self._run({"input_ids": ids1, "attention_mask": mask1})[0]
                 results.append(out1[0].tolist())
             return results
 
@@ -391,7 +484,10 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         return self._embed([EMBED_QUERY_PREFIX + q for q in queries])
 
     def close(self) -> None:
-        """Release model/session references."""
+        """Stop the arena release and drop model/session references."""
+        releaser, self._releaser = self._releaser, None
+        if releaser is not None:
+            releaser.close()
         self._ort_session = None
         self._run_opts = None
         self._tokenizer = None
