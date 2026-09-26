@@ -27,7 +27,11 @@ from src.models.entity import Entity
 from src.models.observation import Observation
 
 _RECALIBRATE_EVERY = 10  # auto-recalibrate after every N observations per vault
-_LIBRARIAN_EVERY = 10    # auto-run librarian after every N observations per vault
+# Auto-librarian used to run every 10 observations too — each run pulls the
+# whole vault's embeddings and (before 2026-09-26) built an NxN distance
+# matrix, so a busy vault re-clustered constantly for a log line nobody
+# reads. Every 100 keeps the report fresh without the churn.
+_LIBRARIAN_EVERY = 100   # auto-run librarian after every N observations per vault
 
 # Observations embedded + upserted per step when re-embedding a whole entity
 # (rename / type change / repair). Small enough that one ONNX batch can't OOM

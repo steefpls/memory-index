@@ -80,10 +80,15 @@ def _run_dbscan(embeddings: np.ndarray, eps: float = 0.5,
     Returns:
         Cluster labels array (length N). -1 = noise.
     """
-    # Cosine distance matrix
-    dist_matrix = cosine_distances(embeddings)
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
-    return clustering.fit_predict(dist_matrix)
+    # NOTE (2026-09-26 RAM fix): this used to build the full NxN precomputed
+    # cosine-distance matrix first (float64, so ~250 MB at N=5600, growing as
+    # N^2 — and the auto-librarian runs it every few writes). The matrix was
+    # transient but Windows never gave the commit back, so the daemon's
+    # private bytes grew monotonically (~2.4 -> 3.3 GB). Clustering directly
+    # with metric="cosine" is the same distance (1 - cosine similarity) with
+    # no NxN allocation — sklearn computes it in batches internally.
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine")
+    return clustering.fit_predict(np.asarray(embeddings, dtype=np.float32))
 
 
 def _build_clusters(labels: np.ndarray, obs_ids: list[str],
@@ -252,6 +257,12 @@ def tool_run_librarian(vault: str = "", eps: float = 0.5,
     t2 = time.perf_counter()
     clusters = _build_clusters(labels, obs_ids, entity_ids, embeddings)
     logger.info("[librarian] built clusters in %.2fs", time.perf_counter() - t2)
+
+    # The full embedding matrix (~17 MB at N=5600) is no longer needed past
+    # this point — gap detection works off per-cluster centroids. Drop it
+    # now so the peak is held for as short a time as possible.
+    del embeddings
+    del labels
 
     # Detect structural gaps
     t3 = time.perf_counter()
