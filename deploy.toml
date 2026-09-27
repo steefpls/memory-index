@@ -1,0 +1,11 @@
+# Test-then-deploy gate, read by the hub's deployer. It runs the command from
+# the repo root in a scratch checkout on steef-server before a deploy.
+# `--extra dev` pulls in pytest (an optional extra here, not a dependency
+# group); `--frozen` still applies since it's already resolved in uv.lock.
+# The embedder is mocked throughout, so this needs no ONNX model download and
+# no GPU. 372 tests, ~75s on this box.
+
+[test]
+command = "uv run --extra dev --frozen python -m pytest -q -p no:cacheprovider -rs tests"
+timeout_s = 300
+enforce = true     # a failing test holds the deploy
