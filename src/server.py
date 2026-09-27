@@ -746,6 +746,10 @@ if __name__ == "__main__":
             sys.exit(1)
         import asyncio
         _configure_http_transport(port, api_key)
-        asyncio.run(mcp.run_streamable_http_async())
+        # FastMCP's own server, wrapped so GET /inflight counts the MCP calls
+        # being answered: the hub's deployer waits for them before a restart,
+        # so it never cuts a write in half (src/inflight.py).
+        from src.inflight import serve_streamable_http
+        asyncio.run(serve_streamable_http(mcp))
     else:
         mcp.run(transport="stdio")

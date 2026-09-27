@@ -305,6 +305,16 @@ what the hub's watchdog reads:
        "embed_device": {"requested": "auto", "active": "cuda", "error": null}}
 ```
 
+`GET /inflight` is open too and says how many MCP calls are being answered
+right now (a POST on `/mcp/<key>`, from arrival until its answer is fully sent)
+and how old the oldest is. The hub's deployer asks it right before a restart
+and waits while a call is in flight, so a deploy never cuts a write in half
+(`src/inflight.py`). The access log leaves it out.
+
+```
+→ 200 {"in_flight": 1, "oldest_s": 0.42}
+```
+
 ## GPU
 
 ONNX Runtime comes from one of two dependency groups. `cpu` is the default,
