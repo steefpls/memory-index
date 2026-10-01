@@ -82,6 +82,20 @@ class BackupSettingsTest(unittest.TestCase):
         path = self._instance_env("INSTANCE_ROLE=dev\n")
         self.assertEqual(self.backup.backup_settings({}, path), self.backup.backup_settings({}, NOWHERE))
 
+    def test_a_vault_not_created_yet_is_nothing_to_back_up(self):
+        backup = self.backup
+        calls = []
+        saved = (backup.tool_export_vault, backup.setup_logging, backup._drive_phase)
+        try:
+            backup.tool_export_vault = lambda vault, path: f"Vault '{vault}' not found."
+            backup.setup_logging = lambda: None
+            backup._drive_phase = lambda path: calls.append(path)
+            self.assertIsNone(backup.export_vault_local())
+            self.assertEqual(backup.main(), 0)
+            self.assertEqual(calls, [])
+        finally:
+            backup.tool_export_vault, backup.setup_logging, backup._drive_phase = saved
+
     def test_import_writes_no_log_file(self):
         # Logging is set up in main(), so loading the module (as this test
         # does) must not attach a file handler to the root logger.

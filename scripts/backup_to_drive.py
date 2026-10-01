@@ -127,12 +127,16 @@ def setup_logging() -> None:
     )
 
 
-def export_vault_local() -> Path:
+def export_vault_local() -> Path | None:
+    """The day's zip; None when the vault doesn't exist yet (a new box whose
+    owner hasn't had anything remembered: nothing to back up, not a failure)."""
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out_path = EXPORTS_DIR / f"{VAULT}_{today}.zip"
     result = tool_export_vault(VAULT, str(out_path))
     log.info("Export: %s", " ".join(result.split()))
+    if result.strip() == f"Vault '{VAULT}' not found.":
+        return None
     if not out_path.exists():
         raise RuntimeError(f"Export reported success but file missing: {out_path}")
     return out_path
@@ -257,6 +261,9 @@ def main() -> int:
     except Exception:
         log.exception("Backup failed")
         return 1
+    if local_path is None:
+        log.info("Vault %r doesn't exist yet (nothing remembered on this box so far); nothing to back up.", VAULT)
+        return 0
     for attempt in range(1, DRIVE_MAX_ATTEMPTS + 1):
         try:
             _drive_phase(local_path)
