@@ -6,7 +6,9 @@ Runs on the server via Windows Task Scheduler. Calls
 `memory-index-backups` using the OAuth token shared with
 google_workspace_mcp.
 
-Settings, from the environment (unset = steef-server's values):
+Settings, from the environment, else the box's instance.env (a client box
+has one at its fleet root; MEMORY_VAULT there names the vault), else
+steef-server's values (never on a client: see backup_settings):
   MEMORY_BACKUP_VAULT  vault to back up (default "work")
   OWNER_GOOGLE_EMAIL   Google account whose Drive gets it, and whose
                        google_workspace_mcp token is used
@@ -54,19 +56,52 @@ DEFAULT_OWNER_GOOGLE_EMAIL = "steven.koe80@gmail.com"
 DEFAULT_INSTANCE_PROFILE = r"C:\Users\steve"
 
 
-def backup_settings(env=None) -> tuple[str, Path]:
-    """(vault, OAuth token path) from the environment.
+def instance_values(path: Path | None = None) -> dict[str, str]:
+    """KEY=value lines of the box's instance.env (the fleet root's:
+    INSTANCE_ROOT, default C:\\daemon-hub), or {} when there is none, as on
+    steef-server."""
+    if path is None:
+        root = (os.environ.get("INSTANCE_ROOT") or "").strip() or r"C:\daemon-hub"
+        path = Path(root) / "instance.env"
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def backup_settings(env=None, instance_file: Path | None = None) -> tuple[str, Path]:
+    """(vault, OAuth token path) from the environment, else instance.env
+    (instance_file, default the fleet root's), else steef-server's values.
 
     The token is google_workspace_mcp's credential file for the owner's
     Google account, under the owner's profile. INSTANCE_PROFILE, not
     Path.home(): under SYSTEM that resolves to the system profile.
+
+    A client box (INSTANCE_ROLE=client) never falls back to steef-server's
+    account or profile: its backup must land in its own owner's Drive, so a
+    missing value there is an error.
     """
     env = os.environ if env is None else env
+    box = instance_values(instance_file)
+    client = box.get("INSTANCE_ROLE", "").strip().lower() == "client"
 
-    def get(key, default):
-        return (env.get(key) or "").strip() or default
+    def get(key, default, box_key=None, required_on_client=True):
+        value = (env.get(key) or "").strip() or box.get(box_key or key, "").strip()
+        if value:
+            return value
+        if client and required_on_client:
+            raise RuntimeError(f"{key} is missing from this client box's instance.env; "
+                               "not falling back to steef-server's")
+        return default
 
-    vault = get("MEMORY_BACKUP_VAULT", DEFAULT_VAULT)
+    vault = get("MEMORY_BACKUP_VAULT", DEFAULT_VAULT, "MEMORY_VAULT", required_on_client=False)
     email = get("OWNER_GOOGLE_EMAIL", DEFAULT_OWNER_GOOGLE_EMAIL)
     profile = get("INSTANCE_PROFILE", DEFAULT_INSTANCE_PROFILE)
     token = Path(profile) / ".google_workspace_mcp" / "credentials" / f"{email}.json"
