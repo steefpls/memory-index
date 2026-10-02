@@ -62,6 +62,14 @@ This creates a venv, installs deps, exports the ONNX model (~274MB download on f
 | `import_vault` | Import a vault export zip into a target vault (additive, lossless — supersede history is preserved) |
 | `vacuum_store` | Hard-remove stale rows left behind by soft-delete semantics |
 
+### The private vault
+
+A vault named `private` belongs to the box's owner alone (Steve's decision, 2026-10-02). Every tool refuses it to a call that isn't made for the owner: a chat turn for the other owner, the peer assistant or a trusted non-owner, and any job or wake one of those started. Naming it (`vault="private"`, `create_vault`, `export_vault`, ...) gets a plain refusal; everything else acts as if it weren't there: all-vault searches, lists, timelines and graph reads leave it out, and its entities, observations and relations are "not found" by name or ID. Owner chat turns, the owner's own sessions and owner-started hub work (programmes, schedules, the gardener) use it like any vault.
+
+Who a call is for is decided once per HTTP request (`src/access.py`, rules in `src/requester.py`): from the process at the other end of the connection (the `JARVIS_RUN_ID` / `HUB_RUN_ID` the chat daemons and the hub put in every engine's environment) and the hub's record of that run (who sent the message, which run or chat started it). A fleet service calling for someone else (the hub's OpenCode tool gateway) must name the run in `X-Jarvis-Run`; from anyone else that header can only narrow. A caller from another machine on the tailnet is the owner's own session. Anything that can't be vouched for is refused. Settings: `MEMORY_INDEX_HUB_URL` (default `http://127.0.0.1:8084`), `MEMORY_INDEX_FLEET_PORTS`.
+
+It is a fence, not a wall: every agent runs as the same Windows account as memory-index, so a turn that sets out to open `data/memory.db` itself is not stopped by this.
+
 ## Data Model
 
 - **Entities** — named nodes: person, project, concept, decision, technology, etc.

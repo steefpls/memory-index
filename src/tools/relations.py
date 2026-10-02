@@ -158,6 +158,6 @@ def tool_delete_relation(relation_id: str) -> str:
     Returns:
         Confirmation or error.
     """
-    if remove_relation(relation_id):
+    if get_relation(relation_id) is not None and remove_relation(relation_id):
         return f"Relation deleted: {relation_id}"
     return f"Relation not found: '{relation_id}'"

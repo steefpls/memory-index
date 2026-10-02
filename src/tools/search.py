@@ -100,7 +100,10 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
             return f"Error: Unknown vault '{vault}'. Use list_vaults() to see available vaults."
         vault_names = [vault]
     else:
-        vault_names = list(VAULTS.keys())
+        # Every vault this call may see: an all-vault search silently leaves
+        # the private vault out for anyone but the owner (src/access.py).
+        from src import access
+        vault_names = [v for v in VAULTS.keys() if not access.is_hidden(v)]
 
     if not vault_names:
         return "No vaults configured. Use create_vault() to create one."

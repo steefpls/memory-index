@@ -25,6 +25,17 @@ _relations: dict[str, Relation] = {}  # keyed by relation ID
 GRAPH_LOCK = threading.RLock()
 
 
+def _hidden_ids() -> frozenset[str]:
+    """Entities this call may not see (src/access.py): their relations read
+    as not there, and graph readers get a view without them."""
+    from src.indexer.store import hidden_entity_ids
+    return hidden_entity_ids()
+
+
+def _visible(rel: Relation | None, hidden: frozenset[str]) -> bool:
+    return rel is not None and rel.from_entity not in hidden and rel.to_entity not in hidden
+
+
 def _get_graph() -> nx.MultiDiGraph:
     """Get or create the singleton graph."""
     global _graph
@@ -88,10 +99,11 @@ def update_relation(relation_id: str, context: str | None = None,
     edge's identity and creation date away. Returns the updated relation, or
     None if no such relation.
     """
+    hidden = _hidden_ids()
     with GRAPH_LOCK:
         graph = _get_graph()
         rel = _relations.get(relation_id)
-        if rel is None:
+        if not _visible(rel, hidden):
             return None
 
         if context is not None:
@@ -133,19 +145,24 @@ def remove_relation(relation_id: str) -> bool:
 
 
 def get_relation(relation_id: str) -> Relation | None:
-    """Get a relation by ID."""
+    """Get a relation by ID (None for one touching an entity this call may
+    not see)."""
+    hidden = _hidden_ids()
     with GRAPH_LOCK:
         _get_graph()  # ensure loaded
-        return _relations.get(relation_id)
+        rel = _relations.get(relation_id)
+        return rel if _visible(rel, hidden) else None
 
 
 def get_relations_for_entity(entity_id: str) -> list[Relation]:
-    """Get all relations involving an entity (incoming and outgoing)."""
+    """Get all relations involving an entity (incoming and outgoing) that
+    this call may see."""
+    hidden = _hidden_ids()
     with GRAPH_LOCK:
         _get_graph()  # ensure loaded
         return [
             r for r in _relations.values()
-            if r.from_entity == entity_id or r.to_entity == entity_id
+            if (r.from_entity == entity_id or r.to_entity == entity_id) and _visible(r, hidden)
         ]
 
 
@@ -247,20 +264,29 @@ def get_graph() -> nx.MultiDiGraph:
     """Get the graph instance (read-only access).
 
     Callers that iterate the returned graph while writes may be in flight must
-    hold GRAPH_LOCK for the duration of the traversal.
+    hold GRAPH_LOCK for the duration of the traversal. A call that may not see
+    some entities (src/access.py) gets a read-only view without them.
     """
-    return _get_graph()
+    hidden = _hidden_ids()
+    graph = _get_graph()
+    if not hidden:
+        return graph
+    return nx.subgraph_view(graph, filter_node=lambda n: n not in hidden)
 
 
 def get_relation_count() -> int:
-    """Count total relations."""
+    """Count the relations this call may see."""
+    hidden = _hidden_ids()
     with GRAPH_LOCK:
         _get_graph()  # ensure loaded
-        return len(_relations)
+        if not hidden:
+            return len(_relations)
+        return sum(1 for r in _relations.values() if _visible(r, hidden))
 
 
 def get_all_relations() -> list[Relation]:
-    """Get all relations (a snapshot list, safe to iterate)."""
+    """Get all relations this call may see (a snapshot list, safe to iterate)."""
+    hidden = _hidden_ids()
     with GRAPH_LOCK:
         _get_graph()  # ensure loaded
-        return list(_relations.values())
+        return [r for r in _relations.values() if _visible(r, hidden)]

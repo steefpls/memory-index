@@ -242,6 +242,10 @@ def tool_import_vault(input_path: str, vault: str = "") -> str:
     target_vault = (vault or manifest.get("source_vault", "")).strip()
     if not target_vault:
         return "Error: target vault could not be determined."
+    from src import access
+    refusal = access.refuse_vault(target_vault)
+    if refusal:
+        return refusal
 
     if get_vault(target_vault) is None:
         config_create_vault(target_vault)

@@ -126,16 +126,22 @@ def quiet_access_log(logger_name: str = "uvicorn.access") -> None:
         log.addFilter(_QuietInflight())
 
 
-def wrap(mcp: Any, mcp_prefix: str = "/mcp") -> InflightMiddleware:
-    """A FastMCP's streamable-HTTP app, counted."""
-    return InflightMiddleware(mcp.streamable_http_app(), mcp_prefix=mcp_prefix)
+def wrap(mcp: Any, mcp_prefix: str = "/mcp",
+         wrap_app: Callable[[Any], Any] | None = None) -> InflightMiddleware:
+    """A FastMCP's streamable-HTTP app, counted. `wrap_app`, when given,
+    wraps the app inside the counter (memory-index's caller middleware)."""
+    app = mcp.streamable_http_app()
+    if wrap_app is not None:
+        app = wrap_app(app)
+    return InflightMiddleware(app, mcp_prefix=mcp_prefix)
 
 
-async def serve_streamable_http(mcp: Any, mcp_prefix: str = "/mcp") -> None:
+async def serve_streamable_http(mcp: Any, mcp_prefix: str = "/mcp",
+                                wrap_app: Callable[[Any], Any] | None = None) -> None:
     """FastMCP.run_streamable_http_async, with the /inflight wrapper."""
     import uvicorn
 
-    config = uvicorn.Config(wrap(mcp, mcp_prefix), host=mcp.settings.host,
+    config = uvicorn.Config(wrap(mcp, mcp_prefix, wrap_app), host=mcp.settings.host,
                             port=mcp.settings.port,
                             log_level=mcp.settings.log_level.lower())
     quiet_access_log()

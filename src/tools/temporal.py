@@ -70,7 +70,13 @@ def _snapshot_store() -> tuple[dict, dict]:
     "dictionary changed size during iteration".
     """
     with STORE_LOCK:
-        return dict(_entities), dict(_observations)
+        ents, obs = dict(_entities), dict(_observations)
+    # Rows in a vault this call may not see are left out (src/access.py).
+    from src import access
+    if access.private_allowed():
+        return ents, obs
+    ents = {k: e for k, e in ents.items() if not access.is_private(e.vault)}
+    return ents, {k: o for k, o in obs.items() if o.entity_id in ents}
 
 
 def tool_query_timeline(vault: str = "", start: str = "", end: str = "",

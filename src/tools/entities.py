@@ -381,7 +381,10 @@ def tool_reembed_entity(name_or_id: str, vault: str = "") -> str:
 
 def tool_reembed_status() -> str:
     """Report the background re-embed job: running progress or last result."""
-    st = get_reembed_status()
+    st = dict(get_reembed_status())
+    if st.get("entity_id") and get_entity(st["entity_id"]) is None:
+        # In a vault this call may not see (src/access.py), or gone since.
+        st["entity_name"] = "an entity you can't see"
     if st["running"]:
         return (f"Re-embed running for '{st['entity_name']}': batch "
                 f"{st['batch']}/{st['batches']} "

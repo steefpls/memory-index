@@ -13,6 +13,8 @@ row-level transactional writes); vectors in ChromaDB. The SQLite row is the
 single source of truth for content — search joins Chroma hits back to it.
 """
 
+import functools
+import inspect
 import logging
 import os
 import sys
@@ -67,9 +69,32 @@ logging.getLogger("mcp.server.streamable_http").addFilter(_SuppressClosedResourc
 mcp = FastMCP("memory-index")
 
 
+def _guarded(*vault_params: str):
+    """Every tool: decide who the call is for before any store lock is taken
+    (the first decision may ask the hub), and refuse a vault argument that
+    names the private vault to anyone but the owner (src/access.py)."""
+    def wrap(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def run(*args, **kwargs):
+            from src import access
+            access.verdict()
+            if vault_params:
+                bound = sig.bind_partial(*args, **kwargs).arguments
+                for name in vault_params:
+                    refusal = access.refuse_vault(bound.get(name) or "")
+                    if refusal:
+                        return refusal
+            return fn(*args, **kwargs)
+        return run
+    return wrap
+
+
 # ========== Entity Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def create_entity(name: str, entity_type: str, vault: str,
                   observations: list[str] | None = None,
                   source: str = "") -> str:
@@ -92,6 +117,7 @@ def create_entity(name: str, entity_type: str, vault: str,
 
 
 @mcp.tool()
+@_guarded('vault')
 def get_entity(name_or_id: str, vault: str = "",
                offset: int = 0, limit: int = 10,
                full: bool = False,
@@ -126,6 +152,7 @@ def get_entity(name_or_id: str, vault: str = "",
 
 
 @mcp.tool()
+@_guarded('vault')
 def update_entity(name_or_id: str, new_name: str = "",
                   new_type: str = "", vault: str = "") -> str:
     """Update an entity's name or type.
@@ -141,6 +168,7 @@ def update_entity(name_or_id: str, new_name: str = "",
 
 
 @mcp.tool()
+@_guarded('vault')
 def reembed_entity(name_or_id: str, vault: str = "") -> str:
     """Re-embed all active observations of an entity without changing it.
 
@@ -157,6 +185,7 @@ def reembed_entity(name_or_id: str, vault: str = "") -> str:
 
 
 @mcp.tool()
+@_guarded()
 def reembed_status() -> str:
     """Report the background re-embed job: running progress or last result.
 
@@ -168,6 +197,7 @@ def reembed_status() -> str:
 
 
 @mcp.tool()
+@_guarded('vault')
 def delete_entity(name_or_id: str, vault: str = "") -> str:
     """Soft delete an entity and its observations.
 
@@ -180,6 +210,7 @@ def delete_entity(name_or_id: str, vault: str = "") -> str:
 
 
 @mcp.tool()
+@_guarded('vault')
 def merge_entities(source: str, target: str, vault: str = "") -> str:
     """Merge one entity into another: move observations + relations.
 
@@ -198,6 +229,7 @@ def merge_entities(source: str, target: str, vault: str = "") -> str:
 
 
 @mcp.tool()
+@_guarded('vault')
 def list_entities(vault: str = "", entity_type: str = "",
                   offset: int = 0, limit: int = 20) -> str:
     """List entities with optional filters.
@@ -215,6 +247,7 @@ def list_entities(vault: str = "", entity_type: str = "",
 # ========== Observation Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def add_observation(name_or_id: str, content: str,
                     vault: str = "", source: str = "",
                     supersedes: str = "", occurred_at: str = "") -> str:
@@ -237,6 +270,7 @@ def add_observation(name_or_id: str, content: str,
 
 
 @mcp.tool()
+@_guarded('vault')
 def add_observations(name_or_id: str, contents: list[str],
                      vault: str = "", source: str = "",
                      occurred_at: list[str] | None = None) -> str:
@@ -263,6 +297,7 @@ def add_observations(name_or_id: str, contents: list[str],
 
 
 @mcp.tool()
+@_guarded()
 def delete_observation(observation_id: str) -> str:
     """Remove an observation by ID.
 
@@ -278,6 +313,7 @@ def delete_observation(observation_id: str) -> str:
 
 
 @mcp.tool()
+@_guarded()
 def undelete_observation(observation_id: str) -> str:
     """Restore a deleted observation by ID.
 
@@ -294,6 +330,7 @@ def undelete_observation(observation_id: str) -> str:
 # ========== Relation Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def create_relation(from_entity: str, to_entity: str,
                     relation_type: str, vault: str = "",
                     weight: float = 1.0, context: str = "") -> str:
@@ -328,6 +365,7 @@ def create_relation(from_entity: str, to_entity: str,
 
 
 @mcp.tool()
+@_guarded()
 def update_relation(relation_id: str, context: str | None = None,
                     weight: float | None = None) -> str:
     """Edit an existing relation's context or weight in place.
@@ -351,6 +389,7 @@ def update_relation(relation_id: str, context: str | None = None,
 
 
 @mcp.tool()
+@_guarded()
 def delete_relation(relation_id: str) -> str:
     """Remove a relation by ID.
 
@@ -364,6 +403,7 @@ def delete_relation(relation_id: str) -> str:
 # ========== Search Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def search_memory(query: str, vault: str = "", n_results: int = 5,
                    entity_type: str = "",
                    since: str = "", before: str = "",
@@ -409,6 +449,7 @@ def search_memory(query: str, vault: str = "", n_results: int = 5,
 
 
 @mcp.tool()
+@_guarded('vault')
 def get_neighbors(entity_name_or_id: str, vault: str = "",
                   max_depth: int = 1, relation_type: str = "") -> str:
     """Get entities connected to a given entity via graph relations.
@@ -454,6 +495,7 @@ def get_neighbors(entity_name_or_id: str, vault: str = "",
 # ========== Temporal Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def query_timeline(vault: str = "", start: str = "", end: str = "",
                    entity_type: str = "", limit: int = 50,
                    date_axis: str = "event",
@@ -484,6 +526,7 @@ def query_timeline(vault: str = "", start: str = "", end: str = "",
 
 
 @mcp.tool()
+@_guarded('vault')
 def point_in_time(entity_name_or_id: str, as_of: str,
                   vault: str = "", output_format: str = "text") -> str:
     """Get what was known about an entity at a specific point in time.
@@ -503,6 +546,7 @@ def point_in_time(entity_name_or_id: str, as_of: str,
 
 
 @mcp.tool()
+@_guarded('vault')
 def get_temporal_neighbors(entity_name_or_id: str, vault: str = "",
                            direction: str = "both", limit: int = 10,
                            output_format: str = "text") -> str:
@@ -525,6 +569,7 @@ def get_temporal_neighbors(entity_name_or_id: str, vault: str = "",
 # ========== Graph Analysis Tools ==========
 
 @mcp.tool()
+@_guarded('vault')
 def analyze_graph(vault: str = "", top_n: int = 20,
                   output_format: str = "text") -> str:
     """Analyze the knowledge graph: PageRank centrality, community detection,
@@ -543,6 +588,7 @@ def analyze_graph(vault: str = "", top_n: int = 20,
 
 
 @mcp.tool()
+@_guarded('vault')
 def run_librarian(vault: str = "", eps: float = 0.5,
                   min_samples: int = 2,
                   output_format: str = "text") -> str:
@@ -565,6 +611,7 @@ def run_librarian(vault: str = "", eps: float = 0.5,
 
 
 @mcp.tool()
+@_guarded('vault')
 def visualize_graph(vault: str = "") -> str:
     """Generate an interactive knowledge graph visualization and open in browser.
 
@@ -582,6 +629,7 @@ def visualize_graph(vault: str = "") -> str:
 # ========== Status Tools ==========
 
 @mcp.tool()
+@_guarded()
 def get_graph_summary() -> str:
     """Get knowledge graph statistics: node/edge counts, components, relation types."""
     from src.tools.status import tool_get_graph_summary
@@ -589,6 +637,7 @@ def get_graph_summary() -> str:
 
 
 @mcp.tool()
+@_guarded()
 def memory_status() -> str:
     """Health check showing backend status, entity/observation/relation counts per vault."""
     from src.tools.status import tool_memory_status
@@ -596,6 +645,7 @@ def memory_status() -> str:
 
 
 @mcp.tool()
+@_guarded()
 def list_vaults() -> str:
     """List all memory vaults with entity and observation counts."""
     from src.tools.status import tool_list_vaults
@@ -603,6 +653,7 @@ def list_vaults() -> str:
 
 
 @mcp.tool()
+@_guarded('name')
 def create_vault(name: str) -> str:
     """Create a new memory vault for isolating knowledge domains.
 
@@ -614,6 +665,7 @@ def create_vault(name: str) -> str:
 
 
 @mcp.tool()
+@_guarded('name')
 def delete_vault(name: str) -> str:
     """Delete a vault and all its entities, observations, relations, and vectors.
 
@@ -627,6 +679,7 @@ def delete_vault(name: str) -> str:
 # ========== Import / Export ==========
 
 @mcp.tool()
+@_guarded('vault')
 def export_vault(vault: str, output_path: str = "") -> str:
     """Export a vault to a portable zip archive.
 
@@ -646,6 +699,7 @@ def export_vault(vault: str, output_path: str = "") -> str:
 
 
 @mcp.tool()
+@_guarded()
 def vacuum_store(dry_run: bool = False) -> str:
     """Hard-remove stale rows that accumulated despite soft-delete semantics.
 
@@ -656,11 +710,16 @@ def vacuum_store(dry_run: bool = False) -> str:
     Args:
         dry_run: If True, report what would be removed without modifying state.
     """
+    from src import access
+    if not access.private_allowed():
+        # It hard-removes rows in every vault, the private one included.
+        return access.refusal()
     from src.tools.maintenance import tool_vacuum_store
     return tool_vacuum_store(dry_run)
 
 
 @mcp.tool()
+@_guarded('vault')
 def import_vault(input_path: str, vault: str = "") -> str:
     """Import a vault export zip into a target vault. Always additive.
 
@@ -701,7 +760,9 @@ def _startup_check():
         except Exception as e:
             logger.warning("Background search init failed: %s", e)
 
-    threading.Thread(target=_bg_init, daemon=True, name="memory-index-startup").start()
+    from src import access
+    threading.Thread(target=access.in_system(_bg_init), daemon=True,
+                     name="memory-index-startup").start()
 
 
 def _configure_http_transport(port: int, api_key: str) -> None:
@@ -748,8 +809,12 @@ if __name__ == "__main__":
         _configure_http_transport(port, api_key)
         # FastMCP's own server, wrapped so GET /inflight counts the MCP calls
         # being answered: the hub's deployer waits for them before a restart,
-        # so it never cuts a write in half (src/inflight.py).
+        # so it never cuts a write in half (src/inflight.py). Every request
+        # also carries its caller, which decides who may use the private
+        # vault (src/access.py); a call that lost its request is refused.
+        from src import access
         from src.inflight import serve_streamable_http
-        asyncio.run(serve_streamable_http(mcp))
+        access.serving(True)
+        asyncio.run(serve_streamable_http(mcp, wrap_app=access.CallerMiddleware))
     else:
         mcp.run(transport="stdio")

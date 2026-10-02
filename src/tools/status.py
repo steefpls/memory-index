@@ -14,6 +14,12 @@ from src.graph.traversal import get_graph_summary
 logger = logging.getLogger(__name__)
 
 
+def _visible_vaults():
+    """The vaults this call may see: the private one only for the owner."""
+    from src import access
+    return [v for v in config_list_vaults() if not access.is_hidden(v.name)]
+
+
 def tool_memory_status() -> str:
     """Health check showing backend status, entity/observation/relation counts.
 
@@ -22,7 +28,7 @@ def tool_memory_status() -> str:
     """
     backend = get_active_backend()
 
-    vaults = config_list_vaults()
+    vaults = _visible_vaults()
     vault_details = []
     total_entities = 0
     total_observations = 0
@@ -74,7 +80,7 @@ def tool_list_vaults() -> str:
     Returns:
         Vault list with details.
     """
-    vaults = config_list_vaults()
+    vaults = _visible_vaults()
     if not vaults:
         return "No vaults configured. Use create_vault() to create one."
 

@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src import access
 from src.config import VAULTS, get_vault
 from src.indexer import db
 from src.indexer.calibration import calibrate_collection
@@ -125,15 +126,38 @@ def _load_store() -> None:
         _loaded = True
 
 
+def _hidden(ent: Entity | None) -> bool:
+    """Is `ent` in a vault this call may not see (access.py)? Such an
+    entity, and everything on it, reads as not there."""
+    return ent is not None and access.is_hidden(ent.vault)
+
+
+def hidden_entity_ids() -> frozenset[str]:
+    """IDs of every entity this call may not see (graph filtering). Empty
+    at once for the owner. No lock: list() of a dict's values is one step
+    under the GIL, and graph readers call this while holding GRAPH_LOCK."""
+    if access.private_allowed():
+        return frozenset()
+    if not _loaded:
+        _load_store()
+    return frozenset(e.id for e in list(_entities.values()) if access.is_private(e.vault))
+
+
 def snapshot_store() -> tuple[dict[str, Entity], dict[str, Observation]]:
     """Return shallow copies of the store dicts, taken under the lock.
 
     Background workers use this to get a stable view they can iterate without
     holding the lock (and without risking "dict changed size during iteration").
+    Rows in a vault this call may not see are left out.
     """
     _load_store()
     with STORE_LOCK:
-        return dict(_entities), dict(_observations)
+        ents, obs = dict(_entities), dict(_observations)
+    if access.private_allowed():
+        return ents, obs
+    ents = {k: e for k, e in ents.items() if not access.is_private(e.vault)}
+    obs = {k: o for k, o in obs.items() if o.entity_id in ents}
+    return ents, obs
 
 
 def _get_collection_for_vault(vault_name: str):
@@ -158,7 +182,11 @@ def _make_embedding_text(entity: Entity, content: str) -> str:
 def create_entity(name: str, entity_type: str, vault: str,
                   observations: list[str] | None = None,
                   source: str = "") -> Entity:
-    """Create an entity with optional initial observations."""
+    """Create an entity with optional initial observations.
+
+    Raises PermissionError for a vault this call may not use (access.py)."""
+    if access.is_hidden(vault):
+        raise PermissionError(access.refusal())
     _load_store()
 
     # The find-or-create step must be atomic so two concurrent callers can't
@@ -196,13 +224,15 @@ def get_entity(entity_id: str) -> Entity | None:
     """Get an entity by ID."""
     _load_store()
     ent = _entities.get(entity_id)
-    if ent and not ent.deleted:
+    if ent and not ent.deleted and not _hidden(ent):
         return ent
     return None
 
 
 def get_entity_by_name(name: str, vault: str) -> Entity | None:
     """Get an entity by name within a vault."""
+    if access.is_hidden(vault):
+        return None
     _load_store()
     with STORE_LOCK:
         for ent in _entities.values():
@@ -224,7 +254,7 @@ def update_entity(entity_id: str, name: str | None = None,
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return None, (0, 0)
 
         if name is not None:
@@ -256,7 +286,7 @@ def reembed_entity(entity_id: str) -> tuple[Entity | None, tuple[int, int]]:
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return None, (0, 0)
 
     return ent, _reembed_entity_observations(ent)
@@ -271,7 +301,7 @@ def delete_entity(entity_id: str) -> bool:
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return False
 
         ent.deleted = True
@@ -335,10 +365,10 @@ def merge_entities(source_id: str, target_id: str) -> dict:
     _load_store()
     with STORE_LOCK:
         src = _entities.get(source_id)
-        if src is None or src.deleted:
+        if src is None or src.deleted or _hidden(src):
             return {"ok": False, "error": f"Source entity not found: '{source_id}'"}
         tgt = _entities.get(target_id)
-        if tgt is None or tgt.deleted:
+        if tgt is None or tgt.deleted or _hidden(tgt):
             return {"ok": False, "error": f"Target entity not found: '{target_id}'"}
         if source_id == target_id:
             return {"ok": False, "error": "Cannot merge an entity into itself."}
@@ -422,6 +452,7 @@ def list_entities(vault: str | None = None, entity_type: str | None = None,
             and (vault is None or e.vault == vault)
             and (entity_type is None or e.entity_type == entity_type)
         ]
+    filtered = [e for e in filtered if not _hidden(e)]
     filtered.sort(key=lambda e: e.updated_at, reverse=True)
     total = len(filtered)
     return filtered[offset:offset + limit], total
@@ -440,7 +471,7 @@ def resolve_entity(name_or_id: str, vault: str | None = None) -> Entity | None:
     # Try name across all vaults (return first match)
     with STORE_LOCK:
         for e in _entities.values():
-            if e.name == name_or_id and not e.deleted:
+            if e.name == name_or_id and not e.deleted and not _hidden(e):
                 return e
     return None
 
@@ -522,7 +553,7 @@ def _run_post_write_hooks(vault: str, vault_obs_count: int,
                                vault_name, e)
 
         threading.Thread(
-            target=_bg_librarian, args=(vault,),
+            target=access.in_system(_bg_librarian), args=(vault,),
             daemon=True, name="memory-index-auto-librarian",
         ).start()
 
@@ -553,7 +584,7 @@ def add_observation(entity_id: str, content: str, source: str = "",
 
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return None
 
         # Captured before the write so the post-write hooks can tell whether
@@ -657,7 +688,7 @@ def add_observations(entity_id: str, contents: list[str], source: str = "",
 
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return []
 
         # See add_observation: the hooks trigger on boundary CROSSING, which a
@@ -731,7 +762,7 @@ def mark_superseded(observation_id: str, superseded_by: str,
     _load_store()
     with STORE_LOCK:
         obs = _observations.get(observation_id)
-        if obs is None or obs.deleted or not superseded_by:
+        if obs is None or obs.deleted or not superseded_by or _hidden(_entities.get(obs.entity_id)):
             return False
         obs.superseded_by = superseded_by
         obs.superseded_at = (superseded_at or "").strip() or None
@@ -751,7 +782,7 @@ def restore_entity_timestamps(entity_id: str, created_at: str = "",
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return False
         created_at = (created_at or "").strip()
         updated_at = (updated_at or "").strip()
@@ -775,7 +806,7 @@ def get_observation(observation_id: str) -> Observation | None:
     _load_store()
     with STORE_LOCK:
         obs = _observations.get(observation_id)
-        if obs is None or obs.deleted:
+        if obs is None or obs.deleted or _hidden(_entities.get(obs.entity_id)):
             return None
         return obs
 
@@ -790,6 +821,8 @@ def get_observations(entity_id: str, include_superseded: bool = False) -> list[O
     """
     _load_store()
     with STORE_LOCK:
+        if _hidden(_entities.get(entity_id)):
+            return []
         return [
             o for o in _observations.values()
             if o.entity_id == entity_id and not o.deleted
@@ -815,7 +848,7 @@ def delete_observation_detailed(observation_id: str) -> tuple[bool, list[str]]:
     _load_store()
     with STORE_LOCK:
         obs = _observations.get(observation_id)
-        if obs is None or obs.deleted:
+        if obs is None or obs.deleted or _hidden(_entities.get(obs.entity_id)):
             return False, []
 
         obs.deleted = True
@@ -859,10 +892,10 @@ def undelete_observation(observation_id: str) -> Observation | None:
     _load_store()
     with STORE_LOCK:
         obs = _observations.get(observation_id)
-        if obs is None or not obs.deleted:
+        if obs is None or not obs.deleted or _hidden(_entities.get(obs.entity_id)):
             return None
         ent = _entities.get(obs.entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return None
 
         obs.deleted = False
@@ -1005,7 +1038,7 @@ def start_reembed(entity_id: str) -> tuple[bool, str]:
     _load_store()
     with STORE_LOCK:
         ent = _entities.get(entity_id)
-        if ent is None or ent.deleted:
+        if ent is None or ent.deleted or _hidden(ent):
             return False, f"Entity not found: '{entity_id}'"
         # Frozen snapshot: the job must not see a later rename halfway.
         snap = {"id": ent.id, "name": ent.name,
@@ -1035,7 +1068,7 @@ def start_reembed(entity_id: str) -> tuple[bool, str]:
     import types
     frozen = types.SimpleNamespace(**snap)
     threading.Thread(
-        target=_reembed_worker, args=(frozen, obs),
+        target=access.in_system(_reembed_worker), args=(frozen, obs),
         daemon=True, name=f"memory-index-reembed-{snap['id'][:8]}",
     ).start()
     return True, (f"Re-embed started in background for '{snap['name']}': "
@@ -1065,25 +1098,26 @@ def _reembed_worker(entity, obs_list: list) -> None:
 # --- Stats ---
 
 def get_entity_count(vault: str | None = None) -> int:
-    """Count active entities."""
+    """Count active entities (in vaults this call may see)."""
     _load_store()
     with STORE_LOCK:
         return sum(
             1 for e in _entities.values()
-            if not e.deleted and (vault is None or e.vault == vault)
+            if not e.deleted and (vault is None or e.vault == vault) and not _hidden(e)
         )
 
 
 def get_observation_count(vault: str | None = None) -> int:
-    """Count active (non-deleted, non-superseded) observations."""
+    """Count active (non-deleted, non-superseded) observations (in vaults
+    this call may see)."""
     _load_store()
     with STORE_LOCK:
-        if vault is None:
+        if vault is None and access.private_allowed():
             return sum(1 for o in _observations.values()
                        if not o.deleted and not o.is_superseded)
         vault_entity_ids = {
             e.id for e in _entities.values()
-            if not e.deleted and e.vault == vault
+            if not e.deleted and (vault is None or e.vault == vault) and not _hidden(e)
         }
         return sum(
             1 for o in _observations.values()

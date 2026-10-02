@@ -10,6 +10,7 @@ dependencies = [
     "transformers",
     "networkx",
     "scikit-learn",
+    "psutil>=5.9",
 ]
 
 # ONNX Runtime comes from exactly one of these two extras. `cpu` is what every
