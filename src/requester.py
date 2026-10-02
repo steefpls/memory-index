@@ -6,10 +6,18 @@ for as the owner's is not the owner's.
 
 1. Where the call comes from.
 
-   - No peer address: refused.
-   - A peer that isn't this machine (the owner's own desktop or laptop on
-     the tailnet; a client box is fenced off from everyone else's): the
-     owner.
+   - No peer address: refused. The address is the socket's own: uvicorn
+     runs with proxy_headers off, so a local process can't pass itself off
+     as another machine with X-Forwarded-For (review A1, 2026-10-02).
+   - The Tailscale relay (tailscaled, behind the Funnel and tailnet
+     `serve`): it sets X-Forwarded-For to the address it took the request
+     from, and that address is judged as the peer. One of this machine's
+     own (a process here going round through the relay): refused. Funnel
+     traffic from the internet: judged like any other remote peer.
+   - A peer that isn't this machine: the owner only when it is one of the
+     owner's own machines (owner_peers: MEMORY_INDEX_OWNER_PEERS, else the
+     untagged tailnet devices of the user this box belongs to; a tagged
+     client box has none, so its admin's machines aren't its owner's).
    - A peer on this machine: the process holding the connection, and the
      processes above it, say who it is (psutil). memory-index runs as
      LocalSystem, so it can read their environments:
@@ -29,7 +37,9 @@ for as the owner's is not the owner's.
      holds the connection ITSELF is calling for someone else (the hub's
      OpenCode tool gateway, discord-mcp's /whois): it must name the run in
      an X-Jarvis-Run header, or it is refused. A chain that breaks or runs
-     too long without a name is refused.
+     too long is refused, whatever run ids it carried up to the break: a
+     process sets its own environment, and a detached child naming an
+     owner's run is no proof of anything (review A2).
 
    An X-Jarvis-Run header from anyone else can only narrow: the run it
    names must be the owner's too. Trigger ids are no secret (the hub shows
@@ -45,9 +55,16 @@ for as the owner's is not the owner's.
    - any run it came from must be the owner's too: parent_id (run_fire from
      a run or a chat), retry_of, a resume's or a branch's from_run, the chat
      run a programme was started from.
-   - a fire of a routine a chat turn made (created_from 'chat'): no -- the
-     hub doesn't record which chat. A fire the hub marked owner_scoped with
-     no parent (a client's chat it couldn't name): no.
+   - a run the hub started for a header-less request from a chat turn's
+     process, or one it couldn't place (execution.caller_origin kind
+     'chat'): no. From a hub run's process (kind 'runs'): whoever those
+     runs are for.
+   - a fire of a routine: the run that made it (created_from_run) must be
+     the owner's; made from a chat the hub couldn't name (created_from
+     'chat', no run): no; a hub too old to say (no created_from at all): no.
+     A programme started from a chat it couldn't name (started_from with
+     no run_id): no. A fire the hub marked owner_scoped with no parent (a
+     client's chat it couldn't name): no.
    - a run the hub doesn't know, or a hub that can't be asked: no.
    - anything else (Steve's or the owner's programmes and schedules, the
      gardener, the hub's own runs, runs started from the hub UI): yes.
@@ -85,6 +102,9 @@ ROOTS = frozenset({
     "winlogon.exe", "svchost.exe", "csrss.exe", "smss.exe", "system", "system idle process",
     "userinit.exe", "launchd", "systemd", "init",
 })
+# The Tailscale relay: a local proxy that says, in X-Forwarded-For, who it
+# took the request from.
+RELAYS = frozenset({"tailscaled.exe", "tailscaled"})
 _MAX_HOPS = 24
 _MAX_RUN_HOPS = 6
 _CACHE_S = 300.0
@@ -222,6 +242,105 @@ class Processes:
         return self._psutil.Process(pid)
 
 
+def _name_of(procs: Any, pid: int | None) -> str:
+    if not pid:
+        return ""
+    proc = _safe(lambda: procs.proc(pid), None)
+    return ((_safe(proc.name, "") if proc is not None else "") or "").lower()
+
+
+def forwarded_for(headers: Mapping[str, str]) -> str:
+    """The address the relay took the request from: the last entry of
+    X-Forwarded-For (a relay that appends puts its own last; tailscaled
+    replaces whatever the client sent)."""
+    raw = headers.get("x-forwarded-for") or ""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return _norm(parts[-1]) if parts else ""
+
+
+# --- the owner's own machines -------------------------------------------------
+
+_peers: tuple[float, tuple[Any, ...]] = (0.0, ())
+_peers_lock = threading.Lock()
+
+
+def _tailscale() -> str:
+    import shutil
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    for path in (r"C:\Program Files\Tailscale\tailscale.exe", "/usr/bin/tailscale",
+                 "/usr/local/bin/tailscale"):
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def _tailnet_owner_peers() -> list[str]:
+    """The tailnet addresses of the untagged devices that belong to the
+    same user as this box. A tagged box (a client) belongs to nobody, so it
+    gets none."""
+    import subprocess
+    exe = _tailscale()
+    if not exe:
+        logger.warning("private vault: no tailscale CLI, so no remote machine is the owner's")
+        return []
+    try:
+        out = subprocess.run([exe, "status", "--json"], capture_output=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        status = json.loads(out.stdout.decode("utf-8", "replace") or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        logger.warning("private vault: tailscale status failed (%r), so no remote machine is the owner's", e)
+        return []
+    me = status.get("Self") or {}
+    if me.get("Tags") or not me.get("UserID"):
+        return []
+    addrs: list[str] = []
+    for peer in (status.get("Peer") or {}).values():
+        if peer.get("Tags") or peer.get("UserID") != me.get("UserID"):
+            continue
+        addrs.extend(str(a) for a in peer.get("TailscaleIPs") or ())
+    return addrs
+
+
+def owner_peers() -> tuple[Any, ...]:
+    """The networks whose machines count as the owner's: MEMORY_INDEX_OWNER_PEERS
+    (comma-separated addresses or CIDRs; "none" for none), else the owner's
+    own tailnet devices (re-read every 5 minutes)."""
+    global _peers
+    with _peers_lock:
+        at, nets = _peers
+        if at and time.monotonic() - at < 300:
+            return nets
+        raw = os.environ.get("MEMORY_INDEX_OWNER_PEERS")
+        entries = raw.split(",") if raw is not None else _tailnet_owner_peers()
+        found = []
+        for entry in entries:
+            entry = entry.strip()
+            if not entry or entry.lower() == "none":
+                continue
+            try:
+                found.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                logger.warning("private vault: %r in the owner's peers isn't an address", entry)
+        _peers = (time.monotonic(), tuple(found))
+        return _peers[1]
+
+
+def clear_owner_peers() -> None:
+    global _peers
+    with _peers_lock:
+        _peers = (0.0, ())
+
+
+def is_owner_peer(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(_norm(host))
+    except ValueError:
+        return False
+    return any(ip.version == net.version and ip in net for net in owner_peers())
+
+
 def walk(pid: int | None, headers: Mapping[str, str], procs: Any,
          ports: frozenset[int] | None = None) -> Origin:
     """What the process holding the connection, and those above it, say."""
@@ -269,12 +388,10 @@ def walk(pid: int | None, headers: Mapping[str, str], procs: Any,
         if parent is not None and _safe(parent.create_time, 0.0) > _safe(proc.create_time, 0.0) + 1:
             parent = None
         if parent is None:
-            if not out.runs:
-                out.refused = f"{name or proc.pid}'s parent has gone"
+            out.refused = f"{name or proc.pid}'s parent has gone"
             return out
         proc = parent
-    if not out.runs:
-        out.refused = "too many parents to follow"
+    out.refused = "too many parents to follow"
     return out
 
 
@@ -385,13 +502,27 @@ def _row_is_owners(tid: str, row: Mapping[str, Any], hub: Any, hops: int,
             links.append(linked.strip())
     if source in HUB_SOURCES and ex.get("owner_scoped") and not links:
         return False, f"run {short} was fired by a chat the hub couldn't name"
+    origin = ex.get("caller_origin")
+    if origin:
+        # Started by a header-less request (review A3): from a hub run's
+        # process, whoever that run is for; from anything else, nobody's.
+        named = ([str(r).strip() for r in (origin.get("runs") or ()) if str(r).strip()]
+                 if isinstance(origin, dict) else [])
+        if not isinstance(origin, dict) or origin.get("kind") != "runs" or not named:
+            return False, f"run {short} was started from a chat turn's process the hub couldn't name"
+        links.extend(named)
     routine_id = row.get("routine_id")
     if routine_id:
         routine = hub.routine(str(routine_id))
         if routine is None:
             return False, f"run {short}'s schedule {str(routine_id)[:8]} is gone"
-        if str(routine.get("created_from") or "").lower() == "chat":
-            return False, f"run {short}'s schedule was made from a chat"
+        if "created_from" not in routine:
+            return False, f"the hub doesn't say who made run {short}'s schedule"
+        made_by = str(routine.get("created_from_run") or "").strip()
+        if made_by:
+            links.append(made_by)
+        elif str(routine.get("created_from") or "").lower() == "chat":
+            return False, f"run {short}'s schedule was made from a chat the hub couldn't name"
     prog = ex.get("programme") if isinstance(ex.get("programme"), dict) else None
     if prog and prog.get("id"):
         p = hub.programme(str(prog["id"]))
@@ -400,6 +531,8 @@ def _row_is_owners(tid: str, row: Mapping[str, Any], hub: Any, hops: int,
         started = p.get("started_from") if isinstance(p.get("started_from"), dict) else None
         if started and started.get("run_id"):
             links.append(str(started["run_id"]))
+        elif started:
+            return False, f"run {short}'s programme was started from a chat the hub couldn't name"
     for linked in dict.fromkeys(links):
         owner, why = run_is_owners(linked, hub, hops - 1, sleep)
         if not owner:
@@ -420,11 +553,19 @@ def decide(peer: tuple[str, int] | None, headers: Mapping[str, str], *,
     host, port = peer
     named = (headers.get(RUN_HEADER) or "").strip()
     if not is_local(host):
-        if named:
-            return _runs_verdict([(named, "X-Jarvis-Run")], hub)
-        return Verdict(True, f"a session from {host}, another of the owner's machines")
+        return _remote(host, named, hub)
     procs = procs if procs is not None else Processes()
-    origin = walk(procs.pid_at(host, port), headers, procs)
+    pid = procs.pid_at(host, port)
+    relay = _name_of(procs, pid)
+    if relay in RELAYS:
+        # Funnel or tailnet `serve`: judge whoever the relay took it from.
+        source = forwarded_for(headers)
+        if not source:
+            return Verdict(False, f"{relay} relayed a request without saying from whom")
+        if is_local(source):
+            return Verdict(False, f"a process on this box came round through {relay}")
+        return _remote(source, named, hub, via=relay)
+    origin = walk(pid, headers, procs)
     if origin.refused:
         return Verdict(False, origin.refused)
     runs = list(origin.runs)
@@ -433,6 +574,16 @@ def decide(peer: tuple[str, int] | None, headers: Mapping[str, str], *,
     if not runs:
         return Verdict(True, f"a session on this box ({origin.root or 'no run'})")
     return _runs_verdict(runs, hub)
+
+
+def _remote(host: str, named: str, hub: Any, via: str = "") -> Verdict:
+    """A peer that isn't this machine."""
+    if not is_owner_peer(host):
+        how = f" through {via}" if via else ""
+        return Verdict(False, f"{host}{how} isn't one of {owner_name()}'s own machines")
+    if named:
+        return _runs_verdict([(named, "X-Jarvis-Run")], hub)
+    return Verdict(True, f"a session from {host}, one of {owner_name()}'s own machines")
 
 
 def _runs_verdict(runs: list[tuple[str, str]], hub: Any) -> Verdict:

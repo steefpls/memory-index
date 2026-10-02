@@ -323,6 +323,10 @@ def undelete_observation(observation_id: str) -> str:
     Args:
         observation_id: The observation ID to restore.
     """
+    from src import access
+    refusal = access.refuse_unless_owner()
+    if refusal:
+        return refusal
     from src.tools.entities import tool_undelete_observation
     return tool_undelete_observation(observation_id)
 
@@ -694,6 +698,10 @@ def export_vault(vault: str, output_path: str = "") -> str:
                      auto-generated as <vault>_<timestamp>.zip), an explicit
                      .zip path, or empty (defaults to data/exports/).
     """
+    from src import access
+    refusal = access.refuse_unless_owner()
+    if refusal:
+        return refusal
     from src.tools.portability import tool_export_vault
     return tool_export_vault(vault, output_path)
 
@@ -732,6 +740,10 @@ def import_vault(input_path: str, vault: str = "") -> str:
         vault: Target vault name. Defaults to the source vault recorded in
                the archive's manifest. Auto-created if it doesn't exist.
     """
+    from src import access
+    refusal = access.refuse_unless_owner()
+    if refusal:
+        return refusal
     from src.tools.portability import tool_import_vault
     return tool_import_vault(input_path, vault)
 

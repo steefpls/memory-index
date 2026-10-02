@@ -141,8 +141,11 @@ async def serve_streamable_http(mcp: Any, mcp_prefix: str = "/mcp",
     """FastMCP.run_streamable_http_async, with the /inflight wrapper."""
     import uvicorn
 
+    # proxy_headers off: uvicorn would otherwise take X-Forwarded-For from
+    # any local process as the client's address, and memory-index decides
+    # who a call is for from that address (src/requester.py).
     config = uvicorn.Config(wrap(mcp, mcp_prefix, wrap_app), host=mcp.settings.host,
-                            port=mcp.settings.port,
+                            port=mcp.settings.port, proxy_headers=False,
                             log_level=mcp.settings.log_level.lower())
     quiet_access_log()
     await uvicorn.Server(config).serve()

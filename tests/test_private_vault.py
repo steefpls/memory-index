@@ -153,14 +153,29 @@ HUB = FakeHub(
         # A client hub's fire from a chat it couldn't name.
         "owner-scoped-orphan": hub_row(execution={"owner_scoped": True}),
         "ui-run": hub_row(),
+        # Started by a header-less POST to the hub (review A3).
+        "from-chat-process": hub_row(execution={"caller_origin": {"kind": "chat", "why": "carries JARVIS_CHAT_TURN"}}),
+        "from-sk-job-process": hub_row(execution={"caller_origin": {"kind": "runs", "runs": ["job-from-sk"]}}),
+        "from-steve-job-process": hub_row(execution={"caller_origin": {"kind": "runs", "runs": ["job-from-steve"]}}),
+        "from-garbled-origin": hub_row(execution={"caller_origin": "chat"}),
+        # Schedules made from chats, named or not (review A4).
+        "steve-chat-schedule": hub_row("routine", routine_id="steve-chat-routine"),
+        "sk-chat-schedule": hub_row("routine", routine_id="sk-chat-routine"),
+        "old-hub-schedule": hub_row("routine", routine_id="old-hub-routine"),
+        "step-from-unnamed-chat": hub_row(execution={"programme": {"id": "prog-unnamed-chat"}}),
         "loop-a": hub_row(parent_id="loop-b"),
         "loop-b": hub_row(parent_id="loop-a"),
     },
-    routines={"gardener-routine": {"created_from": None},
-              "chat-routine": {"created_from": "chat"}},
+    routines={"gardener-routine": {"created_from": None, "created_from_run": None},
+              "chat-routine": {"created_from": "chat"},
+              "steve-chat-routine": {"created_from": "chat", "created_from_run": "steve-tg"},
+              "sk-chat-routine": {"created_from": "chat", "created_from_run": "sk-wa"},
+              # A hub from before created_from was shown: can't be vouched for.
+              "old-hub-routine": {"enabled": True}},
     programmes={"prog-steve": {"started_from": None},
                 "prog-steve-chat": {"started_from": {"run_id": "steve-dc", "source": "dcbot"}},
-                "prog-sk-chat": {"started_from": {"run_id": "sk-wa", "source": "wa"}}},
+                "prog-sk-chat": {"started_from": {"run_id": "sk-wa", "source": "wa"}},
+                "prog-unnamed-chat": {"started_from": {"run_id": None, "source": "chat", "unplaced": True}}},
 )
 
 LOCAL = ("127.0.0.1", 50000)
@@ -172,13 +187,16 @@ class RequesterTestCase(unittest.TestCase):
         requester.clear_cache()
         self.sleep = patch("src.requester.time.sleep", lambda s: None)
         self.sleep.start()
-        self.ports = patch.dict(os.environ, {"MEMORY_INDEX_FLEET_PORTS": "8080,8081,8084,8088"})
+        self.ports = patch.dict(os.environ, {"MEMORY_INDEX_FLEET_PORTS": "8080,8081,8084,8088",
+                                             "MEMORY_INDEX_OWNER_PEERS": "100.64.0.7, 100.64.0.8/32"})
         self.ports.start()
+        requester.clear_owner_peers()
 
     def tearDown(self):
         self.sleep.stop()
         self.ports.stop()
         requester.clear_cache()
+        requester.clear_owner_peers()
 
     def decide(self, procs, headers=None, peer=LOCAL, hub=HUB):
         return requester.decide(peer, headers or {}, procs=procs, hub=hub)
@@ -266,6 +284,23 @@ class TestHubRuns(RequesterTestCase):
         self.assertFalse(self.decide(self.hub_run("chat-schedule")).owner)
         self.assertFalse(self.decide(self.hub_run("gone-schedule")).owner)
 
+    def test_a_schedule_is_whoever_made_it(self):
+        self.assertTrue(self.decide(self.hub_run("steve-chat-schedule")).owner)
+        self.assertFalse(self.decide(self.hub_run("sk-chat-schedule")).owner)
+        v = self.decide(self.hub_run("old-hub-schedule"))
+        self.assertFalse(v.owner)
+        self.assertIn("doesn't say who made", v.why)
+
+    def test_a_run_started_by_a_headerless_call_from_a_chat_process_is_not(self):
+        for tid in ("from-chat-process", "from-garbled-origin"):
+            v = self.decide(self.hub_run(tid))
+            self.assertFalse(v.owner, tid)
+        self.assertFalse(self.decide(self.hub_run("from-sk-job-process")).owner)
+        self.assertTrue(self.decide(self.hub_run("from-steve-job-process")).owner)
+
+    def test_a_programme_from_a_chat_the_hub_couldnt_name_is_not(self):
+        self.assertFalse(self.decide(self.hub_run("step-from-unnamed-chat")).owner)
+
     def test_a_client_hubs_unnamed_chat_fire_is_not(self):
         self.assertFalse(self.decide(self.hub_run("owner-scoped-orphan")).owner)
 
@@ -289,13 +324,56 @@ class TestSessionsAndProxies(RequesterTestCase):
         v = self.decide(procs)
         self.assertTrue(v.owner, v.why)
 
-    def test_the_owners_desktop_on_the_box_and_the_funnel_relay(self):
+    def test_the_owners_desktop_on_the_box(self):
         self.assertTrue(self.decide(chain(("claude.exe", {}), ("explorer.exe", {}))).owner)
-        self.assertTrue(self.decide(chain(("tailscaled.exe", {}), ("services.exe", {}))).owner)
+
+    def test_the_tailscale_relay_is_judged_by_whom_it_relays(self):
+        relay = chain(("tailscaled.exe", {}), ("services.exe", {}))
+        # The owner's desktop through tailnet `serve`.
+        v = self.decide(relay, {"X-Forwarded-For": "100.64.0.7"})
+        self.assertTrue(v.owner, v.why)
+        # The internet through the Funnel; a process on this box going round
+        # through the relay; a relay that doesn't say.
+        self.assertFalse(self.decide(relay, {"X-Forwarded-For": "160.79.106.161"}).owner)
+        self.assertFalse(self.decide(relay, {"X-Forwarded-For": "127.0.0.1"}).owner)
+        self.assertFalse(self.decide(relay).owner)
+        # Only the entry the relay itself wrote counts.
+        self.assertFalse(self.decide(relay, {"X-Forwarded-For": "100.64.0.7, 203.0.113.7"}).owner)
 
     def test_the_owners_other_machines_over_the_tailnet(self):
         v = self.decide(FakeProcs({}, {}, {}), peer=("100.64.0.7", 51000))
         self.assertTrue(v.owner, v.why)
+        self.assertTrue(self.decide(FakeProcs({}, {}, {}), peer=("100.64.0.8", 51000)).owner)
+
+    def test_other_machines_are_not_the_owners(self):
+        # Another box on the tailnet (a client's admin, a peer box), the LAN,
+        # the internet.
+        for host in ("100.87.100.0", "192.168.50.20", "203.0.113.7"):
+            v = self.decide(FakeProcs({}, {}, {}), peer=(host, 51000))
+            self.assertFalse(v.owner, host)
+
+    def test_no_owner_peers_means_no_remote_owner(self):
+        with patch.dict(os.environ, {"MEMORY_INDEX_OWNER_PEERS": "none"}):
+            requester.clear_owner_peers()
+            self.assertFalse(self.decide(FakeProcs({}, {}, {}), peer=("100.64.0.7", 51000)).owner)
+
+    def test_owner_peers_default_to_the_owners_untagged_tailnet_devices(self):
+        status = {"Self": {"UserID": 1, "TailscaleIPs": ["100.64.0.1"]},
+                  "Peer": {"a": {"UserID": 1, "TailscaleIPs": ["100.64.0.9", "fd7a::9"]},
+                           "b": {"UserID": 2, "TailscaleIPs": ["100.64.0.10"]},
+                           "c": {"UserID": 1, "Tags": ["tag:client"], "TailscaleIPs": ["100.64.0.11"]}}}
+        tagged = {"Self": {"UserID": 3, "Tags": ["tag:client"]}, "Peer": status["Peer"]}
+        env = {k: v for k, v in os.environ.items() if k != "MEMORY_INDEX_OWNER_PEERS"}
+        for doc, want in ((status, ["100.64.0.9", "fd7a::9"]), (tagged, [])):
+            run = MagicMock(return_value=types.SimpleNamespace(stdout=json.dumps(doc).encode()))
+            with patch.dict(os.environ, env, clear=True), \
+                    patch("src.requester._tailscale", return_value="tailscale"), \
+                    patch("subprocess.run", run):
+                requester.clear_owner_peers()
+                self.assertEqual(requester._tailnet_owner_peers(), want)
+                self.assertEqual(requester.is_owner_peer("100.64.0.9"), bool(want))
+                self.assertFalse(requester.is_owner_peer("100.64.0.10"))
+                self.assertFalse(requester.is_owner_peer("100.64.0.11"))
 
     def test_a_remote_header_can_only_narrow(self):
         v = self.decide(FakeProcs({}, {}, {}), {"X-Jarvis-Run": "sk-wa"}, peer=("100.64.0.7", 51000))
@@ -329,6 +407,30 @@ class TestSessionsAndProxies(RequesterTestCase):
         self.assertFalse(self.decide(FakeProcs({}, {}, {})).owner)            # nobody holds the port
         self.assertFalse(self.decide(chain(("curl.exe", {}))).owner)          # parent gone
         self.assertFalse(requester.decide(None, {}, procs=FakeProcs({}, {}, {}), hub=HUB).owner)
+
+    def test_a_forged_forwarded_address_is_ignored_by_the_daemon(self):
+        # uvicorn runs with proxy_headers off, so the peer stays the socket's
+        # own and a local chat turn with X-Forwarded-For is still walked.
+        import inspect
+        from src import inflight
+        self.assertIn("proxy_headers=False", inspect.getsource(inflight.serve_streamable_http))
+        v = self.decide(self.turn("sk-wa"), {"X-Forwarded-For": "100.64.0.7"})
+        self.assertFalse(v.owner)
+
+    def test_a_detached_child_naming_an_owner_run_is_refused(self):
+        # Its parent (another owner's turn) is gone; it names Steve's run
+        # in its own environment (review A2).
+        v = self.decide(chain(("python.exe", {"JARVIS_RUN_ID": "steve-tg"})))
+        self.assertFalse(v.owner)
+        self.assertIn("parent has gone", v.why)
+        self.assertFalse(self.decide(chain(("python.exe", {"HUB_RUN_ID": "ui-run"}))).owner)
+
+    def test_a_child_naming_an_owner_run_below_another_turn_is_refused(self):
+        procs = chain(("python.exe", {"JARVIS_RUN_ID": "steve-tg", "JARVIS_CHAT_TURN": "telegram"}),
+                      ("bash.exe", {"JARVIS_RUN_ID": "sk-wa", "JARVIS_CHAT_TURN": "telegram"}),
+                      ("claude.exe", {"JARVIS_RUN_ID": "sk-wa", "JARVIS_CHAT_TURN": "telegram"}),
+                      ("python.exe", {}), ("services.exe", {}), listeners={"python.exe": 8081})
+        self.assertFalse(self.decide(procs).owner)
 
     def test_a_reused_parent_pid_is_not_a_parent(self):
         child = FakeProc(2, "curl.exe", {}, None, created=100.0)
@@ -581,13 +683,26 @@ class TestNonOwnerTools(ToolTestCase):
             import src.graph.manager as gm
             self.assertIsNotNone(gm.get_relation(self.cross_rel))
 
-    def test_undelete_of_a_private_row_finds_nothing(self):
+    def test_undelete_is_the_owners_alone(self):
         with self.as_owner():
             self.s.delete_observation(self.private_obs)
+            self.s.delete_observation(self.work_obs)
         with self.as_other():
-            self.assertIn("cannot undelete", self.s.undelete_observation(self.private_obs).lower())
+            # Not even in work: the notes moved out of work are deleted rows there.
+            self.assertIn("Nothing was done", self.s.undelete_observation(self.private_obs))
+            self.assertIn("Nothing was done", self.s.undelete_observation(self.work_obs))
         with self.as_owner():
             self.assertIn("restored", self.s.undelete_observation(self.private_obs).lower())
+            self.assertIn("restored", self.s.undelete_observation(self.work_obs).lower())
+
+    def test_export_and_import_are_the_owners_alone(self):
+        with self.as_owner():
+            self.assertIn("Exported", self.s.export_vault("work", output_path=self.tmpdir))
+        archive = next(Path(self.tmpdir).glob("work_*.zip"))
+        with self.as_other():
+            self.assertIn("Nothing was done", self.s.export_vault("work", output_path=self.tmpdir))
+            for target in ("", "work", "tmp"):
+                self.assertIn("Nothing was done", self.s.import_vault(str(archive), vault=target))
 
     def test_import_into_it_is_refused(self):
         with self.as_owner():

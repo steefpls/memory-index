@@ -46,7 +46,16 @@ logger = logging.getLogger(__name__)
 PRIVATE_VAULT = "private"
 
 REFUSAL = ("The private vault is only for {owner}'s own conversations, so this "
-           "call can't use it. Nothing was read or written there.")
+           "call can't use it. Nothing was read or written there. Don't write a "
+           "private fact to another vault instead: in this conversation it isn't "
+           "written down anywhere.")
+
+# Tools that reach rows a non-owner shouldn't see whatever vault they name:
+# an export holds deleted rows (the notes moved out of `work` are among
+# them), an import loads any archive on disk, undelete revives any id
+# (review A5/B2, 2026-10-02).
+OWNER_ONLY = ("That tool is only for {owner}'s own conversations: it can reach notes "
+              "this conversation isn't allowed to see. Nothing was done.")
 
 
 def is_private(vault: str | None) -> bool:
@@ -132,6 +141,14 @@ def is_hidden(vault: str | None) -> bool:
 def refusal() -> str:
     from src import requester
     return REFUSAL.format(owner=requester.owner_name())
+
+
+def refuse_unless_owner() -> str | None:
+    """The refusal for an owner-only tool, or None for the owner."""
+    if private_allowed():
+        return None
+    from src import requester
+    return OWNER_ONLY.format(owner=requester.owner_name())
 
 
 def refuse_vault(vault: str | None) -> str | None:
