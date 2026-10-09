@@ -419,9 +419,10 @@ def search_memory(query: str, vault: str = "", n_results: int = 5,
 
     Every matching observation is ranked flat by calibrated relevance — results
     are individual facts with their entity as context, not entities with a
-    sample of their facts. Only observations above the vault's calibrated noise
-    threshold are returned; if fewer than 3 clear it, the best 3 overall come
-    back anyway with honest LOW / NO MATCH labels so you can judge them.
+    sample of their facts. A relevance check reads each candidate with the
+    query and drops what doesn't answer it, so a query memory can't answer
+    returns one "No memory matches" line, not padding. Ask for the default 5
+    unless you need more: results 6-10 are mostly noise.
 
     Args:
         query: Natural language query describing what you're looking for.
@@ -769,6 +770,8 @@ def _startup_check():
         try:
             from src.tools.search import start_search_init
             start_search_init()
+            from src.indexer import reranker
+            reranker.start()
         except Exception as e:
             logger.warning("Background search init failed: %s", e)
 

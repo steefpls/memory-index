@@ -48,10 +48,22 @@ def tool_memory_status() -> str:
     if dev.get("error"):
         device_line += f" -- {dev['error']}"
 
+    from src.indexer import reranker
+    gate = reranker.status()
+    if gate["mode"] == "off":
+        gate_line = "  Relevance gate: off (MEMORY_INDEX_RERANK=off)"
+    elif gate["loaded"]:
+        gate_line = f"  Relevance gate: MiniLM on {gate['device']}, drops under {gate['min']}"
+    else:
+        gate_line = "  Relevance gate: not loaded yet, search is ungated"
+    if gate.get("error"):
+        gate_line += f" -- {gate['error']}"
+
     lines = [
         "Memory Index Status",
         f"  Backend: {backend}",
         device_line,
+        gate_line,
         f"  Vaults: {len(vaults)}",
         f"  Total entities: {total_entities}",
         f"  Total observations: {total_observations}",

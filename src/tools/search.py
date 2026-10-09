@@ -19,6 +19,7 @@ from src.indexer.embedder import get_collection, get_embedding_function, get_act
 from src.indexer.calibration import get_thresholds
 from src.indexer.store import get_entity, get_observation
 from src.graph.traversal import spread_activation
+from src.indexer import reranker
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,12 @@ def invalidate_calibration_cache(vault: str | None = None) -> None:
 
 DEFAULT_N_RESULTS = 5
 
-# The tool never returns fewer than this many observations when the vault has
-# anything to offer, even if nothing clears the relevance threshold. Honest
-# LOW / NO MATCH labels are attached so the caller can judge for themselves.
+# Without the relevance gate (src/indexer/reranker.py not loaded), the tool
+# never returns fewer than this many observations when the vault has anything
+# to offer, even if nothing clears the relevance threshold. Honest LOW / NO
+# MATCH labels are attached so the caller can judge for themselves. With the
+# gate, a query nothing answers gets one line instead: those padded hits were
+# ~470 tokens of noise per miss (scratch/memeval, 2026-10-09).
 MIN_RESULTS = 3
 
 
@@ -55,10 +59,13 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     """Semantic memory search over observations.
 
     Every matching observation is ranked flat by calibrated relevance (no
-    dedupe-to-entity, no sampling of an entity's facts). Results above the
-    calibrated noise threshold are returned, capped at n_results. If fewer than
-    3 clear the threshold, the best 3 overall are returned anyway with their
-    honest confidence labels.
+    dedupe-to-entity, no sampling of an entity's facts). With the relevance
+    gate loaded, the best RERANK_POOL candidates are each read with the query
+    by a cross-encoder and those under RERANK_MIN are dropped, keeping the
+    vector order, capped at n_results; nothing left means one "no match" line.
+    Without it, results above the calibrated noise threshold are returned,
+    capped at n_results, and if fewer than 3 clear it the best 3 overall come
+    back anyway with their honest confidence labels.
 
     Args:
         query: Natural language query describing what you're looking for.
@@ -131,6 +138,9 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     # Over-fetch so the threshold gate and the min-3 rule both have material
     # to work with after superseded observations are dropped.
     fetch_count = max(n_results * 3, MIN_RESULTS * 3)
+    gate = reranker.get()
+    if gate is not None:
+        fetch_count = max(fetch_count, reranker.RERANK_POOL)
     if date_bounds[0] is not None or date_bounds[1] is not None:
         # Post-filtering shrinks the top-k window, so widen it first.
         fetch_count = min(fetch_count * 4, 500)
@@ -178,12 +188,20 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
                 ranked = _rank(ranked + fresh)
                 above = [item for item in ranked if item["confidence"] != "NO MATCH"]
 
-    if len(above) >= MIN_RESULTS:
-        selected = above[:n_results]
-    else:
-        # Min-3 rule: nothing (or almost nothing) cleared the bar — hand back
-        # the best few anyway rather than an empty result, labels intact.
-        selected = ranked[:MIN_RESULTS]
+    gated = False
+    if gate is not None:
+        pool = ranked[:reranker.RERANK_POOL]
+        if _apply_gate(gate, query, pool):
+            gated = True
+            above = [item for item in pool if item["rerank"] >= reranker.RERANK_MIN]
+            selected = above[:n_results]
+    if not gated:
+        if len(above) >= MIN_RESULTS:
+            selected = above[:n_results]
+        else:
+            # Min-3 rule: nothing (or almost nothing) cleared the bar — hand back
+            # the best few anyway rather than an empty result, labels intact.
+            selected = ranked[:MIN_RESULTS]
 
     # Keyword fallback: vector search is primary, but embeddings systematically
     # miss exact strings (file paths, identifiers, numbers — "prod.pem" is far
@@ -211,12 +229,39 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     selected_ids = {item["observation_id"] for item in selected}
     appended = [h for h in keyword_hits
                 if h["observation_id"] not in selected_ids][:n_results]
-    combined = selected + appended
+    if gated:
+        # Exact-string hits answer to the same gate and count toward n_results.
+        if appended and _apply_gate(gate, query, appended):
+            appended = [h for h in appended if h["rerank"] >= reranker.RERANK_MIN]
+        combined = (selected + appended)[:n_results]
+    else:
+        combined = selected + appended
 
+    if gated and not combined:
+        if output_format == "json":
+            return _format_json([], query, strategy=strategy, above_threshold_count=0)
+        return f"No memory matches '{query}'."
     if output_format == "json":
         return _format_json(combined, query, strategy=strategy,
                             above_threshold_count=len(above))
     return _format_text(combined, query, above_threshold_count=len(above))
+
+
+def _apply_gate(gate, query: str, items: list[dict]) -> bool:
+    """Score `items` with the relevance gate, setting item["rerank"]; False
+    (and search runs ungated) when the gate fails."""
+    if not items:
+        return True
+    texts = [f"{i.get('entity_type', '')}: {i.get('entity_name', '')}\n{i.get('content', '')}"[:1500]
+             for i in items]
+    try:
+        scores = gate.score(query, texts)
+    except Exception as e:  # noqa: BLE001 -- a broken gate must not break search
+        logger.warning("Relevance gate failed, search runs ungated: %s", str(e)[:200])
+        return False
+    for item, s in zip(items, scores):
+        item["rerank"] = float(s)
+    return True
 
 
 def _build_where_conditions(entity_type: str) -> list[dict]:
@@ -693,6 +738,7 @@ def _format_json(results: list[dict], query: str, strategy: str = "semantic",
                 "graph_boosted": False,
                 "superseded": bool(item.get("superseded")),
                 "keyword_match": True,
+                "rerank": item.get("rerank"),
             })
             continue
         confidence = _confidence_label(item["distance"], vault)
@@ -712,5 +758,6 @@ def _format_json(results: list[dict], query: str, strategy: str = "semantic",
             "graph_boosted": bool(item.get("graph_boosted")),
             "superseded": bool(item.get("superseded")),
             "keyword_match": bool(item.get("keyword_match")),
+            "rerank": item.get("rerank"),
         })
     return json.dumps(payload, indent=2)

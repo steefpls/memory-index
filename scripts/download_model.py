@@ -1,4 +1,5 @@
-"""Download the EmbeddingGemma-300m ONNX q8 model into data/embeddinggemma_onnx.
+"""Download the EmbeddingGemma-300m ONNX q8 model into data/embeddinggemma_onnx,
+and the relevance gate's MiniLM cross-encoder into data/minilm_onnx.
 
 Pulls from the ungated onnx-community mirror, so no HF login is needed.
 The q8 (dynamic int8) variant is deliberate: EmbeddingGemma activations are
@@ -42,6 +43,11 @@ def main() -> int:
         print(f"[OK]   {local_name} ({dest.stat().st_size:,} bytes)")
 
     print(f"\nModel ready in {EMBED_ONNX_DIR}")
+
+    # The relevance gate's cross-encoder (src/indexer/reranker.py, ~90 MB).
+    from src.indexer import reranker
+    reranker.download()
+    print(f"Relevance gate model ready in {reranker.RERANK_ONNX_DIR}")
     return 0
 
 

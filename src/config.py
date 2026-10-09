@@ -30,6 +30,16 @@ EMBED_QUERY_PREFIX = "task: search result | query: "
 EMBED_DOC_PREFIX = "title: none | text: "
 EMBED_MAX_TOKENS = 2048
 
+# Second-pass relevance gate (src/indexer/reranker.py): a cross-encoder reads
+# the query and each candidate together and scores how relevant it is, which
+# cosine distance can't do across queries. MiniLM-L6 (22M params, Apache-2.0),
+# the ONNX export from its own repo, pinned to a revision.
+RERANK_ONNX_REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANK_ONNX_REVISION = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
+RERANK_ONNX_FILES = (("onnx/model.onnx", "model.onnx"), ("tokenizer.json", "tokenizer.json"))
+RERANK_ONNX_DIR = DATA_DIR / "minilm_onnx"
+RERANK_MAX_TOKENS = 512
+
 
 @dataclass
 class VaultConfig:
