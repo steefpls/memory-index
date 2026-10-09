@@ -9,10 +9,11 @@ from src.indexer.store import (
     reembed_entity, start_reembed, get_reembed_status, REEMBED_BG_THRESHOLD,
     delete_entity, list_entities, resolve_entity,
     add_observation, add_observations, get_observations, delete_observation,
-    delete_observation_detailed, undelete_observation,
+    delete_observation_detailed, undelete_observation, get_observation,
 )
 from src.graph.manager import get_relations_for_entity, remove_entity_relations
 from src.models.entity import ENTITY_TYPES
+from src.tools.brief import source_tag
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,31 @@ def _obs_json(obs) -> dict:
     }
 
 
+def _one_observation(obs_id: str, vault: str, as_json: bool) -> str | None:
+    """get_entity on an observation id: that one fact, whole, with its full
+    source. This is the fetch behind search's "[+N words, obs=<id>]" marker.
+    None when the id is not an observation (the caller reports not-found)."""
+    obs = get_observation(obs_id.strip())
+    ent = get_entity(obs.entity_id) if obs is not None else None
+    if ent is None or (vault and ent.vault != vault):
+        return None
+    if as_json:
+        return json.dumps({
+            "entity": {"id": ent.id, "name": ent.name, "type": ent.entity_type, "vault": ent.vault},
+            "observation": _obs_json(obs),
+        })
+    when = f" · happened {obs.occurred_at}" if obs.occurred_at else ""
+    lines = [
+        f"Observation {obs.id} on {ent.name} ({ent.entity_type}) · id={ent.id} · vault={ent.vault}",
+        f"  recorded {obs.created_at}{when}"
+        + (f" · superseded by {obs.superseded_by}" if obs.is_superseded else ""),
+        f"  {obs.content}",
+    ]
+    if obs.source:
+        lines.append(f"  [src: {obs.source}]")
+    return "\n".join(lines)
+
+
 def tool_get_entity(name_or_id: str, vault: str = "",
                     offset: int = 0, limit: int = 10,
                     full: bool = False,
@@ -157,7 +183,7 @@ def tool_get_entity(name_or_id: str, vault: str = "",
     when the caller intends to act on individual rows.
 
     Args:
-        name_or_id: Entity name or ID.
+        name_or_id: Entity name or ID, or an observation ID (that one fact).
         vault: Vault name (helps disambiguate names across vaults).
         offset: Skip this many active observations (newest-first ordering).
         limit: Max active observations to show (default 10, ignored if full=True).
@@ -172,6 +198,9 @@ def tool_get_entity(name_or_id: str, vault: str = "",
     as_json = output_format.strip().lower() == "json"
     entity = resolve_entity(name_or_id, vault or None)
     if entity is None:
+        one = _one_observation(name_or_id, vault, as_json)
+        if one is not None:
+            return one
         if as_json:
             return json.dumps({
                 "error": "not_found",
@@ -253,7 +282,12 @@ def tool_get_entity(name_or_id: str, vault: str = "",
                 f"+{remaining} more, offset={end}):"
             )
         for obs in shown_obs:
-            src = f" [src: {obs.source}]" if obs.source else ""
+            # Full sources only when the caller is about to edit (show_ids);
+            # otherwise the date, as in search (src/tools/brief.py).
+            if show_ids:
+                src = f" [src: {obs.source}]" if obs.source else ""
+            else:
+                src = source_tag(obs.source, obs.content)
             tail = f" (id: {obs.id})" if show_ids else ""
             lines.append(f"  - {obs.content}{src}{tail}")
         lines.append("")

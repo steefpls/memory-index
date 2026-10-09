@@ -613,7 +613,8 @@ class TestSearchScoring(unittest.TestCase):
         self.assertIn("technology", text)
         self.assertIn("General purpose language", text)
         self.assertIn("Created by Guido", text)
-        self.assertIn("[src: docs]", text)
+        # A source shows only as its date; "docs" has none.
+        self.assertNotIn("docs", text)
         # Entity context line is emitted once for the consecutive run
         self.assertEqual(text.count("(technology)"), 1)
         # No shortfall note when everything cleared

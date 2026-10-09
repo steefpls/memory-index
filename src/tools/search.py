@@ -654,7 +654,13 @@ def _format_text(results: list[dict], query: str,
     Keyword (exact-substring) hits carry no distance — they render with a
     'keyword' tag instead of a score, so they can never be mistaken for a
     calibrated vector result.
+
+    Each fact is shown short (src/tools/brief.py): a long one is cut with the
+    observation id that fetches it whole, and the source shrinks to its date.
+    JSON output keeps both in full.
     """
+    from src.tools.brief import clip, source_tag
+
     lines: list[str] = []
 
     n_semantic = sum(1 for r in results if not r.get("keyword_match"))
@@ -681,13 +687,13 @@ def _format_text(results: list[dict], query: str,
             )
             last_key = key
 
-        src = f" [src: {item['source']}]" if item.get("source") else ""
+        content = item.get("content", "")
+        src = source_tag(item.get("source", ""), content)
         old = " [superseded]" if item.get("superseded") else ""
+        shown = clip(content, item.get("observation_id", ""),
+                     match=query if item.get("keyword_match") else "")
         if item.get("keyword_match") and item.get("distance") is None:
-            lines.append(
-                f"  [{i + 1}] KEYWORD keyword · "
-                f"{item.get('content', '')}{src}{old}"
-            )
+            lines.append(f"  [{i + 1}] KEYWORD keyword · {shown}{src}{old}")
             continue
 
         confidence = _confidence_label(item["distance"], vault)
@@ -697,8 +703,7 @@ def _format_text(results: list[dict], query: str,
         kw = " keyword" if item.get("keyword_match") else ""
 
         lines.append(
-            f"  [{i + 1}] {score}% {conf_short}{boosted}{kw} · "
-            f"{item.get('content', '')}{src}{old}"
+            f"  [{i + 1}] {score}% {conf_short}{boosted}{kw} · {shown}{src}{old}"
         )
 
     return "\n".join(lines)

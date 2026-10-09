@@ -181,6 +181,41 @@ class TestEntityTools(unittest.TestCase):
         self.assertEqual(old["superseded_by"], payload["observations"][0]["id"])
         self.assertTrue(old["superseded_at"])
 
+    def test_get_entity_text_shows_source_dates(self):
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_get_entity)
+        tool_create_entity("Python", "technology", "test")
+        tool_add_observation("Python", "Used in ML", vault="test",
+                             source="Claude Code session 2026-08-04 (desktop)")
+        tool_add_observation("Python", "Pinned to 3.11 on 2026-08-05", vault="test",
+                             source="chat 2026-08-05")
+        text = tool_get_entity("Python", "test")
+        self.assertIn("  - Used in ML (2026-08-04)", text)
+        self.assertIn("  - Pinned to 3.11 on 2026-08-05\n", text + "\n")
+        self.assertNotIn("[src:", text)
+        # About to edit: the full source again.
+        self.assertIn("[src: Claude Code session 2026-08-04 (desktop)]",
+                      tool_get_entity("Python", "test", show_ids=True))
+
+    def test_get_entity_by_observation_id(self):
+        import json as _json
+        from src.tools.entities import (tool_create_entity, tool_add_observation,
+                                        tool_get_entity)
+        tool_create_entity("Python", "technology", "test")
+        long_fact = "word " * 200 + "the end"
+        out = tool_add_observation("Python", long_fact, vault="test",
+                                   source="chat 2026-08-04")
+        obs_id = out.split("id=", 1)[1].split(",", 1)[0].strip()
+        text = tool_get_entity(obs_id)
+        self.assertTrue(text.startswith(f"Observation {obs_id} on Python (technology)"))
+        self.assertIn("the end", text)
+        self.assertIn("[src: chat 2026-08-04]", text)
+        payload = _json.loads(tool_get_entity(obs_id, output_format="json"))
+        self.assertEqual(payload["observation"]["id"], obs_id)
+        self.assertEqual(payload["entity"]["name"], "Python")
+        # The vault argument still scopes it.
+        self.assertIn("not found", tool_get_entity(obs_id, vault="other"))
+
     def test_get_entity_json_not_found(self):
         import json as _json
         from src.tools.entities import tool_get_entity

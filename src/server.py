@@ -131,10 +131,12 @@ def get_entity(name_or_id: str, vault: str = "",
     full=True to dump everything in one call. Observation IDs are hidden
     unless show_ids=True (set when you intend to supersede/delete).
     Superseded observations are hidden unless include_superseded=True
-    (use temporal tools for history).
+    (use temporal tools for history). Sources show as dates; show_ids=True
+    shows them in full.
 
     Args:
-        name_or_id: Entity name or ID.
+        name_or_id: Entity name or ID, or an observation ID (search's
+                    "obs=<id>") to get that one fact whole with its source.
         vault: Vault name (helps disambiguate names across vaults).
         offset: Skip this many active observations (newest-first).
         limit: Max active observations to show (default 10, ignored if full).
@@ -423,6 +425,10 @@ def search_memory(query: str, vault: str = "", n_results: int = 5,
     query and drops what doesn't answer it, so a query memory can't answer
     returns one "No memory matches" line, not padding. Ask for the default 5
     unless you need more: results 6-10 are mostly noise.
+
+    Facts are shown short: a long one ends "[+N words, obs=<id>]" and
+    get_entity(<id>) returns it whole; a source is shown as its date, and
+    only when the fact has none.
 
     Args:
         query: Natural language query describing what you're looking for.
