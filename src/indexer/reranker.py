@@ -38,9 +38,9 @@ from src.indexer.embedder import (
     ARENA_RELEASE_SECONDS,
     EMBED_DEVICE,
     _ArenaReleaser,
-    _CPU,
     _CUDA,
     _run_options,
+    open_session,
     providers_for,
 )
 
@@ -108,19 +108,17 @@ class CrossEncoder:
 
         path = str(model_dir / "model.onnx")
         providers, err = providers_for(EMBED_DEVICE, list(ort.get_available_providers()))
-        session = ort.InferenceSession(path, sess_opts, providers=providers)
+
+        def smoke(session):
+            self._inputs = {i.name for i in session.get_inputs()}
+            self._output = session.get_outputs()[0].name
+            session.run([self._output], self._feed("warmup", ["warmup"]),
+                        _run_options(session, shrink=True))
+
+        session, cuda_err = open_session(path, sess_opts, providers, smoke, "Reranker")
+        err = err or cuda_err
         self._inputs = {i.name for i in session.get_inputs()}
         self._output = session.get_outputs()[0].name
-        if providers[0] != _CPU:
-            try:
-                if session.get_providers()[0] != _CUDA:
-                    raise RuntimeError("the session came up on " + session.get_providers()[0])
-                session.run([self._output], self._feed("warmup", ["warmup"]),
-                            _run_options(session, shrink=True))
-            except Exception as e:
-                err = f"CUDA session failed, using CPU: {str(e)[:300]}"
-                logger.error("Reranker: %s", err)
-                session = ort.InferenceSession(path, sess_opts, providers=[_CPU])
         self._session = session
         self._run_opts = _run_options(session)
         self._releaser = None

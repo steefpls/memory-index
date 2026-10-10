@@ -78,6 +78,66 @@ def providers_for(device: str, available: list[str]) -> tuple[list, str | None]:
     return [_CPU], None
 
 
+# Every CUDA session in the process (the embedder and the reranker's gate) is
+# created and smoke-tested under this lock, one at a time. At the 2026-10-10
+# 00:00 restart the gate's warm-up thread opened its CUDA session in the same
+# second as the embedder's; the embedder's first run then failed with
+# NOT_IMPLEMENTED (RequireCudnnHandle) and it stayed on the CPU for the life
+# of the process. At the 23:10 start the gate was still downloading its model,
+# so the two never overlapped and both came up on CUDA.
+_cuda_open_lock = threading.Lock()
+_dlls_preloaded = False
+# A failed CUDA smoke test is retried this many times, after this pause,
+# before the session falls back to the CPU.
+_CUDA_RETRIES = 1
+_CUDA_RETRY_PAUSE = 2.0
+
+
+def open_session(path: str, sess_opts, providers: list, smoke, label: str):
+    """An ONNX session on `providers`, proven by `smoke(session)` when CUDA.
+
+    Returns (session, error): error says why a wanted CUDA session is not the
+    one returned. Serialised by _cuda_open_lock (see above).
+    """
+    global _dlls_preloaded
+    import onnxruntime as ort
+
+    if providers[0] == _CPU:
+        return ort.InferenceSession(path, sess_opts, providers=providers), None
+    with _cuda_open_lock:
+        # onnxruntime-gpu finds the CUDA/cuDNN DLLs from the nvidia-* wheels
+        # only when told to look; a plain CPU build has nothing to preload.
+        if not _dlls_preloaded and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception as e:  # pragma: no cover - depends on the venv
+                logger.debug("preload_dlls: %s", e)
+        _dlls_preloaded = True
+        err = None
+        for attempt in range(_CUDA_RETRIES + 1):
+            session = None
+            try:
+                session = ort.InferenceSession(path, sess_opts, providers=providers)
+                if session.get_providers()[0] != _CUDA:
+                    raise RuntimeError("the session came up on " + session.get_providers()[0])
+                # A CUDA session can be created and still die on its first run
+                # (cuDNN 9.26 on Pascal: CUDNN_STATUS_EXECUTION_FAILED), so
+                # prove it here rather than on the first search of the day.
+                smoke(session)
+                if err:
+                    logger.warning("%s: CUDA came up on retry %d after: %s", label, attempt, err)
+                return session, None
+            except Exception as e:
+                err = f"CUDA session failed, using CPU: {str(e)[:300]}"
+                del session
+                gc.collect()
+                if attempt < _CUDA_RETRIES:
+                    logger.warning("%s: %s; retrying", label, err)
+                    time.sleep(_CUDA_RETRY_PAUSE)
+        logger.error("%s: %s", label, err)
+        return ort.InferenceSession(path, sess_opts, providers=[_CPU]), err
+
+
 def _release_seconds() -> float:
     raw = os.environ.get("MEMORY_INDEX_ARENA_RELEASE_SECONDS", "").strip()
     try:
@@ -269,14 +329,6 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
         logger.info("ONNX init: importing onnxruntime (device=%s)", EMBED_DEVICE)
         import onnxruntime as ort
 
-        # onnxruntime-gpu finds the CUDA/cuDNN DLLs from the nvidia-* wheels
-        # only when told to look; a plain CPU build has nothing to preload.
-        if hasattr(ort, "preload_dlls"):
-            try:
-                ort.preload_dlls()
-            except Exception as e:  # pragma: no cover - depends on the venv
-                logger.debug("preload_dlls: %s", e)
-
         sess_opts = ort.SessionOptions()
         # No persist-optimized-graph flow here: the q8 model uses external
         # weight data, and session creation is only a few seconds.
@@ -297,20 +349,10 @@ class GemmaEmbedder(EmbeddingFunction[Documents]):
             self._tokenizer = AutoTokenizer.from_pretrained(str(EMBED_ONNX_DIR))
 
         providers, err = providers_for(EMBED_DEVICE, list(ort.get_available_providers()))
-        session = ort.InferenceSession(onnx_path, sess_opts, providers=providers)
         want_cuda = providers[0] != _CPU
-        if want_cuda:
-            # A CUDA session can be created and still die on its first run
-            # (cuDNN 9.26 on Pascal: CUDNN_STATUS_EXECUTION_FAILED), so prove
-            # it here rather than on the first search of the day.
-            try:
-                if session.get_providers()[0] != _CUDA:
-                    raise RuntimeError("the session came up on " + session.get_providers()[0])
-                self._smoke(session)
-            except Exception as e:
-                err = f"CUDA session failed, using CPU: {str(e)[:300]}"
-                logger.error("EmbeddingGemma: %s", err)
-                session = ort.InferenceSession(onnx_path, sess_opts, providers=[_CPU])
+        session, cuda_err = open_session(onnx_path, sess_opts, providers, self._smoke,
+                                         "EmbeddingGemma")
+        err = err or cuda_err
         self._ort_session = session
         self._run_opts = _run_options(session)
         self._start_releaser(session)

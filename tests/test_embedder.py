@@ -263,6 +263,99 @@ class TestProviderChoice(unittest.TestCase):
         self.assertIn("gpu", err)
 
 
+class TestOpenSession(unittest.TestCase):
+    """open_session: CUDA sessions open one at a time, and a failed first run
+    is retried before the CPU fallback (the 2026-10-10 00:00 restart, where the
+    reranker's warm-up and the embedder's opened together and the embedder
+    stayed on the CPU)."""
+
+    CUDA = "CUDAExecutionProvider"
+    CPU = "CPUExecutionProvider"
+
+    def setUp(self):
+        import src.indexer.embedder as emb
+        self.emb = emb
+        self.created = []
+        self.active = 0
+        self.overlapped = False
+        test = self
+
+        class FakeSession:
+            def __init__(self, path, opts, providers):
+                self.providers = [p[0] if isinstance(p, tuple) else p for p in providers]
+                test.created.append(self.providers[0])
+
+            def get_providers(self):
+                return self.providers
+
+        class FakeOrt:
+            InferenceSession = FakeSession
+
+        patcher = patch.dict(sys.modules, {"onnxruntime": FakeOrt})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        pause = patch.object(emb, "_CUDA_RETRY_PAUSE", 0)
+        pause.start()
+        self.addCleanup(pause.stop)
+
+    def _providers(self):
+        return [(self.CUDA, {}), self.CPU]
+
+    def _smoke(self, failures):
+        """A smoke test that fails `failures` times, and records overlap."""
+        left = [failures]
+
+        def smoke(session):
+            self.active += 1
+            if self.active > 1:
+                self.overlapped = True
+            time.sleep(0.1)
+            self.active -= 1
+            if left[0] > 0:
+                left[0] -= 1
+                raise RuntimeError("NOT_IMPLEMENTED : RequireCudnnHandle")
+
+        return smoke
+
+    def test_cuda_on_the_first_try(self):
+        session, err = self.emb.open_session("m.onnx", None, self._providers(),
+                                             self._smoke(0), "test")
+        self.assertEqual(session.get_providers()[0], self.CUDA)
+        self.assertIsNone(err)
+        self.assertEqual(self.created, [self.CUDA])
+
+    def test_a_failed_first_run_is_retried_on_cuda(self):
+        session, err = self.emb.open_session("m.onnx", None, self._providers(),
+                                             self._smoke(1), "test")
+        self.assertEqual(session.get_providers()[0], self.CUDA)
+        self.assertIsNone(err)
+        self.assertEqual(self.created, [self.CUDA, self.CUDA])
+
+    def test_cpu_only_after_every_retry_fails(self):
+        session, err = self.emb.open_session("m.onnx", None, self._providers(),
+                                             self._smoke(99), "test")
+        self.assertEqual(session.get_providers()[0], self.CPU)
+        self.assertIn("RequireCudnnHandle", err)
+        self.assertEqual(self.created.count(self.CUDA), self.emb._CUDA_RETRIES + 1)
+
+    def test_two_loads_never_open_cuda_at_the_same_time(self):
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.emb.open_session(
+            "m.onnx", None, self._providers(), self._smoke(0), "test"))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse(self.overlapped)
+        self.assertEqual([s.get_providers()[0] for s, _ in results], [self.CUDA] * 2)
+
+    def test_cpu_providers_skip_the_smoke_test(self):
+        smoke = self._smoke(99)
+        session, err = self.emb.open_session("m.onnx", None, [self.CPU], smoke, "test")
+        self.assertEqual(session.get_providers()[0], self.CPU)
+        self.assertIsNone(err)
+
+
 class TestArenaRelease(unittest.TestCase):
     """A CUDA session gives its arena back once runs go quiet, not on every run.
 
