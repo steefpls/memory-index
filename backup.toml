@@ -13,6 +13,7 @@ sqlite = [
 skip = [
     "data/chroma/",
     "data/embeddinggemma_onnx/",  # downloaded by setup.bat
+    "data/minilm_onnx/",          # the relevance gate's model, the same
     "data/exports/",              # the old daily vault exports
     "data/backup.log",
     "data/server.log",
