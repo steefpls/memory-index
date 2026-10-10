@@ -5,7 +5,9 @@
 # The embedder is mocked throughout, so this needs no ONNX model download and
 # no GPU. 372 tests, ~75s on this box.
 
+# timeout_s 600: a client box runs this gate on slower hardware, several
+# gates at once; Friday's runs took up to 2-3x steef-server's (2026-10-11).
 [test]
 command = "uv run --extra dev --frozen python -m pytest -q -p no:cacheprovider -rs tests"
-timeout_s = 300
+timeout_s = 600
 enforce = true     # a failing test holds the deploy
