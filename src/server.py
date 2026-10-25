@@ -26,6 +26,13 @@ _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# The settings, in the fleet's one order (src/envload.py): the process
+# environment, then every key the box's instance.env sets, then this
+# checkout's .env. Before src.config, which reads them at import.
+from src import envload  # noqa: E402
+
+_SETTINGS_LINE = envload.load(Path(_project_root))
+
 from mcp.server.fastmcp import FastMCP
 
 from src.config import DATA_DIR, LOG_FILE, PROJECT_ROOT
@@ -761,6 +768,7 @@ def _startup_check():
     """Validate state and start search init in background."""
     from src.config import VAULTS
     logger.info("memory-index starting: %d vaults configured", len(VAULTS))
+    logger.info(_SETTINGS_LINE)
 
     # Pre-import heavy C extension libraries (numpy, sklearn, onnxruntime)
     # BEFORE launching the background init thread. On Windows, concurrent
