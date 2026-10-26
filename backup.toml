@@ -3,6 +3,7 @@
 # match `files`, `sqlite` or `skip`, or the backup reports it.
 
 files = [
+    ".env",                    # MCP port, host and key, embed device: moved here from NSSM
     "data/*_calibration.json",  # each vault's search thresholds
 ]
 sqlite = [
