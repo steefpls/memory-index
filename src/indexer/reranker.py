@@ -8,9 +8,10 @@ answer for one query and noise for the next. Measured on 86 real queries
 returned ~470 tokens of LOW hits. A cross-encoder reads the query and the
 fact together and gives a probability that does carry across queries.
 
-Search keeps its own order and only drops candidates this model scores under
-RERANK_MIN (see src/tools/search.py). Re-sorting by this model lost answers in
-the same eval; gating alone kept them and emptied the no-answer queries.
+Search drops candidates this model scores under RERANK_MIN and fuses its rank
+with the vector rank (see src/tools/search.py). Re-sorting by this model alone
+lost answers in the same eval; gating kept them and emptied the no-answer
+queries, and fusion (2026-10-28) ranks better than either order alone.
 
 Loading is explicit: the server's search warm-up calls `start()`, scripts call
 `load()`. Until one has, `get()` is None and search behaves as it did before

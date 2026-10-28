@@ -165,6 +165,10 @@ class SearchTestCase(unittest.TestCase):
             patch("src.tools.search.get_entity", self.get_entity),
             patch("src.tools.search.get_observation",
                   side_effect=lambda oid: self.store_observations.get(oid)),
+            # The BM25 pass and the keyword scan read the store, not Chroma.
+            patch("src.indexer.store.snapshot_store",
+                  side_effect=lambda: (dict(self.store_entities),
+                                       dict(self.store_observations))),
         ]
         for p in self.patches:
             p.start()

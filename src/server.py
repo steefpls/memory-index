@@ -428,10 +428,11 @@ def search_memory(query: str, vault: str = "", n_results: int = 5,
 
     Every matching observation is ranked flat by calibrated relevance — results
     are individual facts with their entity as context, not entities with a
-    sample of their facts. A relevance check reads each candidate with the
-    query and drops what doesn't answer it, so a query memory can't answer
-    returns one "No memory matches" line, not padding. Ask for the default 5
-    unless you need more: results 6-10 are mostly noise.
+    sample of their facts. Candidates come from meaning (vector) and from
+    shared words (BM25); a relevance check reads each with the query and
+    drops what doesn't answer it, so a query memory can't answer returns one
+    "No memory matches" line, not padding. Ask for the default 5 unless you
+    want context: results 6-10 are about half useful but rarely essential.
 
     Facts are shown short: a long one ends "[+N words, obs=<id>]" and
     get_entity(<id>) returns it whole; a source is shown as its date, and
@@ -440,7 +441,9 @@ def search_memory(query: str, vault: str = "", n_results: int = 5,
     Args:
         query: Natural language query describing what you're looking for.
         vault: Vault to search (empty = search all vaults).
-        n_results: Max observations to return (default 5, max 30).
+        n_results: The most observations to return (default 5, max 30). A
+                   ceiling, not a target: fewer come back when fewer answer
+                   the query, and asking for more won't add them.
         entity_type: Optional entity type filter.
         since: Only include observations after this ISO date/datetime
                (e.g., "2026-03-01", "2026-03-13T10:00:00").

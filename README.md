@@ -253,12 +253,22 @@ Pipeline:
 
 The floor exists so a search never returns a bare "no results" when the vault does hold something adjacent — the caller sees the near-misses and judges them, rather than being told nothing exists. It is a floor for the threshold-shortfall case, not an override of a caller who asked for fewer results.
 
+### Relevance gate
+
+With the gate's model present (`src/indexer/reranker.py`, MiniLM-L6 cross-encoder, `MEMORY_INDEX_RERANK=off` disables it) the top-5/min-3 rule above is replaced:
+
+1. Candidates are the vector ranking's best 30 (or `2 × n_results` when that is more) plus BM25's best 10 over entity name + content (`src/tools/lexical.py`). A BM25 candidate the vector pass didn't fetch is scored with the real query embedding through an entity-filtered query, so every result has a real distance.
+2. The cross-encoder reads each candidate with the query; those under `MEMORY_INDEX_RERANK_MIN` (0.1) are dropped. A candidate in **both** the vector and the BM25 top 10 is kept anyway (`rescued` in `json`): MiniLM reads questions, and agents' keyword-list queries score ~0 against the fact they name. Rescue only happens when something passed the gate, so a query memory can't answer still returns one "No memory matches" line.
+3. What is kept is ordered by Reciprocal Rank Fusion of the vector rank and the gate's rank (k=60), then capped at `n_results`. Sorting by the gate alone lost answers; fusing keeps the vector ranking's strength and lets a clear gate verdict move a fact up.
+
+`n_results` is a ceiling: when fewer pass, the text output says so on its first line. Measured on 86 labelled queries (2026-10-28, against the gate keeping vector order): must-have recall at 5 0.631 → 0.668 and at 10 0.720 → 0.771, nDCG@5 0.687 → 0.725, precision at 5 0.786 → 0.774, ~4 more pairs for the gate per search.
+
 ### Strategies
 
 - **`semantic`** (default) — vector search only. No graph traversal happens at all.
 - **`associative`** (opt-in) — spreading activation over the relation graph *nominates* candidate entities from the semantic hits' neighbourhood. Nomination is not a score: each nominated entity's observations are then queried with the real query embedding and admitted only if they clear the same threshold as a direct hit. Nothing invents a distance, so a well-connected entity cannot outrank a genuine match, and when no neighbour earns its place `associative` degrades silently to `semantic`.
 
-Reciprocal Rank Fusion is no longer used for merging. RRF is rank-only and therefore has no notion of match quality — a popularity-ranked graph neighbour could outrank a real semantic hit. Scoring graph candidates against the actual query replaced it.
+Reciprocal Rank Fusion is not used to merge graph neighbours. RRF is rank-only, so a popularity-ranked graph neighbour could outrank a real semantic hit; scoring graph candidates against the actual query replaced it. (The gate's fusion above is different: both of its rankings score the fact against the query.)
 
 ### Keyword fallback
 
@@ -384,6 +394,7 @@ src/
 │   └── relation.py        # + canonical RELATION_TYPES and aliases (enforced)
 └── tools/
     ├── search.py          # Observation-level ranked search + threshold gate
+    ├── lexical.py         # BM25 candidates for the relevance gate
     ├── entities.py        # Entity/observation tool impls
     ├── relations.py       # Relation tool impls
     ├── temporal.py        # Timeline, point-in-time, temporal neighbors

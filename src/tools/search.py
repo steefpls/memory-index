@@ -48,6 +48,12 @@ DEFAULT_N_RESULTS = 5
 # ~470 tokens of noise per miss (scratch/memeval, 2026-10-09).
 MIN_RESULTS = 3
 
+# With the gate: BM25's best this many join the gate's pool, and a fact in
+# both the vector and the BM25 top RESCUE_RANK is kept whatever the gate says.
+LEXICAL_POOL = 10
+RESCUE_RANK = 10
+_RRF_K = 60
+
 
 def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULTS,
                    entity_type: str = "",
@@ -60,9 +66,11 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
 
     Every matching observation is ranked flat by calibrated relevance (no
     dedupe-to-entity, no sampling of an entity's facts). With the relevance
-    gate loaded, the best RERANK_POOL candidates are each read with the query
-    by a cross-encoder and those under RERANK_MIN are dropped, keeping the
-    vector order, capped at n_results; nothing left means one "no match" line.
+    gate loaded, the vector ranking's best RERANK_POOL candidates and BM25's
+    best LEXICAL_POOL are each read with the query by a cross-encoder; those
+    under RERANK_MIN are dropped unless both rankings put them in their top
+    RESCUE_RANK, and the rest are ordered by fusing the vector and gate ranks,
+    capped at n_results; nothing passing the gate means one "no match" line.
     Without it, results above the calibrated noise threshold are returned,
     capped at n_results, and if fewer than 3 clear it the best 3 overall come
     back anyway with their honest confidence labels.
@@ -70,7 +78,7 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     Args:
         query: Natural language query describing what you're looking for.
         vault: Vault to search (empty = search all vaults).
-        n_results: Max observations to return (default 5, max 30).
+        n_results: Most observations to return (default 5, max 30).
         entity_type: Optional entity type filter.
         since: Only include observations after this ISO date/datetime.
         before: Only include observations before this ISO date/datetime.
@@ -190,10 +198,38 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
 
     gated = False
     if gate is not None:
-        pool = ranked[:reranker.RERANK_POOL]
+        # The gate reads the vector ranking's best and BM25's best. A fact
+        # both rank near the top is kept even when the gate scores it low:
+        # MiniLM reads questions, and agent queries are often keyword lists
+        # it scores ~0 against the very fact they name. Kept facts are ordered
+        # by fusing the vector rank with the gate's. Measured on the 86
+        # labelled queries against vector order and pool alone (2026-10-28,
+        # scratch/memeval score.py prod_gate): must-have recall at 5 0.631 ->
+        # 0.668, at 10 0.720 -> 0.771, nDCG@5 0.687 -> 0.725, precision at 5
+        # 0.786 -> 0.774.
+        lex_ids, ranked = _lexical_candidates(
+            query, ranked, vault_names, query_embeddings, where_conditions,
+            entity_type, include_superseded, date_bounds,
+        )
+        pool_size = max(reranker.RERANK_POOL, 2 * n_results)
+        pool = list({item["observation_id"]: item for item in
+                     ranked[:pool_size] + [i for i in ranked if i["observation_id"] in lex_ids]}.values())
         if _apply_gate(gate, query, pool):
             gated = True
+            vec_rank = {item["observation_id"]: r for r, item in enumerate(ranked)}
             above = [item for item in pool if item["rerank"] >= reranker.RERANK_MIN]
+            if above:
+                for item in pool:
+                    oid = item["observation_id"]
+                    if (item["rerank"] < reranker.RERANK_MIN
+                            and vec_rank[oid] < RESCUE_RANK
+                            and lex_ids.get(oid, RESCUE_RANK) < RESCUE_RANK):
+                        item["rescued"] = True
+                        above.append(item)
+            gate_rank = {item["observation_id"]: r for r, item in
+                         enumerate(sorted(above, key=lambda i: -i["rerank"]))}
+            above.sort(key=lambda i: -(1 / (_RRF_K + vec_rank[i["observation_id"]])
+                                       + 1 / (_RRF_K + gate_rank[i["observation_id"]])))
             selected = above[:n_results]
     if not gated:
         if len(above) >= MIN_RESULTS:
@@ -244,7 +280,66 @@ def search_memory(query: str, vault: str = "", n_results: int = DEFAULT_N_RESULT
     if output_format == "json":
         return _format_json(combined, query, strategy=strategy,
                             above_threshold_count=len(above))
-    return _format_text(combined, query, above_threshold_count=len(above))
+    text = _format_text(combined, query, above_threshold_count=len(above))
+    if gated and len(combined) < n_results:
+        # n_results is a ceiling: say so, or a caller asking for 10 and
+        # getting 3 retries with 20 and gets the same 3.
+        text = (f"note: {len(combined)} of up to {n_results} answer this; "
+                f"a bigger n_results won't add more.\n" + text)
+    return text
+
+
+def _lexical_candidates(query: str, ranked: list[dict], vault_names: list[str],
+                        query_embeddings, where_conditions: list[dict],
+                        entity_type: str, include_superseded: bool,
+                        date_bounds: tuple) -> tuple[dict[str, int], list[dict]]:
+    """BM25's best LEXICAL_POOL observations as {id: bm25 rank}, and `ranked`
+    with any of them the vector pass didn't fetch merged in at their real
+    distance. A broken BM25 pass leaves search as it was."""
+    from src.tools import lexical
+
+    vault_set = set(vault_names)
+
+    def allowed(oid: str) -> bool:
+        obs = get_observation(oid)
+        if obs is None or (obs.is_superseded and not include_superseded):
+            return False
+        ent = get_entity(obs.entity_id)
+        if ent is None or ent.vault not in vault_set:
+            return False
+        if entity_type and ent.entity_type != entity_type:
+            return False
+        return _in_date_range(obs, date_bounds)
+
+    try:
+        ids = lexical.search(query, allowed, LEXICAL_POOL)
+    except Exception as e:  # noqa: BLE001 -- BM25 is a helper, never a failure
+        logger.warning("BM25 pass failed, search runs vector-only: %s", str(e)[:200])
+        return {}, ranked
+    lex = {oid: r for r, oid in enumerate(ids)}
+    have = {item["observation_id"] for item in ranked}
+    missing = {oid for oid in ids if oid not in have}
+    if missing:
+        # Score them with the real query embedding: an entity-filtered vector
+        # query, as the associative pass does. No distance is ever invented.
+        by_vault: dict[str, set[str]] = {}
+        for oid in missing:
+            obs = get_observation(oid)
+            ent = get_entity(obs.entity_id) if obs else None
+            if ent is not None:  # deleted since BM25 saw it
+                by_vault.setdefault(ent.vault, set()).add(ent.id)
+        fetched = []
+        for vault_name, entity_ids in by_vault.items():
+            fetched.extend(_query_vault(
+                vault_name, query_embeddings, 200, where_conditions,
+                include_superseded, entity_ids=sorted(entity_ids),
+                date_bounds=date_bounds,
+            ))
+        fresh = [item for item in fetched if item["observation_id"] in missing]
+        if fresh:
+            ranked = _rank(ranked + fresh)
+    have = {item["observation_id"] for item in ranked}
+    return {oid: r for oid, r in lex.items() if oid in have}, ranked
 
 
 def _apply_gate(gate, query: str, items: list[dict]) -> bool:
@@ -764,5 +859,6 @@ def _format_json(results: list[dict], query: str, strategy: str = "semantic",
             "superseded": bool(item.get("superseded")),
             "keyword_match": bool(item.get("keyword_match")),
             "rerank": item.get("rerank"),
+            "rescued": bool(item.get("rescued")),
         })
     return json.dumps(payload, indent=2)
