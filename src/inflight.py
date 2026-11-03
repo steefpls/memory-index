@@ -22,6 +22,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable
 
@@ -107,14 +108,26 @@ class InflightMiddleware:
                     "body": b"" if scope.get("method") == "HEAD" else body})
 
 
+_KEYED = re.compile(r"/(mcp|upload|download)/[^/?#\s]+")
+
+
 class _QuietInflight(logging.Filter):
-    """Drops uvicorn's access line for /inflight: the hub polls it."""
+    """Drops uvicorn's access line for /inflight (the hub polls it), and masks
+    the key in /mcp/<key>, /upload/<key> and /download/<key> on every other
+    line. Those keys had been written to daemon.log in clear (found 2026-11-04),
+    as they had in google-workspace-mcp, dataprocessor and daemon-hub-mcp."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             args = record.args
-            return not (isinstance(args, tuple) and len(args) >= 3
-                        and str(args[2]).split("?", 1)[0] == PATH)
+            if not (isinstance(args, tuple) and len(args) >= 3):
+                return True
+            if str(args[2]).split("?", 1)[0] == PATH:
+                return False
+            masked = _KEYED.sub(lambda m: f"/{m.group(1)}/<key>", str(args[2]))
+            if masked != args[2]:
+                record.args = (*args[:2], masked, *args[3:])
+            return True
         except Exception:
             return True
 

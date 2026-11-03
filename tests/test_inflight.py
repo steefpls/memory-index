@@ -124,6 +124,32 @@ def _the_access_log_leaves_inflight_out():
     assert quiet[0].filter(rec("/mcp/xyz"))
 
 
+def _the_access_log_masks_a_key_in_the_path():
+    """The key in /mcp/<key>, /upload/<key> and /download/<key> is rewritten
+    to <key> in args[2] before the line is formatted: uvicorn's access lines
+    had written the MCP key to daemon.log in clear on every call (2026-11-04)."""
+    inflight.quiet_access_log()
+    log = logging.getLogger("uvicorn.access")
+    quiet = [f for f in log.filters if isinstance(f, inflight._QuietInflight)]
+    key = "SEKRET-0123456789abcdef0123456789abcdef"
+
+    def rec(path):
+        return logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
+                                 '%s - "%s %s HTTP/%s" %d',
+                                 ("127.0.0.1:1", "POST", path, "1.1", 200), None)
+
+    for route in ("mcp", "upload", "download"):
+        r = rec(f"/{route}/{key}")
+        assert quiet[0].filter(r)
+        assert r.args[2] == f"/{route}/<key>", r.args[2]
+        assert key not in r.getMessage(), r.getMessage()
+    r = rec(f"/upload/{key}?name=photo.png")
+    quiet[0].filter(r)
+    assert r.args[2] == "/upload/<key>?name=photo.png", r.args[2]
+    r = rec("/health")
+    assert quiet[0].filter(r) and r.args[2] == "/health"
+
+
 class InflightTests(unittest.TestCase):
     def test_a_slow_tool_call_is_in_flight_until_answered(self):
         _a_slow_tool_call_is_in_flight_until_answered()
@@ -133,6 +159,9 @@ class InflightTests(unittest.TestCase):
 
     def test_the_access_log_leaves_inflight_out(self):
         _the_access_log_leaves_inflight_out()
+
+    def test_the_access_log_masks_a_key_in_the_path(self):
+        _the_access_log_masks_a_key_in_the_path()
 
 
 if __name__ == "__main__":
