@@ -62,6 +62,14 @@ class TestPortability(unittest.TestCase):
         self.patches.append(p)
         p.start()
 
+        # The fixtures here add 20+ observations, crossing the every-10
+        # auto-recalibration boundary. calibrate_collection imports the real
+        # embedder, so one trigger built an ONNX session inside an export/scan
+        # test; the scan's snapshot behaviour is what this module tests.
+        p_cal = patch("src.indexer.store.calibrate_collection", MagicMock())
+        self.patches.append(p_cal)
+        p_cal.start()
+
     def tearDown(self):
         from tests.support import close_sqlite
         close_sqlite()

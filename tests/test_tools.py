@@ -482,6 +482,10 @@ class TestOntologyEnforcement(unittest.TestCase):
         mock_ef.__call__ = MagicMock(return_value=[[0.1] * 768])
         self.patches.append(patch("src.indexer.store.get_collection", return_value=mock_collection))
         self.patches.append(patch("src.indexer.store.get_embedding_function", return_value=mock_ef))
+        # A >10-observation fixture crosses the auto-recalibration boundary,
+        # and calibrate_collection imports the real embedder (an ONNX session),
+        # not the mock above. The trigger path has its own tests in test_store.
+        self.patches.append(patch("src.indexer.store.calibrate_collection", MagicMock()))
 
         for p in self.patches:
             p.start()
@@ -546,6 +550,7 @@ class TestOntologyEnforcement(unittest.TestCase):
         """A rename past the bg threshold returns at once with a background
         message; the job completes and status reports exact counts."""
         import time as time_mod
+        from unittest.mock import patch
         import src.config as config_mod
         from src.tools.entities import (
             tool_create_entity, tool_update_entity, tool_reembed_status)
@@ -554,20 +559,23 @@ class TestOntologyEnforcement(unittest.TestCase):
         tool_create_entity("Huge", "project", "test",
                            observations=[f"fact {i}" for i in range(70)])
 
-        result = tool_update_entity("Huge", new_name="Huger", vault="test")
-        self.assertIn("Entity updated", result)
-        self.assertIn("Huger", result)
-        self.assertIn("background", result)
-        # Caller was not held for the whole job: no synchronous counts.
-        self.assertNotIn("re-embedded 70 observations", result)
+        # The job is real (thread + batches); only the CPU-yield breather
+        # between batches is zeroed -- its own test asserts where it fires.
+        with patch("src.indexer.store._REEMBED_BREATHER_S", 0):
+            result = tool_update_entity("Huge", new_name="Huger", vault="test")
+            self.assertIn("Entity updated", result)
+            self.assertIn("Huger", result)
+            self.assertIn("background", result)
+            # Caller was not held for the whole job: no synchronous counts.
+            self.assertNotIn("re-embedded 70 observations", result)
 
-        deadline = time_mod.time() + 30
-        last = ""
-        while time_mod.time() < deadline:
-            last = tool_reembed_status()
-            if "Last re-embed" in last:
-                break
-            time_mod.sleep(0.1)
+            deadline = time_mod.time() + 30
+            last = ""
+            while time_mod.time() < deadline:
+                last = tool_reembed_status()
+                if "Last re-embed" in last:
+                    break
+                time_mod.sleep(0.1)
         self.assertIn("70 ok, 0 failed", last)
 
     # ---- relation types ----

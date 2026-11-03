@@ -67,6 +67,15 @@ class TestEntityStore(unittest.TestCase):
         self.patches.append(p9)
         p9.start()
 
+        # Writes past the every-10 boundary trigger auto-recalibration, and
+        # calibrate_collection imports the REAL embedder rather than the mock
+        # above, so a 70-observation fixture built a real ONNX session here.
+        # The trigger itself is asserted in the boundary tests, which patch
+        # this same name.
+        p10 = patch("src.indexer.store.calibrate_collection", MagicMock())
+        self.patches.append(p10)
+        p10.start()
+
     def tearDown(self):
         from tests.support import close_sqlite
         close_sqlite()
@@ -147,7 +156,11 @@ class TestEntityStore(unittest.TestCase):
         self.mock_ef.side_effect = fake_ef
         self.mock_collection.reset_mock()
 
-        updated, (ok, failed) = update_entity(entity.id, name="Bigger")
+        import src.indexer.store as store_mod
+        # The breather is a CPU yield, not behaviour under test here (its own
+        # test asserts it fires between batches); 2 x 1.5s is pure gate time.
+        with patch.object(store_mod, "_REEMBED_BREATHER_S", 0):
+            updated, (ok, failed) = update_entity(entity.id, name="Bigger")
         self.assertEqual(updated.name, "Bigger")
         self.assertEqual((ok, failed), (70, 0))
 
@@ -183,7 +196,11 @@ class TestEntityStore(unittest.TestCase):
         self.mock_ef.side_effect = flaky_ef
         self.mock_collection.reset_mock()
 
-        updated, (ok, failed) = update_entity(entity.id, name="Bigger")
+        import src.indexer.store as store_mod
+        # Same seam as the batched-rename test: the breather's delay is not
+        # what this failure-path test measures.
+        with patch.object(store_mod, "_REEMBED_BREATHER_S", 0):
+            updated, (ok, failed) = update_entity(entity.id, name="Bigger")
         self.assertEqual(updated.name, "Bigger")
         self.assertEqual(ok, 70 - 32)   # batches 1 and 3 landed
         self.assertEqual(failed, 32)    # batch 2 skipped, not fatal
@@ -912,6 +929,13 @@ class TestStoreConcurrency(unittest.TestCase):
         store_mod._entities = {}
         store_mod._observations = {}
         store_mod._loaded = True
+
+        # 150 writes cross the every-10 recalibration boundary 15 times; the
+        # real calibrate_collection pulls in the unmocked ONNX embedder, which
+        # is calibration's cost, not this race's.
+        p_cal = patch("src.indexer.store.calibrate_collection", MagicMock())
+        self.patches.append(p_cal)
+        p_cal.start()
 
         import src.config as config_mod
         config_mod.VAULTS = {
