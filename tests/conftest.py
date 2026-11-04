@@ -14,7 +14,12 @@ import types
 
 import pytest
 
-WORKER_CAP = 12  # tune per repo: more workers than this only pays startup
+# Measured with run_gate.py on steef-server (2026-11-04, two runs each):
+# 4 workers 17.95/15.79s, 6 workers 16.04/17.42s, 12 workers 18.41/22.37s.
+# Every worker pays its own start (pytest, collection, chromadb's import via
+# src.indexer.store): an empty 6-worker run already takes ~8s, so more
+# workers than this only add startup and contention.
+WORKER_CAP = 6
 
 
 def _seed() -> int | None:
