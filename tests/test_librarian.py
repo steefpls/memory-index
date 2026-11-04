@@ -44,8 +44,13 @@ class TestDBSCAN(unittest.TestCase):
     def test_single_cluster_with_loose_eps(self):
         from src.tools.librarian import _run_dbscan
 
-        # Tight cluster
-        embeddings = np.random.randn(10, 10).astype(np.float32) * 0.01
+        # Tight cluster: ten points round one direction (the distance is
+        # cosine). It was ten tiny points round the origin, whose directions
+        # are random, drawn from the global numpy state; it passed only when
+        # test_finds_clusters had just seeded that with 42 (file order), and
+        # random order found states that split it in two (seed 444062757).
+        rng = np.random.default_rng(7)
+        embeddings = (np.ones(10) + rng.standard_normal((10, 10)) * 0.01).astype(np.float32)
         labels = _run_dbscan(embeddings, eps=1.0, min_samples=2)
 
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)

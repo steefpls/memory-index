@@ -106,3 +106,22 @@ def _share_dicts() -> None:
 
 
 _share_dicts()
+
+
+# ─── data/server.log exists before any test runs ─────────────────────────
+# Importing src.server (test_private_vault does, inside a test) opens
+# data/server.log in the repo's real data dir, creating it on a fresh clone.
+# test_eval's test_real_data_dir_untouched lists that dir before and after an
+# eval run, so with xdist the log could appear in between from another worker
+# (fresh clone, 2026-11-04 review: seed 396731352). Serially the file was
+# either there for both listings or neither. The service makes this file
+# anyway; making it up front gives every worker the same data dir.
+def _ensure_server_log() -> None:
+    from src.config import LOG_FILE
+
+    if not LOG_FILE.exists():
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        open(LOG_FILE, "a", encoding="utf-8").close()
+
+
+_ensure_server_log()
