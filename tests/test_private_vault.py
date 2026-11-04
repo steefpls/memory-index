@@ -187,6 +187,12 @@ class RequesterTestCase(unittest.TestCase):
         requester.clear_cache()
         self.sleep = patch("src.requester.time.sleep", lambda s: None)
         self.sleep.start()
+        # run_is_owners takes `sleep=time.sleep` as a default argument, bound
+        # when the module loaded, so the patch above never reaches the
+        # not-found retry: it really waited 1.5s. The retry still happens;
+        # it just doesn't wait.
+        self.retry = patch("src.requester._NOT_FOUND_RETRY_S", 0.0)
+        self.retry.start()
         self.ports = patch.dict(os.environ, {"MEMORY_INDEX_FLEET_PORTS": "8080,8081,8084,8088",
                                              "MEMORY_INDEX_OWNER_PEERS": "100.64.0.7, 100.64.0.8/32"})
         self.ports.start()
@@ -194,6 +200,7 @@ class RequesterTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.sleep.stop()
+        self.retry.stop()
         self.ports.stop()
         requester.clear_cache()
         requester.clear_owner_peers()

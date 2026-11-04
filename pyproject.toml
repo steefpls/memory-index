@@ -27,7 +27,10 @@ backup = [
     "google-auth",
     "google-auth-oauthlib",
 ]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "pytest-xdist>=3.6",
+]
 cpu = ["onnxruntime"]
 cuda = [
     "onnxruntime-gpu>=1.29,<1.30",
