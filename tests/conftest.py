@@ -125,3 +125,20 @@ def _ensure_server_log() -> None:
 
 
 _ensure_server_log()
+
+
+# ─── no test opens Chroma in the repo's real data dir ────────────────────
+# src.indexer.embedder binds CHROMA_DIR when first imported, so a test's
+# patch of src.config.CHROMA_DIR reaches it only if embedder happened to be
+# imported under that patch: an order accident. Unmocked, get_chroma_client()
+# then made data/chroma in the repo, and test_eval's "data/ untouched" check
+# failed whenever that landed between its two listings on another xdist
+# worker (memory-index gate, 2026-11-07). Every worker gets a temp dir.
+@pytest.fixture(autouse=True, scope="session")
+def _chroma_outside_the_repo(tmp_path_factory):
+    import src.indexer.embedder as embedder
+
+    real = embedder.CHROMA_DIR
+    embedder.CHROMA_DIR = tmp_path_factory.mktemp("chroma")
+    yield
+    embedder.CHROMA_DIR = real

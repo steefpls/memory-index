@@ -7,10 +7,12 @@ deliberately slow fake that only counts constructions.
 """
 
 import os
+import tempfile
 import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -132,8 +134,10 @@ class TestChromaClientSingleton(unittest.TestCase):
             with lock:
                 results.append(client)
 
-        with patch.object(self.emb.chromadb, "PersistentClient",
-                          side_effect=slow_client):
+        # get_chroma_client() makes CHROMA_DIR before building the client: point it at a temp
+        # folder, or it creates the repo's real data/chroma (and test_eval's "data/ untouched"
+        # check fails whenever the two tests overlap on xdist workers: the 2026-11-07 gate).
+        with tempfile.TemporaryDirectory() as tmp,                 patch.object(self.emb, "CHROMA_DIR", Path(tmp) / "chroma"),                 patch.object(self.emb.chromadb, "PersistentClient", side_effect=slow_client):
             threads = [threading.Thread(target=worker) for _ in range(6)]
             for t in threads:
                 t.start()

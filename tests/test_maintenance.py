@@ -47,6 +47,14 @@ class TestMaintenance(unittest.TestCase):
         self.patches.append(p)
         p.start()
 
+        # vacuum's best-effort Chroma cleanup opens the real client, which makes the repo's own
+        # data/chroma (embedder.CHROMA_DIR is bound at import, so the src.config patch above
+        # doesn't reach it): test_eval's "data/ untouched" check failed the 2026-11-07 gate.
+        self.mock_chroma = MagicMock()
+        p = patch("src.indexer.embedder.get_chroma_client", return_value=self.mock_chroma)
+        self.patches.append(p)
+        p.start()
+
         self.mock_ef = MagicMock(return_value=[[0.1] * 768])
         p = patch("src.indexer.store.get_embedding_function", return_value=self.mock_ef)
         self.patches.append(p)
