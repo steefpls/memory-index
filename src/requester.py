@@ -45,6 +45,33 @@ for as the owner's is not the owner's.
    names must be the owner's too. Trigger ids are no secret (the hub shows
    them), so a header on its own never vouches for anything.
 
+   The hub has a second way to say whom it calls for (2026-11-07): the
+   review of a meeting's memory plan is Steve at a keyboard, not a run, so
+   there is no run to name. The hub then names the ADDRESS of the machine
+   that asked, in X-Memory-On-Behalf-Of, and memory-index judges that
+   address itself, exactly as it would a direct connection from it:
+
+   - read only when the process holding the connection IS the hub (hop 0 of
+     the walk is the process listening on the hub's port: MEMORY_INDEX_HUB_URL,
+     8084 by default). Another fleet service holding the connection, a
+     process further up the chain, a remote peer, the relay: the header is
+     ignored, and what that caller would have got without it stands (the
+     hub's own connection without a run is refused). A header can't borrow
+     anything from a caller that isn't the hub, because it's never read;
+   - the address must parse as ONE ip address (no list, no name), must not
+     be loopback or one of this machine's own (a process here the hub was
+     fooled into naming: refused), and must be one of the owner's own
+     machines (owner_peers, tagged devices excluded, as for any remote peer).
+     Anything else, or a failed lookup of owner_peers: refused;
+   - X-Jarvis-Run alongside it still has to pass: a run the hub names narrows,
+     it is never widened by an address;
+   - the hub is trusted to name the socket peer of its own caller and only
+     for that review route (it sends nothing for a chat turn, a run, a local
+     or non-tailnet peer). That trust is the part memory-index can't check;
+     what it does check is that the address is one it would have trusted
+     had that machine connected itself, so the hub can't make a stranger
+     the owner, only pass on an owner machine's request.
+
 2. Whose each named run is, from the hub's records (GET /api/triggers/{id}):
 
    - a chat turn (any source but hub/routine): the owner's only when the
@@ -88,6 +115,7 @@ from src.access import Verdict
 logger = logging.getLogger(__name__)
 
 RUN_HEADER = "x-jarvis-run"
+BEHALF_HEADER = "x-memory-on-behalf-of"
 RUN_ENV = "JARVIS_RUN_ID"
 HUB_RUN_ENV = "HUB_RUN_ID"
 CHAT_ENV = "JARVIS_CHAT_TURN"
@@ -137,6 +165,18 @@ def hub_url() -> str:
     return (os.environ.get("MEMORY_INDEX_HUB_URL") or "http://127.0.0.1:8084").strip().rstrip("/")
 
 
+def hub_port() -> int | None:
+    """The port the hub listens on (from MEMORY_INDEX_HUB_URL): the only
+    fleet service whose X-Memory-On-Behalf-Of is read. None when the URL has
+    no usable port, so the header is read from nobody."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(hub_url())
+        return parts.port or (443 if parts.scheme == "https" else 80 if parts.scheme == "http" else None)
+    except ValueError:
+        return None
+
+
 def fleet_ports() -> frozenset[int]:
     """Ports of the fleet services that may call memory-index for someone
     else: whatsapp 8080, telegram 8081, hub 8084, daemon-hub-mcp 8085,
@@ -160,6 +200,7 @@ class Origin:
     refused: str | None = None                                   # why, when unnameable
     proxy: str | None = None                                     # the service holding the connection
     root: str | None = None
+    behalf: str | None = None                                    # the hub's X-Memory-On-Behalf-Of, read
 
 
 def is_local(host: str) -> bool:
@@ -372,9 +413,14 @@ def walk(pid: int | None, headers: Mapping[str, str], procs: Any,
                 # A fleet service calling for someone: it must say whom.
                 out.proxy = f"{name or proc.pid} (port {services[proc.pid]})"
                 named = (headers.get(RUN_HEADER) or "").strip()
+                behalf = (headers.get(BEHALF_HEADER) or "").strip()
+                if behalf and services[proc.pid] != hub_port():
+                    behalf = ""   # only the hub names a machine; from the others it is ignored
                 if named:
                     out.runs.append((named, f"X-Jarvis-Run from {out.proxy}"))
-                else:
+                if behalf:
+                    out.behalf = behalf
+                if not named and not behalf:
                     out.refused = f"{out.proxy} calls for someone it doesn't name"
                 return out
             if not out.runs:
@@ -571,9 +617,36 @@ def decide(peer: tuple[str, int] | None, headers: Mapping[str, str], *,
     runs = list(origin.runs)
     if named and not origin.proxy:
         runs.append((named, "X-Jarvis-Run"))
+    if origin.behalf:
+        # The hub names the machine that asked; judged like a direct
+        # connection from it, and any run named beside it must pass too.
+        v = _on_behalf(origin.behalf, origin.proxy or "the hub")
+        if not v.owner or not runs:
+            return v
+        rv = _runs_verdict(runs, hub)
+        return rv if not rv.owner else Verdict(True, f"{v.why}; {rv.why}")
     if not runs:
         return Verdict(True, f"a session on this box ({origin.root or 'no run'})")
     return _runs_verdict(runs, hub)
+
+
+def _on_behalf(address: str, who: str) -> Verdict:
+    """The hub says a request is for `address`: the owner's only when that is
+    one ip address of one of the owner's own machines, not this one."""
+    try:
+        ip = ipaddress.ip_address(_norm(address))
+    except ValueError:
+        v = Verdict(False, f"{who} named {address[:60]!r} as who asked, which isn't an ip address")
+    else:
+        host = str(ip)
+        if is_local(host):
+            v = Verdict(False, f"{who} named {host} as who asked, an address of this box")
+        elif not is_owner_peer(host):
+            v = Verdict(False, f"{who} named {host} as who asked, which isn't one of {owner_name()}'s own machines")
+        else:
+            v = Verdict(True, f"{who} called for {host}, one of {owner_name()}'s own machines")
+    logger.info("private vault: %s", v.why)
+    return v
 
 
 def _remote(host: str, named: str, hub: Any, via: str = "") -> Verdict:

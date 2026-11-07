@@ -404,6 +404,96 @@ class TestSessionsAndProxies(RequesterTestCase):
         self.assertFalse(self.decide(hub, {"X-Jarvis-Run": "sk-wa"}).owner)
         self.assertFalse(self.decide(hub, {"X-Jarvis-Run": "job-from-sk"}).owner)
 
+    # --- the hub names the machine that asked (X-Memory-On-Behalf-Of) -----------
+
+    def hub_conn(self):
+        return chain(("hubpython.exe", {}), ("nssm.exe", {}), ("services.exe", {}),
+                     listeners={"hubpython.exe": 8084})
+
+    def test_the_hub_naming_an_owner_machine_is_the_owner(self):
+        for host in ("100.64.0.7", "100.64.0.8"):
+            v = self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": host})
+            self.assertTrue(v.owner, v.why)
+        self.assertTrue(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "::ffff:100.64.0.7"}).owner)
+
+    def test_the_hub_naming_any_other_machine_is_refused(self):
+        # A tagged client box / another user's device / the LAN / the internet,
+        # all absent from owner_peers; and with the owner's peers off.
+        for host in ("100.87.100.0", "100.64.0.11", "192.168.50.20", "203.0.113.7"):
+            self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": host}).owner, host)
+        with patch.dict(os.environ, {"MEMORY_INDEX_OWNER_PEERS": "none"}):
+            requester.clear_owner_peers()
+            self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "100.64.0.7"}).owner)
+
+    def test_the_hub_naming_a_tagged_owner_device_is_refused(self):
+        # The default owner_peers leave tagged devices out; the header can't put one back.
+        status = {"Self": {"UserID": 1}, "Peer": {"a": {"UserID": 1, "TailscaleIPs": ["100.64.0.9"]},
+                                                  "c": {"UserID": 1, "Tags": ["tag:client"], "TailscaleIPs": ["100.64.0.11"]}}}
+        env = {k: v for k, v in os.environ.items() if k != "MEMORY_INDEX_OWNER_PEERS"}
+        run = MagicMock(return_value=types.SimpleNamespace(stdout=json.dumps(status).encode()))
+        with patch.dict(os.environ, env, clear=True), patch("src.requester._tailscale", return_value="tailscale"),                 patch("subprocess.run", run):
+            requester.clear_owner_peers()
+            self.assertTrue(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "100.64.0.9"}).owner)
+            self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "100.64.0.11"}).owner)
+            # tailscale unusable: nobody is the owner's, fail closed.
+            run.side_effect = OSError("no tailscale")
+            requester.clear_owner_peers()
+            self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "100.64.0.9"}).owner)
+
+    def test_a_local_or_garbled_address_from_the_hub_is_refused(self):
+        with patch("src.requester._own_addresses", return_value=frozenset({"127.0.0.1", "::1", "100.64.0.7"})):
+            for host in ("127.0.0.1", "::1", "localhost", "100.64.0.7", "::ffff:127.0.0.1", "[::1]"):
+                self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": host}).owner, host)
+        for host in ("", "   ", "garbage", "100.64.0.7, 203.0.113.7", "100.64.0.7,100.64.0.8", "100.64.0.0/24",
+                     "100.64.0.7 ", "100.64.0.999"):
+            v = self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": host})
+            if host.strip() == "100.64.0.7":   # whitespace round the one address is not a second address
+                self.assertTrue(v.owner)
+            else:
+                self.assertFalse(v.owner, host)
+
+    def test_the_header_is_ignored_from_anyone_but_the_hub(self):
+        h = {"X-Memory-On-Behalf-Of": "100.64.0.7"}
+        # Another fleet service holding the connection itself.
+        daemon = chain(("python.exe", {}), ("services.exe", {}), listeners={"python.exe": 8088})
+        self.assertFalse(self.decide(daemon, h).owner)
+        # A chat turn of the other owner, with or without a daemon above it.
+        self.assertFalse(self.decide(self.turn("sk-wa"), h).owner)
+        self.assertFalse(self.decide(chain(("python.exe", {})), h).owner)
+        # A run the hub started: the hub is above it, not holding the connection.
+        self.assertFalse(self.decide(self.hub_run("job-from-sk"), h).owner)
+        # A process that is not on the fleet at all, with no session root.
+        self.assertFalse(self.decide(chain(("curl.exe", {}), ("python.exe", {})), h).owner)
+        # A remote peer that isn't an owner machine; a stranger's header can't help it.
+        self.assertFalse(self.decide(FakeProcs({}, {}, {}), h, peer=("203.0.113.7", 51000)).owner)
+        # The relay.
+        relay = chain(("tailscaled.exe", {}), ("services.exe", {}))
+        self.assertFalse(self.decide(relay, {**h, "X-Forwarded-For": "160.79.106.161"}).owner)
+        # It adds nothing for a hub whose port isn't the one configured.
+        with patch.dict(os.environ, {"MEMORY_INDEX_HUB_URL": "http://127.0.0.1:9999"}):
+            self.assertFalse(self.decide(self.hub_conn(), h).owner)
+        with patch.dict(os.environ, {"MEMORY_INDEX_HUB_URL": "not a url ["}):
+            self.assertFalse(self.decide(self.hub_conn(), h).owner)
+
+    def test_the_header_never_widens_what_a_caller_already_has(self):
+        # A session on the box naming the other owner's run is still narrowed;
+        # an owner session with the header is unchanged (still the owner's).
+        sess = chain(("claude.exe", {}), ("sshd.exe", {}))
+        self.assertFalse(self.decide(sess, {"X-Jarvis-Run": "sk-wa", "X-Memory-On-Behalf-Of": "100.64.0.7"}).owner)
+        self.assertTrue(self.decide(sess, {"X-Memory-On-Behalf-Of": "100.64.0.11"}).owner)
+
+    def test_a_run_named_beside_the_address_must_pass_too(self):
+        both = {"X-Memory-On-Behalf-Of": "100.64.0.7"}
+        self.assertTrue(self.decide(self.hub_conn(), {**both, "X-Jarvis-Run": "steve-tg"}).owner)
+        self.assertFalse(self.decide(self.hub_conn(), {**both, "X-Jarvis-Run": "sk-wa"}).owner)
+        self.assertFalse(self.decide(self.hub_conn(), {"X-Memory-On-Behalf-Of": "203.0.113.7",
+                                                       "X-Jarvis-Run": "steve-tg"}).owner)
+
+    def test_the_hub_without_the_header_is_still_refused(self):
+        v = self.decide(self.hub_conn())
+        self.assertFalse(v.owner)
+        self.assertIn("doesn't name", v.why)
+
     def test_a_chat_daemon_calling_for_someone_must_name_them(self):
         daemon = chain(("python.exe", {}), ("services.exe", {}), listeners={"python.exe": 8088})
         v = self.decide(daemon)
