@@ -12,7 +12,11 @@ setup.bat
 
 This creates a venv, installs deps, exports the ONNX model (~274MB download on first run), and registers the MCP server.
 
-## Tools (29)
+### Settings
+
+Settings load in the fleet's one order (`src/envload.py`): the process environment wins, then every key the box's `instance.env` sets (`INSTANCE_ROOT`, else `C:\daemon-hub`, else the checkout's parent), then this checkout's `.env`. On a fleet box the MCP port, host and key and the embed device live in `.env`, not in NSSM. The daemon logs one start-up line naming where each setting came from, never a value.
+
+## Tools (31)
 
 ### Entities & observations
 
@@ -21,6 +25,8 @@ This creates a venv, installs deps, exports the ONNX model (~274MB download on f
 | `create_entity` | Create a named entity with optional initial observations (`observations` is a list of strings) |
 | `get_entity` | Entity details with observations and relations (current and superseded shown separately). `output_format="json"` returns the same data with observation AND relation IDs, for callers that intend to act on individual rows |
 | `update_entity` | Update an entity's name or type |
+| `reembed_entity` | Re-embed an entity's active observations without changing it: the repair for vectors a re-embed left stale |
+| `reembed_status` | Progress or last result of the background re-embed (big renames and re-embeds run in a worker thread, so the caller returns at once) |
 | `delete_entity` | Soft delete an entity and its observations |
 | `merge_entities` | Merge one entity into another: move observations (IDs stable, timestamps kept) + re-point relations deduped by (from, to, type), re-embed under the target's name, soft-delete the source. Export/import preserves the merged state |
 | `list_entities` | Paginated list, filter by vault / type |
@@ -34,6 +40,7 @@ This creates a venv, installs deps, exports the ONNX model (~274MB download on f
 | Tool | Purpose |
 |------|---------|
 | `create_relation` | Create a directed relation between two entities |
+| `update_relation` | Edit a relation's context or weight in place (ID, endpoints, type and creation date kept). Context is a disambiguator, not a fact store: it never shows in search |
 | `delete_relation` | Remove a relation by ID |
 | `get_neighbors` | Entities connected to a given entity, up to `max_depth` hops |
 | `analyze_graph` | PageRank centrality, Louvain community detection, under-documented entity (knowledge gap) identification |
@@ -45,7 +52,7 @@ This creates a venv, installs deps, exports the ONNX model (~274MB download on f
 
 | Tool | Purpose |
 |------|---------|
-| `search_memory` | Observation-level semantic search with calibrated confidence, temporal / type / superseded filters, opt-in graph expansion |
+| `search_memory` | Observation-level search (vector + BM25, then a relevance gate) with calibrated confidence, temporal / type / superseded filters, opt-in graph expansion |
 | `query_timeline` | Observations across a time range, ordered chronologically |
 | `point_in_time` | What was known about an entity as of a given timestamp |
 | `get_temporal_neighbors` | Entities whose observations sit temporally adjacent to a given entity's |
@@ -246,6 +253,8 @@ Pipeline:
 6. Optionally expand via the graph (below)
 7. Render as ranked facts grouped under one line of entity context (`text`), or a flat ranked list of observation objects including observation IDs (`json`)
 
+In `text`, a fact longer than ~300 characters is cut and ends `[+N words, obs=<id>]`; `get_entity(<id>)` returns it whole. A source is shown only as its date, and not at all when the fact already states one (`src/tools/brief.py`). `get_entity` lists facts the same way. On the labelled queries this took search output from ~494 to ~330 tokens, and 1 must-have fact in 58 needed the full text.
+
 ### Top-5 / min-3 selection rule
 
 - If **3 or more** observations clear the threshold, return the top `n_results` of them (default 5). An explicitly smaller `n_results` is honoured.
@@ -314,6 +323,11 @@ When the daemon serves HTTP (`MCP_PORT` + `MCP_API_KEY`), it also answers Bearer
 POST /embed          Authorization: Bearer <key>
                      {"texts": ["...", ...], "kind": "document" | "query"}
 → 200 {"model": "embeddinggemma-300m", "backend": "ONNX + CPU", "dim": 768, "kind": "document", "vectors": [[...], ...]}
+```
+
+- `kind` picks the prefix the model expects: `document` (default, how observations are stored) or `query` (how searches are embedded). Vectors are L2-normalised, so a dot product is the cosine.
+- At most 64 texts per call, each clipped to 8,000 characters. A wrong key is 401, a model still loading is 503.
+- Batches run in a worker thread, one at a time, so a bulk caller never blocks the MCP event loop or piles model runs up next to a live search.
 
 `GET /health` is open (no key) and says which device the embedder runs on —
 what the hub's watchdog reads:
@@ -327,7 +341,8 @@ what the hub's watchdog reads:
 right now (a POST on `/mcp/<key>`, from arrival until its answer is fully sent)
 and how old the oldest is. The hub's deployer asks it right before a restart
 and waits while a call is in flight, so a deploy never cuts a write in half
-(`src/inflight.py`). The access log leaves it out.
+(`src/inflight.py`). The access log leaves it out, and masks the key in
+every `/mcp/<key>`, `/upload/<key>` and `/download/<key>` line it does write.
 
 ```
 → 200 {"in_flight": 1, "oldest_s": 0.42}
@@ -365,11 +380,11 @@ and only exists on Microsoft's `onnxruntime-cuda-12` package index; cuDNN
 9.26 loads on that card and fails at run time, 9.1.1 works. A session that
 comes up on CUDA is smoke-tested once at load and falls back to CPU with the
 error recorded, so a broken GPU stack shows as a fault, never as a slow day.
-```
 
-- `kind` picks the prefix the model expects: `document` (default, how observations are stored) or `query` (how searches are embedded). Vectors are L2-normalised, so a dot product is the cosine.
-- At most 64 texts per call, each clipped to 8,000 characters. A wrong key is 401, a model still loading is 503.
-- Batches run in a worker thread, one at a time, so a bulk caller never blocks the MCP event loop or piles model runs up next to a live search.
+The embedder and the relevance gate both run on the card. Every CUDA session
+in the process is created and smoke-tested under one lock, so the two take
+turns (opened in the same second, one of them used to land on the CPU), and a
+failed first GPU run is retried once before the CPU fallback.
 
 ## Architecture
 
@@ -377,12 +392,17 @@ Forked from [code-index](https://github.com/you/code-index). Same embedding pipe
 
 ```
 src/
-├── server.py              # FastMCP, 29 tool registrations
+├── server.py              # FastMCP, 31 tool registrations
 ├── config.py              # VaultConfig, vault CRUD, paths
+├── envload.py             # Settings: environment, then instance.env, then .env
+├── access.py              # Who a request is for, decided once per HTTP request
+├── requester.py           # The private vault's rules (process tree + hub run lookup)
+├── inflight.py            # GET /inflight, key-masking access log
 ├── embed_http.py          # Bearer-authenticated POST /embed (reuses the loaded model)
 ├── indexer/
 │   ├── db.py              # SQLite DAL (row-level transactions, legacy-JSON auto-migration)
 │   ├── embedder.py        # ONNX embedder singleton (CPU or CUDA) + ChromaDB client
+│   ├── reranker.py        # MiniLM-L6 cross-encoder: the search relevance gate
 │   ├── calibration.py     # Per-vault distance thresholds (randomly sampled probes)
 │   └── store.py           # Entity/observation CRUD, in-memory cache over SQLite, RLock
 ├── graph/
@@ -395,6 +415,7 @@ src/
 └── tools/
     ├── search.py          # Observation-level ranked search + threshold gate
     ├── lexical.py         # BM25 candidates for the relevance gate
+    ├── brief.py           # Short forms of a fact for list views
     ├── entities.py        # Entity/observation tool impls
     ├── relations.py       # Relation tool impls
     ├── temporal.py        # Timeline, point-in-time, temporal neighbors
@@ -409,24 +430,24 @@ scripts/
 ├── download_model.py         # Fetch/export the EmbeddingGemma ONNX model
 ├── recalibrate.py            # Force per-vault threshold recalibration
 ├── reembed_all.py            # Re-embed every observation (model change)
+├── rebuild_index.py          # Fill the search index from memory.db after a restore
 ├── backfill_occurred_at.py   # Infer occurred_at from ISO dates in text (dry-run default)
 ├── canonicalize_relations.py # Collapse legacy relation types onto the canonical set (dry-run default)
 ├── eval_search.py            # Retrieval eval harness (golden queries, recall@k / MRR)
-└── backup_to_drive.py        # Vault backup
+├── backup_to_drive.py        # Vault backup to Drive
+└── daily-backup.bat          # The scheduled task that runs it
 ```
+
+`deploy.toml` is the test gate the hub's deployer runs before a deploy (a failing test holds it). `backup.toml` tells the fleet backup what this checkout needs after a wipe: `.env`, each vault's calibration and `data/memory.db`; the search index and both models are rebuilt or downloaded again.
 
 ## Tests
 
-No pytest — the suites are plain `unittest` scripts:
+pytest, with `pytest-xdist` in the `dev` extra:
 
 ```bash
-PYTHONPATH=. python tests/test_search.py
+uv run --extra dev --frozen python -m pytest -q tests
 ```
 
-Run them all:
+Tests run in random order across xdist workers (up to 6). `TEST_SEED=<n>` replays an order (it is printed first; `off` keeps file order) and `TEST_WORKERS=1` runs serially. Tests never touch the checkout's own `data/`.
 
-```bash
-for f in tests/test_*.py; do PYTHONPATH=. python "$f"; done
-```
-
-330 tests across 16 files, covering entity CRUD and superseding, entity merge, batched observation writes, SQLite persistence and the legacy-JSON migration, concurrency behaviour, ontology enforcement, observation-level search ranking and threshold selection, keyword fallback, long-text guard, graph traversal and analysis, the librarian, temporal queries on both time axes, vault export/import round-trips, maintenance, the eval harness, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model present.
+486 tests across 23 files, covering entity CRUD and superseding, entity merge, batched observation writes, SQLite persistence and the legacy-JSON migration, concurrency, ontology enforcement, observation-level search ranking, the relevance gate and BM25, short fact rendering, keyword fallback, long-text guard, graph traversal and analysis, the librarian, temporal queries on both time axes, vault export/import round-trips, the private vault, settings loading, the embed endpoint, `/inflight`, GPU session handling, backup settings, maintenance, the eval harness, and the tool layer. The embedder is mocked throughout, so the suite runs without the ONNX model or a GPU.
