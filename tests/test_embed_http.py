@@ -159,6 +159,29 @@ class TestEmbedEndpoint(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertIn("SessionOptions", body["error"])
 
+    def test_health_reports_this_process_memory(self):
+        handler = make_health_endpoint(
+            get_backend=lambda: "ONNX + CPU",
+            get_device=lambda: {"requested": "cpu", "active": "cpu", "error": None})
+        app = Starlette(routes=[Route("/health", handler, methods=["GET"])])
+        mem = TestClient(app).get("/health").json()["memory"]
+        self.assertGreater(mem["private_mb"], 0)
+        self.assertGreater(mem["working_set_mb"], 0)
+        self.assertGreaterEqual(mem["threads"], 1)
+        self.assertIn("arena_releases", mem)
+
+    def test_health_stays_ok_when_memory_cant_be_read(self):
+        handler = make_health_endpoint(
+            get_backend=lambda: "ONNX + CUDA",
+            get_device=lambda: {"requested": "auto", "active": "cuda", "error": None},
+            get_load_error=lambda: None,
+            get_memory=lambda: None)
+        app = Starlette(routes=[Route("/health", handler, methods=["GET"])])
+        r = TestClient(app).get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+        self.assertIsNone(r.json()["memory"])
+
     def test_health_registers_beside_embed(self):
         from mcp.server.fastmcp import FastMCP
         from src.embed_http import register

@@ -60,10 +60,16 @@ def _default_load_error() -> str | None:
     return get_load_error()
 
 
+def _default_memory() -> dict | None:
+    from src.process_memory import snapshot
+    return snapshot()
+
+
 def make_health_endpoint(
     get_backend: Callable[[], str] = _default_backend,
     get_device: Callable[[], dict] = _default_device,
     get_load_error: Callable[[], str | None] = _default_load_error,
+    get_memory: Callable[[], dict | None] = _default_memory,
 ):
     """GET /health: unauthenticated, no secrets, what the hub's watchdog reads.
 
@@ -75,7 +81,11 @@ def make_health_endpoint(
     When the model has failed to load, the answer is 503 with ok: false and
     `error` saying why: the process is up, but every search and write needs
     the embedder, so it is not doing its job. Before the first load attempt
-    (the seconds of warm-up after a start) it stays ok."""
+    (the seconds of warm-up after a start) it stays ok.
+
+    `memory` is the process's own figures (src/process_memory.py: cached
+    for a few seconds, read in a worker thread), or null when they can't be
+    read; it never changes `ok`."""
     async def health(request: Request) -> JSONResponse:
         err = get_load_error()
         body: dict[str, Any] = {
@@ -83,6 +93,7 @@ def make_health_endpoint(
             "model": MODEL_NAME,
             "backend": get_backend(),
             "embed_device": get_device(),
+            "memory": await anyio.to_thread.run_sync(get_memory),
         }
         if err:
             body["error"] = f"the embedding model won't load, so search and writes fail ({err})"

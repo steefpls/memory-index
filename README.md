@@ -329,13 +329,37 @@ POST /embed          Authorization: Bearer <key>
 - At most 64 texts per call, each clipped to 8,000 characters. A wrong key is 401, a model still loading is 503.
 - Batches run in a worker thread, one at a time, so a bulk caller never blocks the MCP event loop or piles model runs up next to a live search.
 
-`GET /health` is open (no key) and says which device the embedder runs on —
-what the hub's watchdog reads:
+`GET /health` is open (no key) and says which device the embedder runs on and
+how much memory the process holds — what the hub's watchdog reads:
 
 ```
 → 200 {"ok": true, "model": "embeddinggemma-300m", "backend": "ONNX + CUDA",
-       "embed_device": {"requested": "auto", "active": "cuda", "error": null}}
+       "embed_device": {"requested": "auto", "active": "cuda", "error": null},
+       "memory": {"private_mb": 2784.7, "working_set_mb": 1159.1, "threads": 61,
+                  "peak_private_mb": 7243.6, "handles": 1187,
+                  "gpu": {"dedicated_mb": 564.5, "shared_mb": 56.0, "committed_mb": 620.5},
+                  "host_mb": 2164.2,
+                  "arena_releases": {"embedder": 412, "reranker": 388}}}
 ```
+
+`memory` (`src/process_memory.py`) is there so the hub can keep a history and
+spot a creep; it never changes `ok`, and is `null` if the figures can't be read.
+
+- `private_mb` is the process's private commit, `peak_private_mb` its highest
+  since start, `working_set_mb` what sits in RAM now.
+- On Windows the CUDA driver backs GPU allocations with process commit, so
+  `private_mb` rises and falls with the ONNX CUDA arenas (about 2.8 GB idle,
+  up to ~4.6 GB in a burst on steef-server, 2026-11-17). `gpu` is this
+  process's GPU memory from Windows' "GPU Process Memory" counters, and
+  `host_mb` is `private_mb − gpu.committed_mb`: the line that should stay
+  flat (~2.15 GB). Watch its idle floor for a leak, not a mid-traffic peak.
+- `gpu` and `host_mb` are `null` off Windows, for the first few seconds after a
+  start (the counter query opens in the background), or where the counters
+  are missing.
+- `arena_releases` counts how often each CUDA session's idle timer handed its
+  arena back (`null` when that session isn't loaded or runs on the CPU).
+- The whole block is cached for 5 s and read in a worker thread, so polling
+  /health costs nothing extra.
 
 `GET /inflight` is open too and says how many MCP calls are being answered
 right now (a POST on `/mcp/<key>`, from arrival until its answer is fully sent)
